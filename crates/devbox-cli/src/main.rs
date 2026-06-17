@@ -57,7 +57,7 @@ async fn main() -> Result<()> {
             owner,
             instance_type,
         } => {
-            let url = format!("{}/api/devboxes/claim", cli.server_url);
+            let url = format!("{}/api/v1/devboxes/claim", cli.server_url);
             let req = ClaimRequest {
                 owner,
                 instance_type,
@@ -82,7 +82,7 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Release { id, owner } => {
-            let url = format!("{}/api/devboxes/{}/release", cli.server_url, id);
+            let url = format!("{}/api/v1/devboxes/{}/release", cli.server_url, id);
             let req = ReleaseRequest { owner };
             let resp = client
                 .post(&url)
@@ -103,7 +103,7 @@ async fn main() -> Result<()> {
             }
         }
         Commands::List => {
-            let url = format!("{}/api/devboxes", cli.server_url);
+            let url = format!("{}/api/v1/devboxes", cli.server_url);
             let resp = client
                 .get(&url)
                 .send()
@@ -133,7 +133,7 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Status { id } => {
-            let url = format!("{}/api/devboxes/{}", cli.server_url, id);
+            let url = format!("{}/api/v1/devboxes/{}", cli.server_url, id);
             let resp = client
                 .get(&url)
                 .send()

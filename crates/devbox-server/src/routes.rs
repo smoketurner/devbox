@@ -25,10 +25,10 @@ pub struct AppState {
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health_check))
-        .route("/api/devboxes", get(list_devboxes))
-        .route("/api/devboxes/{id}", get(get_devbox))
-        .route("/api/devboxes/claim", post(claim_devbox))
-        .route("/api/devboxes/{id}/release", post(release_devbox))
+        .route("/api/v1/devboxes", get(list_devboxes))
+        .route("/api/v1/devboxes/{id}", get(get_devbox))
+        .route("/api/v1/devboxes/claim", post(claim_devbox))
+        .route("/api/v1/devboxes/{id}/release", post(release_devbox))
         .merge(build_ui_router())
         .with_state(state)
 }

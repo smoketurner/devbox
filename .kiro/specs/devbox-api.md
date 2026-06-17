@@ -18,10 +18,10 @@ Coding agents need a simple, reliable API to acquire development environments. T
 ### Functional
 
 1. **Health check** - `GET /health` returns server and database health
-2. **Claim** - `POST /api/devboxes/claim` atomically assigns a Ready devbox to a requester
-3. **Release** - `POST /api/devboxes/{id}/release` returns a Claimed devbox to the pool (terminates it)
-4. **List** - `GET /api/devboxes` returns all devboxes with optional state filter
-5. **Get** - `GET /api/devboxes/{id}` returns a single devbox by ID
+2. **Claim** - `POST /api/v1/devboxes/claim` atomically assigns a Ready devbox to a requester
+3. **Release** - `POST /api/v1/devboxes/{id}/release` returns a Claimed devbox to the pool (terminates it)
+4. **List** - `GET /api/v1/devboxes` returns all devboxes with optional state filter
+5. **Get** - `GET /api/v1/devboxes/{id}` returns a single devbox by ID
 6. **Dashboard** - `GET /` serves an HTML dashboard showing pool status
 
 ### Non-Functional
@@ -44,7 +44,7 @@ Coding agents need a simple, reliable API to acquire development environments. T
 }
 ```
 
-### POST /api/devboxes/claim
+### POST /api/v1/devboxes/claim
 
 **Request:**
 ```json
@@ -76,7 +76,7 @@ Coding agents need a simple, reliable API to acquire development environments. T
 }
 ```
 
-### POST /api/devboxes/{id}/release
+### POST /api/v1/devboxes/{id}/release
 
 **Request:**
 ```json
@@ -107,7 +107,7 @@ Coding agents need a simple, reliable API to acquire development environments. T
 }
 ```
 
-### GET /api/devboxes
+### GET /api/v1/devboxes
 
 **Query parameters:**
 - `state` (optional): Filter by state (`launching`, `warming`, `ready`, `claimed`, `terminating`)
@@ -131,7 +131,7 @@ Coding agents need a simple, reliable API to acquire development environments. T
 }
 ```
 
-### GET /api/devboxes/{id}
+### GET /api/v1/devboxes/{id}
 
 **Response: 200 OK** (same shape as single devbox above)
 
@@ -158,10 +158,10 @@ pub struct AppState {
 ```rust
 Router::new()
     .route("/health", get(health_check))
-    .route("/api/devboxes", get(list_devboxes))
-    .route("/api/devboxes/{id}", get(get_devbox))
-    .route("/api/devboxes/claim", post(claim_devbox))
-    .route("/api/devboxes/{id}/release", post(release_devbox))
+    .route("/api/v1/devboxes", get(list_devboxes))
+    .route("/api/v1/devboxes/{id}", get(get_devbox))
+    .route("/api/v1/devboxes/claim", post(claim_devbox))
+    .route("/api/v1/devboxes/{id}/release", post(release_devbox))
     .merge(build_ui_router())
     .with_state(state)
 ```
