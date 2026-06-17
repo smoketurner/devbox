@@ -5,13 +5,23 @@
 //! appropriate cache headers.
 
 use askama::Template;
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{Path, State};
+use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
+use rust_embed::Embed;
 
 use crate::routes::AppState;
+
+// ============================================================================
+// Embedded Static Assets
+// ============================================================================
+
+/// Static assets embedded into the binary at compile time.
+#[derive(Embed)]
+#[folder = "static/"]
+struct StaticAssets;
 
 // ============================================================================
 // Template IntoResponse macro (following Vouch pattern)
@@ -67,7 +77,9 @@ pub struct DashboardDevbox {
 
 /// Build the UI router.
 pub fn build_ui_router() -> Router<AppState> {
-    Router::new().route("/", get(dashboard))
+    Router::new()
+        .route("/", get(dashboard))
+        .route("/static/{*path}", get(static_asset))
 }
 
 /// Render the dashboard page.
@@ -78,4 +90,22 @@ async fn dashboard(State(_state): State<AppState>) -> Response {
         devboxes: Vec::new(),
     };
     template.into_response()
+}
+
+/// Serve embedded static assets.
+///
+/// GET /static/*path
+async fn static_asset(Path(path): Path<String>) -> Response {
+    match StaticAssets::get(&path) {
+        Some(content) => {
+            let mime = content.metadata.mimetype();
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, mime.to_string())],
+                content.data.to_vec(),
+            )
+                .into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }

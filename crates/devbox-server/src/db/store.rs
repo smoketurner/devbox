@@ -477,25 +477,15 @@ impl DocumentStore {
             cnt: i64,
         }
 
-        let count_sql = format!(
-            "SELECT COUNT(*) as cnt FROM documents WHERE doc_type = '{}'",
-            T::DOC_TYPE
-        );
+        let stmt = Query::select()
+            .expr_as(Expr::col(Documents::Id).count(), sea_query::Alias::new("cnt"))
+            .from(Documents::Table)
+            .and_where(Expr::col(Documents::DocType).eq(T::DOC_TYPE))
+            .to_owned();
 
-        let result = match &self.pool {
-            Pool::Sqlite(p) => {
-                sqlx::query_as::<_, CountRow>(sqlx::AssertSqlSafe(count_sql.clone()))
-                    .fetch_one(p)
-                    .await?
-            }
-            Pool::Postgres(p) => {
-                sqlx::query_as::<_, CountRow>(sqlx::AssertSqlSafe(count_sql))
-                    .fetch_one(p)
-                    .await?
-            }
-        };
+        let row: CountRow = crate::db_fetch_one!(&self.pool, stmt, CountRow)?;
 
-        Ok(result.cnt)
+        Ok(row.cnt)
     }
 
     /// List all documents of a given type.

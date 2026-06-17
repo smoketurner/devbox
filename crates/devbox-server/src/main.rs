@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 
 use devbox_server::db::{DocumentStore, Pool, PoolConfig};
 use devbox_server::reconcile::spawn_reconciliation_loop;
@@ -44,8 +45,9 @@ async fn main() -> Result<()> {
 
     let store = Arc::new(DocumentStore::new(pool));
 
-    // Spawn reconciliation loop
-    spawn_reconciliation_loop(Arc::clone(&store));
+    // Spawn reconciliation loop with cancellation support
+    let cancel = CancellationToken::new();
+    let reconcile_handle = spawn_reconciliation_loop(Arc::clone(&store), cancel.clone());
 
     // Build router
     let app = build_router(AppState {
@@ -59,6 +61,10 @@ async fn main() -> Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+
+    // Signal the reconciliation loop to stop and wait for it
+    cancel.cancel();
+    let _join = reconcile_handle.await;
 
     // Cleanup
     store.pool().close().await;
