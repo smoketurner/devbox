@@ -1,0 +1,23 @@
+[package]
+name = "devbox-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "CLI client for the devbox orchestration service"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "devbox"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true, features = ["std"] }
+clap = { workspace = true, features = ["std", "derive"] }
+devbox-common = { path = "../devbox-common" }
+reqwest = { workspace = true, features = ["json", "rustls"] }
+serde = { workspace = true, features = ["std", "derive"] }
+serde_json = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

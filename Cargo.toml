@@ -1,0 +1,136 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unreachable_pub = "warn"
+non_ascii_idents = "deny"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+unused_lifetimes = "warn"
+single_use_lifetimes = "warn"
+
+[workspace.lints.clippy]
+# Panic-prevention lints
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+exit = "deny"
+
+# Panic patterns inside Result-returning functions
+unwrap_in_result = "deny"
+panic_in_result_fn = "deny"
+get_unwrap = "deny"
+
+# Indexing can panic - use .get() instead
+indexing_slicing = "deny"
+
+# String slicing can panic on non-UTF8 boundaries
+string_slice = "deny"
+
+# Modulo by zero panics
+modulo_arithmetic = "deny"
+
+# Integer division panics on /0
+integer_division = "deny"
+
+# Overflow panics in debug, wraps in release
+arithmetic_side_effects = "deny"
+
+# Numeric `as` casts silently truncate, lose sign, wrap, or lose precision
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_possible_wrap = "deny"
+cast_precision_loss = "deny"
+checked_conversions = "deny"
+
+# Time/Duration subtraction panics on negative result
+unchecked_time_subtraction = "deny"
+
+# Float equality is unreliable
+float_cmp = "deny"
+float_cmp_const = "deny"
+
+# Lossy float literals
+lossy_float_literal = "deny"
+
+# 0.0 / 0.0 is NaN
+zero_divided_by_zero = "deny"
+
+# `From` impls must be infallible
+fallible_impl_from = "deny"
+
+# Recursive Display/Debug impls cause stack-overflow panics
+recursive_format_impl = "deny"
+
+# Stack-overflow risk
+large_stack_arrays = "deny"
+large_stack_frames = "deny"
+
+# Infinite iteration / hangs
+infinite_iter = "deny"
+
+# Undefined behavior
+mem_replace_with_uninit = "deny"
+uninit_assumed_init = "deny"
+uninit_vec = "deny"
+
+# Code hygiene
+dbg_macro = "deny"
+
+# Safety
+await_holding_lock = "deny"
+large_futures = "deny"
+mem_forget = "deny"
+
+# Use atomics instead of Mutex<bool/integer>
+mutex_atomic = "deny"
+
+# Rc<String>/Arc<Vec<T>> should be Rc<str>/Arc<[T]>
+rc_buffer = "deny"
+
+# Style: prefer .map_or(default, f) over .map(f).unwrap_or(default)
+map_unwrap_or = "deny"
+
+# Silent drops of #[must_use] hide real failures
+let_underscore_must_use = "deny"
+
+# Ratchet against monolithic functions
+too_many_lines = "warn"
+
+module_name_repetitions = "allow"
+similar_names = "allow"
+
+allow_attributes_without_reason = "deny"
+
+[workspace.dependencies]
+anyhow = { version = "=1.0.102", default-features = false }
+askama = { version = "=0.16.0", default-features = false }
+aws-config = { version = "=1.8.18", default-features = false }
+aws-lc-rs = { version = "=1.17.0", default-features = false }
+aws-sdk-dsql = { version = "=1.60.0", default-features = false }
+axum = { version = "=0.8.9", default-features = false }
+clap = { version = "=4.6.1", default-features = false }
+jiff = { version = "=0.2.28", default-features = false }
+reqwest = { version = "=0.13.4", default-features = false }
+rust-embed = { version = "=8.11.0", default-features = false }
+sea-query = { version = "=1.0.1", default-features = false }
+sea-query-sqlx = { version = "=0.9.1", default-features = false }
+serde = { version = "=1.0.228", default-features = false }
+serde_json = { version = "=1.0.150", default-features = false }
+sqlx = { version = "=0.9.0", default-features = false }
+tokio = { version = "=1.52.3", default-features = false }
+tracing = { version = "=0.1.44", default-features = false }
+tracing-subscriber = { version = "=0.3.23", default-features = false }
+url = { version = "=2.5.8", default-features = false }
+uuid = { version = "=1.23.3", default-features = false }
