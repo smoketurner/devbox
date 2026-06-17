@@ -74,10 +74,7 @@ pub(crate) fn is_dsql_endpoint(host: &str) -> bool {
 #[derive(Debug, Clone)]
 pub(crate) enum DsqlEndpoint {
     /// Direct DSQL connection: `cluster-id.dsql.region.on.aws`
-    Direct {
-        hostname: String,
-        region: String,
-    },
+    Direct { hostname: String, region: String },
     /// VPC PrivateLink connection
     VpcEndpoint {
         hostname: String,
@@ -111,9 +108,7 @@ impl DsqlEndpoint {
                 .query_pairs()
                 .find(|(k, _)| k == "dsql_cluster_id")
                 .map(|(_, v)| v.to_string())
-                .context(
-                    "VPC endpoint URL requires a 'dsql_cluster_id' query parameter",
-                )?;
+                .context("VPC endpoint URL requires a 'dsql_cluster_id' query parameter")?;
 
             if cluster_id.is_empty() {
                 bail!("dsql_cluster_id query parameter must not be empty");
@@ -174,7 +169,7 @@ impl DsqlEndpoint {
 
     /// The DSQL cluster ID, if this is a VPC endpoint connection.
     #[must_use]
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "used in VPC endpoint scenarios")]
     pub(crate) fn cluster_id(&self) -> Option<&str> {
         match self {
             Self::Direct { .. } => None,

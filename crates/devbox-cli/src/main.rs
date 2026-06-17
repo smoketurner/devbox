@@ -70,7 +70,8 @@ async fn main() -> Result<()> {
                 .context("failed to send claim request")?;
 
             if resp.status().is_success() {
-                let devbox: DevboxResponse = resp.json().await.context("failed to parse response")?;
+                let devbox: DevboxResponse =
+                    resp.json().await.context("failed to parse response")?;
                 println!("Claimed devbox: {}", devbox.id);
                 println!("  State: {:?}", devbox.state);
                 println!("  Instance: {}", devbox.instance_id.unwrap_or_default());
@@ -91,7 +92,8 @@ async fn main() -> Result<()> {
                 .context("failed to send release request")?;
 
             if resp.status().is_success() {
-                let devbox: DevboxResponse = resp.json().await.context("failed to parse response")?;
+                let devbox: DevboxResponse =
+                    resp.json().await.context("failed to parse response")?;
                 println!("Released devbox: {}", devbox.id);
                 println!("  State: {:?}", devbox.state);
             } else {
@@ -109,7 +111,8 @@ async fn main() -> Result<()> {
                 .context("failed to send list request")?;
 
             if resp.status().is_success() {
-                let list: DevboxListResponse = resp.json().await.context("failed to parse response")?;
+                let list: DevboxListResponse =
+                    resp.json().await.context("failed to parse response")?;
                 if list.devboxes.is_empty() {
                     println!("No devboxes found.");
                 } else {
@@ -138,7 +141,8 @@ async fn main() -> Result<()> {
                 .context("failed to send status request")?;
 
             if resp.status().is_success() {
-                let devbox: DevboxResponse = resp.json().await.context("failed to parse response")?;
+                let devbox: DevboxResponse =
+                    resp.json().await.context("failed to parse response")?;
                 println!("Devbox: {}", devbox.id);
                 println!("  State: {:?}", devbox.state);
                 println!("  Type: {}", devbox.instance_type);

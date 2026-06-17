@@ -59,6 +59,7 @@ impl DocumentType for DevboxDoc {
 #[cfg(test)]
 #[expect(
     clippy::unwrap_used,
+    clippy::get_unwrap,
     reason = "test code: panic on assertion failure is acceptable"
 )]
 mod tests {

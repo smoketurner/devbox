@@ -1,0 +1,21 @@
+# Exclude everything by default
+*
+
+# Root build files
+!Cargo.toml
+!Cargo.lock
+
+# Workspace crate manifests (needed for dependency caching layer)
+!crates/devbox-common/Cargo.toml
+!crates/devbox-server/Cargo.toml
+!crates/devbox-cli/Cargo.toml
+
+# Source code
+!crates/devbox-common/src/
+!crates/devbox-server/src/
+!crates/devbox-server/migrations/
+!crates/devbox-server/templates/
+!crates/devbox-server/static/
+!crates/devbox-server/styles/
+!crates/devbox-server/tailwind.config.js
+!crates/devbox-cli/src/

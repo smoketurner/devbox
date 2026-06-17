@@ -1,0 +1,9 @@
+target/
+.git/
+.github/
+.kiro/
+.claude/
+*.md
+.env
+.env.example
+*.db

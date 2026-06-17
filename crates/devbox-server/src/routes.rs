@@ -2,11 +2,11 @@
 
 use std::sync::Arc;
 
+use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::{get, post};
-use axum::Router;
 
 use devbox_common::{
     ClaimRequest, DevboxListResponse, DevboxResponse, HealthResponse, ReleaseRequest,

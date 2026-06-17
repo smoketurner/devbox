@@ -5,11 +5,11 @@
 //! appropriate cache headers.
 
 use askama::Template;
+use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
-use axum::Router;
 use rust_embed::Embed;
 
 use crate::routes::AppState;

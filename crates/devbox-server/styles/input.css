@@ -1,0 +1,69 @@
+@import "tailwindcss";
+@config "../tailwind.config.js";
+
+/* Devbox dashboard styles - dark-mode, blue/cyan accent */
+@layer components {
+  .btn-primary {
+    @apply inline-block px-6 py-3 bg-devbox-accent text-devbox-bg font-medium rounded-md hover:bg-devbox-accent-hover transition-colors;
+  }
+
+  .btn-secondary {
+    @apply inline-block px-6 py-3 border border-devbox-border text-gray-300 rounded-md hover:bg-devbox-raised transition-colors;
+  }
+
+  .btn-danger {
+    @apply inline-block px-4 py-2 bg-devbox-error text-white rounded-md hover:opacity-90 transition-colors;
+  }
+
+  .btn-small {
+    @apply px-3 py-1.5 text-sm;
+  }
+
+  .card {
+    @apply bg-devbox-surface border border-devbox-border rounded-lg p-8;
+  }
+
+  .input-field {
+    @apply w-full px-4 py-3 bg-devbox-raised border border-devbox-border text-gray-200 rounded-md focus:border-devbox-accent focus:outline-none transition-colors;
+  }
+
+  .status-launching {
+    @apply bg-devbox-warning-bg border border-devbox-warning text-devbox-warning px-2 py-0.5 rounded text-xs font-medium;
+  }
+
+  .status-warming {
+    @apply bg-devbox-warning-bg border border-devbox-warning text-devbox-warning px-2 py-0.5 rounded text-xs font-medium;
+  }
+
+  .status-ready {
+    @apply bg-devbox-success-bg border border-devbox-success text-devbox-success px-2 py-0.5 rounded text-xs font-medium;
+  }
+
+  .status-claimed {
+    @apply bg-devbox-surface border border-devbox-accent text-devbox-accent px-2 py-0.5 rounded text-xs font-medium;
+  }
+
+  .status-terminating {
+    @apply bg-devbox-error-bg border border-devbox-error text-devbox-error px-2 py-0.5 rounded text-xs font-medium;
+  }
+
+  .alert-success {
+    @apply bg-devbox-success-bg border-l-4 border-devbox-success text-gray-300 p-4 rounded-r-lg;
+  }
+
+  .alert-error {
+    @apply bg-devbox-error-bg border-l-4 border-devbox-error text-gray-300 p-4 rounded-r-lg;
+  }
+
+  .alert-warning {
+    @apply bg-devbox-warning-bg border-l-4 border-devbox-warning text-gray-300 p-4 rounded-r-lg;
+  }
+
+  .table-header {
+    @apply px-4 py-3 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider;
+  }
+
+  .table-cell {
+    @apply px-4 py-3 text-sm text-gray-300 border-t border-devbox-border;
+  }
+}

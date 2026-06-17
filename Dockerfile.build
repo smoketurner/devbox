@@ -1,0 +1,76 @@
+# syntax=docker/dockerfile:1
+#
+# Multi-stage Dockerfile for producing static musl binaries.
+# Used by docker-bake.hcl targets (ci, cli, server).
+# The existing Dockerfile (server Docker image) is NOT replaced by this file.
+#
+# Uses cargo-chef to cache dependency compilation. Only workspace crates
+# are recompiled when source changes - dependencies are cached as long as
+# Cargo.toml/Cargo.lock stay the same.
+
+FROM rust:1.96.0-alpine AS base
+RUN apk add --no-cache musl-dev pkgconfig cmake make go clang linux-headers \
+    openssl-dev openssl-libs-static perl
+ENV AWS_LC_FIPS_SYS_CC=clang
+ENV AWS_LC_FIPS_SYS_CXX=clang++
+ENV OPENSSL_STATIC=1
+ENV OPENSSL_LIB_DIR=/usr/lib
+ENV OPENSSL_INCLUDE_DIR=/usr/include
+
+# Install cargo-chef (cached with base OS layer)
+RUN cargo install cargo-chef --locked
+
+# --- Planner: compute dependency recipe ---
+FROM base AS planner
+WORKDIR /app
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# --- Builder: cook dependencies, then build workspace crates ---
+FROM base AS builder
+
+ARG TARGET
+
+WORKDIR /app
+RUN rustup target add "${TARGET}"
+
+# Cook dependencies from recipe (cached when only source files change)
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --locked --target "${TARGET}" --recipe-path recipe.json
+
+# Copy source and build workspace crates (only these recompile)
+COPY . .
+
+# Declare build-time ARGs after the cook layer so changes don't bust the cache
+ARG SOURCE_DATE_EPOCH=0
+ARG GENERATE_SBOM=false
+ARG CARGO_PACKAGES="-p devbox-cli -p devbox-server"
+
+# Touch entry-point files for reproducible builds
+RUN touch -d "@${SOURCE_DATE_EPOCH}" \
+      crates/devbox-common/src/lib.rs \
+      crates/devbox-cli/src/main.rs \
+      crates/devbox-server/src/main.rs
+
+RUN cargo build --release --locked --target "${TARGET}" ${CARGO_PACKAGES}
+
+# Generate SBOM if requested
+RUN if [ "${GENERATE_SBOM}" = "true" ]; then \
+      cargo install cargo-cyclonedx --version 0.5.6 \
+      && cargo cyclonedx --target "${TARGET}" --format json; \
+    fi
+
+# Collect only release binaries and SBOMs
+RUN mkdir -p "/out/target/${TARGET}/release" \
+    && for bin in devbox-cli devbox-server; do \
+         if [ -f "target/${TARGET}/release/${bin}" ]; then \
+           cp "target/${TARGET}/release/${bin}" "/out/target/${TARGET}/release/"; \
+         fi; \
+       done \
+    && find crates/ -name "*cdx.json" 2>/dev/null | while read -r f; do \
+         mkdir -p "/out/$(dirname "$f")"; \
+         cp "$f" "/out/$f"; \
+       done
+
+FROM scratch AS output
+COPY --from=builder /out/ /

@@ -75,9 +75,7 @@ async fn main() -> Result<()> {
 
 /// Wait for shutdown signal (Ctrl+C).
 async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .ok();
+    tokio::signal::ctrl_c().await.ok();
     tracing::info!("shutdown signal received");
 }
 

@@ -91,10 +91,7 @@ mod store_tests {
         store.insert(&doc1).await.unwrap();
         store.insert(&doc2).await.unwrap();
 
-        let found = store
-            .find_all::<DevboxDoc>("state", "ready")
-            .await
-            .unwrap();
+        let found = store.find_all::<DevboxDoc>("state", "ready").await.unwrap();
         assert_eq!(found.len(), 2);
     }
 

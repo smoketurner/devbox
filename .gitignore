@@ -1,1 +1,18 @@
 /target
+
+# Generated CSS (rebuilt by tailwindcss)
+crates/devbox-server/static/css/output.css
+
+# Environment files
+.env
+
+# Database files
+*.db
+*.db-shm
+*.db-wal
+
+# Editor/IDE
+.idea/
+.vscode/
+*.swp
+*.swo

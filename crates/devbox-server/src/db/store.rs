@@ -65,10 +65,7 @@ enum DocumentIndexes {
 }
 
 /// Build an INSERT statement for a single document index entry.
-fn build_index_insert(
-    doc_id: &str,
-    entry: &IndexEntry,
-) -> Result<sea_query::InsertStatement> {
+fn build_index_insert(doc_id: &str, entry: &IndexEntry) -> Result<sea_query::InsertStatement> {
     let index_id = uuid::Uuid::now_v7().to_string();
     let stmt = Query::insert()
         .into_table(DocumentIndexes::Table)
@@ -478,7 +475,10 @@ impl DocumentStore {
         }
 
         let stmt = Query::select()
-            .expr_as(Expr::col(Documents::Id).count(), sea_query::Alias::new("cnt"))
+            .expr_as(
+                Expr::col(Documents::Id).count(),
+                sea_query::Alias::new("cnt"),
+            )
             .from(Documents::Table)
             .and_where(Expr::col(Documents::DocType).eq(T::DOC_TYPE))
             .to_owned();
@@ -598,10 +598,7 @@ impl StoreTransaction<'_> {
                     Expr::val(T::CURRENT_VERSION.cast_signed()),
                 )
                 .value(Documents::UpdatedAt, Expr::val(now_str.as_str()))
-                .value(
-                    Documents::Version,
-                    Expr::col(Documents::Version).add(1),
-                )
+                .value(Documents::Version, Expr::col(Documents::Version).add(1))
                 .and_where(Expr::col(Documents::Id).eq(id));
             q.to_owned()
         };
