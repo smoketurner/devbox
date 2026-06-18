@@ -1,9 +1,11 @@
 //! Devbox CLI client.
 
+mod format;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use devbox_common::{ClaimRequest, DevboxListResponse, DevboxResponse, ReleaseRequest};
+use devbox_common::{ClaimRequest, DevboxListResponse, DevboxResponse, InstanceType, ReleaseRequest};
 
 /// Devbox CLI - manage remote development environments.
 #[derive(Parser)]
@@ -60,7 +62,7 @@ async fn main() -> Result<()> {
             let url = format!("{}/api/v1/devboxes/claim", cli.server_url);
             let req = ClaimRequest {
                 owner,
-                instance_type,
+                instance_type: instance_type.map(InstanceType),
             };
             let resp = client
                 .post(&url)
@@ -72,13 +74,12 @@ async fn main() -> Result<()> {
             if resp.status().is_success() {
                 let devbox: DevboxResponse =
                     resp.json().await.context("failed to parse response")?;
-                println!("Claimed devbox: {}", devbox.id);
-                println!("  State: {:?}", devbox.state);
-                println!("  Instance: {}", devbox.instance_id.unwrap_or_default());
+                println!("{}", format::format_claim_success(&devbox));
             } else {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
-                anyhow::bail!("claim failed ({}): {}", status, body);
+                eprintln!("{} {}", status.as_u16(), body);
+                std::process::exit(1);
             }
         }
         Commands::Release { id, owner } => {
@@ -94,12 +95,12 @@ async fn main() -> Result<()> {
             if resp.status().is_success() {
                 let devbox: DevboxResponse =
                     resp.json().await.context("failed to parse response")?;
-                println!("Released devbox: {}", devbox.id);
-                println!("  State: {:?}", devbox.state);
+                println!("{}", format::format_release_success(&devbox));
             } else {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
-                anyhow::bail!("release failed ({}): {}", status, body);
+                eprintln!("{} {}", status.as_u16(), body);
+                std::process::exit(1);
             }
         }
         Commands::List => {
@@ -116,20 +117,13 @@ async fn main() -> Result<()> {
                 if list.devboxes.is_empty() {
                     println!("No devboxes found.");
                 } else {
-                    for devbox in &list.devboxes {
-                        println!(
-                            "{} | {:?} | {} | owner: {}",
-                            devbox.id,
-                            devbox.state,
-                            devbox.instance_type,
-                            devbox.owner.as_deref().unwrap_or("-")
-                        );
-                    }
+                    println!("{}", format::format_list_table(&list));
                 }
             } else {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
-                anyhow::bail!("list failed ({}): {}", status, body);
+                eprintln!("{} {}", status.as_u16(), body);
+                std::process::exit(1);
             }
         }
         Commands::Status { id } => {
@@ -143,17 +137,12 @@ async fn main() -> Result<()> {
             if resp.status().is_success() {
                 let devbox: DevboxResponse =
                     resp.json().await.context("failed to parse response")?;
-                println!("Devbox: {}", devbox.id);
-                println!("  State: {:?}", devbox.state);
-                println!("  Type: {}", devbox.instance_type);
-                println!("  AMI: {}", devbox.ami_id);
-                println!("  Instance: {}", devbox.instance_id.unwrap_or_default());
-                println!("  Owner: {}", devbox.owner.unwrap_or_default());
-                println!("  Created: {}", devbox.created_at);
+                println!("{}", format::format_status(&devbox));
             } else {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
-                anyhow::bail!("status failed ({}): {}", status, body);
+                eprintln!("{} {}", status.as_u16(), body);
+                std::process::exit(1);
             }
         }
     }

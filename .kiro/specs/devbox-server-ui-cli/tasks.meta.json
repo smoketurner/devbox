@@ -1,0 +1,305 @@
+{
+  "pbtResults": {},
+  "executionHistory": {
+    "1.1 Create the error module (`src/error.rs`)": [
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745447338
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745475064
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745636953
+      }
+    ],
+    "1.2 Create the conversion module (`src/convert.rs`)": [
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745447342
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745475913
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745637722
+      }
+    ],
+    "1.3 Create the custom `JsonBody<T>` extractor": [
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745447347
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745643901
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745711464
+      }
+    ],
+    "2. Checkpoint - Ensure foundational modules compile": [
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745447349
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745720034
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745722911
+      }
+    ],
+    "3.1 Implement `list_devboxes` handler": [
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745447351
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745744236
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745871743
+      }
+    ],
+    "3.2 Implement `get_devbox` handler": [
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745447353
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745744959
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745871860
+      }
+    ],
+    "3.3 Implement `claim_devbox` handler": [
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745447356
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745875631
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745967608
+      }
+    ],
+    "3.4 Implement `release_devbox` handler": [
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745447358
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745876469
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745968310
+      }
+    ],
+    "4. Checkpoint - Ensure API handlers work": [
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745447360
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745973101
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745975794
+      }
+    ],
+    "5.1 Update `DashboardTemplate` and `dashboard` handler for real data": [
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745447362
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745986656
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781746213689
+      }
+    ],
+    "5.2 Create `DevboxDetailTemplate` and `devbox_detail` handler": [
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745447364
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781746218983
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781746355299
+      }
+    ],
+    "5.3 Create `ClaimFormTemplate` and claim/release UI handlers": [
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745447366
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781746361251
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781746567320
+      }
+    ],
+    "6. Checkpoint - Ensure UI templates render correctly": [
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745447367
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781746572065
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781746574801
+      }
+    ],
+    "7.1 Create CLI format module (`devbox-cli/src/format.rs`)": [
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745447369
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745987444
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781746214622
+      }
+    ],
+    "7.2 Update CLI `main.rs` to use format module": [
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745447371
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781746219861
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781746356046
+      }
+    ],
+    "8. Final checkpoint - Ensure all tests pass": [
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745447373
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781746577932
+      },
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781746637959
+      }
+    ],
+    "1. Create foundational modules (error and conversion)": [
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745711467
+      }
+    ],
+    "3. Implement API route handlers": [
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781745968356
+      }
+    ],
+    "7. Implement CLI output formatter": [
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781746356091
+      }
+    ],
+    "5. Implement dashboard UI templates and handlers": [
+      {
+        "executionId": "b8c3f4c6-434e-44ee-bb5c-936cdcc900b0",
+        "chatSessionId": "6a0accc0-0e65-48a2-b54e-97a0d9e35441",
+        "timestamp": 1781746567364
+      }
+    ]
+  }
+}

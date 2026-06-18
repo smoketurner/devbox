@@ -10,7 +10,7 @@ mod store_tests {
     use crate::db::pool::{Pool, PoolConfig};
     use crate::db::store::DocumentStore;
     use crate::documents::devbox::DevboxDoc;
-    use devbox_common::DevboxState;
+    use devbox_common::{AmiId, DevboxState, InstanceType, SubnetId};
     use jiff::Timestamp;
 
     async fn setup_store() -> DocumentStore {
@@ -27,9 +27,9 @@ mod store_tests {
         DevboxDoc {
             instance_id: Some("i-1234567890abcdef0".to_string()),
             state: DevboxState::Ready,
-            instance_type: "m5.large".to_string(),
-            ami_id: "ami-12345678".to_string(),
-            subnet_id: "subnet-12345678".to_string(),
+            instance_type: InstanceType("m5.large".to_string()),
+            ami_id: AmiId("ami-12345678".to_string()),
+            subnet_id: SubnetId("subnet-12345678".to_string()),
             ebs_volume_id: Some("vol-12345678".to_string()),
             owner: None,
             claimed_at: None,
@@ -48,7 +48,7 @@ mod store_tests {
 
         let fetched = store.get::<DevboxDoc>(&inserted.id).await.unwrap().unwrap();
         assert_eq!(fetched.id, inserted.id);
-        assert_eq!(fetched.data.instance_type, "m5.large");
+        assert_eq!(fetched.data.instance_type, InstanceType("m5.large".to_string()));
     }
 
     #[tokio::test]
@@ -61,7 +61,7 @@ mod store_tests {
         assert_eq!(inserted.id, custom_id);
 
         let fetched = store.get::<DevboxDoc>(custom_id).await.unwrap().unwrap();
-        assert_eq!(fetched.data.ami_id, "ami-12345678");
+        assert_eq!(fetched.data.ami_id, AmiId("ami-12345678".to_string()));
     }
 
     #[tokio::test]

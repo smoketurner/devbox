@@ -1,13 +1,16 @@
 //! Devbox server binary entry point.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
+use devbox_common::{AmiId, InstanceType, SubnetId};
 use devbox_server::db::{DocumentStore, Pool, PoolConfig};
-use devbox_server::reconcile::spawn_reconciliation_loop;
+use devbox_server::ec2::real::RealEc2Client;
+use devbox_server::reconcile::{ReconcilerConfig, spawn_reconciliation_loop};
 use devbox_server::routes::{AppState, build_router};
 
 #[tokio::main]
@@ -45,13 +48,57 @@ async fn main() -> Result<()> {
 
     let store = Arc::new(DocumentStore::new(pool));
 
+    // Load reconciler config from environment
+    let reconciler_config = ReconcilerConfig {
+        target_pool_size: std::env::var("POOL_TARGET_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2),
+        instance_type: InstanceType(
+            std::env::var("POOL_INSTANCE_TYPE").unwrap_or_else(|_| "m5.large".to_string()),
+        ),
+        ami_id: AmiId(std::env::var("POOL_AMI_ID").unwrap_or_default()),
+        subnet_id: SubnetId(std::env::var("POOL_SUBNET_ID").unwrap_or_default()),
+        polling_interval: Duration::from_secs(
+            std::env::var("POOL_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
+        ),
+        stuck_threshold: Duration::from_secs(
+            std::env::var("POOL_STUCK_THRESHOLD_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(600),
+        ),
+        lock_ttl: Duration::from_secs(
+            std::env::var("POOL_LOCK_TTL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
+        ),
+        server_id: uuid::Uuid::now_v7().to_string(),
+    };
+
+    let reconciler_config = Arc::new(reconciler_config);
+
+    // Load AWS config and create EC2 client
+    let aws_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    let ec2_client = Arc::new(RealEc2Client::new(&aws_config));
+
     // Spawn reconciliation loop with cancellation support
     let cancel = CancellationToken::new();
-    let reconcile_handle = spawn_reconciliation_loop(Arc::clone(&store), cancel.clone());
+    let reconcile_handle = spawn_reconciliation_loop(
+        Arc::clone(&store),
+        ec2_client,
+        (*reconciler_config).clone(),
+        cancel.clone(),
+    );
 
     // Build router
     let app = build_router(AppState {
         store: Arc::clone(&store),
+        reconciler_config: Arc::clone(&reconciler_config),
     });
 
     // Start server
