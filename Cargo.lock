@@ -192,6 +192,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-autoscaling"
+version = "1.120.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d77b701921f3bbc6b058904e13fd487ddaa36dd8764a1eb65381dddccbba2bb0"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-query",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-smithy-xml",
+ "aws-types",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.2",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-dsql"
 version = "1.60.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -892,6 +918,7 @@ dependencies = [
  "askama",
  "aws-config",
  "aws-lc-rs",
+ "aws-sdk-autoscaling",
  "aws-sdk-dsql",
  "aws-sdk-ec2",
  "axum",

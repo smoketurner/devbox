@@ -118,6 +118,33 @@ impl AsRef<str> for SubnetId {
 }
 
 // ============================================================================
+// SecurityGroupId
+// ============================================================================
+
+/// A strongly-typed security group ID (e.g., "sg-0123456789abcdef0").
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecurityGroupId(pub String);
+
+impl std::fmt::Display for SecurityGroupId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for SecurityGroupId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl AsRef<str> for SecurityGroupId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+// ============================================================================
 // DevboxState
 // ============================================================================
 
@@ -205,12 +232,11 @@ pub struct HealthResponse {
 /// Pool metrics response showing instance counts by state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolMetricsResponse {
-    pub launching: u32,
     pub warming: u32,
     pub ready: u32,
     pub claimed: u32,
     pub terminating: u32,
-    pub target_pool_size: u32,
+    pub target_warm_pool_size: u32,
     /// Positive = deficit (need more Ready), negative = surplus.
     pub ready_delta: i32,
 }
@@ -361,19 +387,27 @@ mod tests {
     }
 
     #[test]
+    fn test_security_group_id_serde_transparent() {
+        let sg = SecurityGroupId("sg-abcdef0123456789".to_string());
+        let json = serde_json::to_string(&sg).unwrap();
+        assert_eq!(json, "\"sg-abcdef0123456789\"");
+        let parsed: SecurityGroupId = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, sg);
+    }
+
+    #[test]
     fn test_pool_metrics_response_serde() {
         let resp = PoolMetricsResponse {
-            launching: 1,
             warming: 2,
             ready: 3,
             claimed: 4,
             terminating: 5,
-            target_pool_size: 3,
+            target_warm_pool_size: 3,
             ready_delta: 0,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: PoolMetricsResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.launching, 1);
+        assert_eq!(parsed.warming, 2);
         assert_eq!(parsed.ready_delta, 0);
     }
 }

@@ -34,6 +34,7 @@ mod store_tests {
             owner: None,
             claimed_at: None,
             created_at: Timestamp::now(),
+            owner_tag_applied: false,
         }
     }
 

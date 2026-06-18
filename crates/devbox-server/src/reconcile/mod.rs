@@ -19,14 +19,14 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::db::DocumentStore;
-use crate::ec2::Ec2Client;
+use crate::compute::Compute;
 
 /// Spawn the pool reconciliation background task.
 ///
 /// This task periodically checks the pool state and launches or terminates
 /// instances to maintain the desired pool size. It acquires a distributed
 /// leader lock before each tick to prevent duplicate actions across replicas.
-pub fn spawn_reconciliation_loop<E: Ec2Client + 'static>(
+pub fn spawn_reconciliation_loop<E: Compute + 'static>(
     store: Arc<DocumentStore>,
     ec2: Arc<E>,
     config: ReconcilerConfig,

@@ -27,6 +27,10 @@ pub struct DevboxDoc {
     pub claimed_at: Option<Timestamp>,
     /// When the devbox record was created.
     pub created_at: Timestamp,
+    /// Whether the EC2 "devbox:owner" tag has been applied after claiming.
+    /// Tagging is deferred to the reconciler tick; this flag enables retry.
+    #[serde(default)]
+    pub owner_tag_applied: bool,
 }
 
 impl DocumentType for DevboxDoc {
@@ -76,6 +80,7 @@ mod tests {
             owner: None,
             claimed_at: None,
             created_at: Timestamp::now(),
+            owner_tag_applied: false,
         }
     }
 

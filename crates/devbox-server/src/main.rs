@@ -7,9 +7,9 @@ use anyhow::{Context, Result};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
-use devbox_common::{AmiId, InstanceType, SubnetId};
+use devbox_common::{AmiId, InstanceType, SecurityGroupId, SubnetId};
 use devbox_server::db::{DocumentStore, Pool, PoolConfig};
-use devbox_server::ec2::real::RealEc2Client;
+use devbox_server::compute::ec2::Ec2;
 use devbox_server::reconcile::{ReconcilerConfig, spawn_reconciliation_loop};
 use devbox_server::routes::{AppState, build_router};
 
@@ -50,15 +50,40 @@ async fn main() -> Result<()> {
 
     // Load reconciler config from environment
     let reconciler_config = ReconcilerConfig {
-        target_pool_size: std::env::var("POOL_TARGET_SIZE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2),
+        pool_id: std::env::var("POOL_ID").unwrap_or_else(|_| "default".to_string()),
+        server_id: uuid::Uuid::now_v7().to_string(),
         instance_type: InstanceType(
             std::env::var("POOL_INSTANCE_TYPE").unwrap_or_else(|_| "m5.large".to_string()),
         ),
         ami_id: AmiId(std::env::var("POOL_AMI_ID").unwrap_or_default()),
-        subnet_id: SubnetId(std::env::var("POOL_SUBNET_ID").unwrap_or_default()),
+        cpu: std::env::var("POOL_CPU")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2),
+        memory_mib: std::env::var("POOL_MEMORY_MIB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8192),
+        subnet_ids: std::env::var("POOL_SUBNET_IDS")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| SubnetId(s.trim().to_string()))
+            .collect(),
+        security_group_ids: std::env::var("POOL_SECURITY_GROUP_IDS")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| SecurityGroupId(s.trim().to_string()))
+            .collect(),
+        target_warm_pool_size: std::env::var("POOL_TARGET_WARM_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2),
+        max_pool_size: std::env::var("POOL_MAX_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10),
         polling_interval: Duration::from_secs(
             std::env::var("POOL_INTERVAL_SECS")
                 .ok()
@@ -77,14 +102,23 @@ async fn main() -> Result<()> {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
         ),
-        server_id: uuid::Uuid::now_v7().to_string(),
+        lifecycle_hook_timeout: Duration::from_secs(
+            std::env::var("POOL_LIFECYCLE_HOOK_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300),
+        ),
     };
+
+    reconciler_config
+        .validate()
+        .context("invalid reconciler configuration")?;
 
     let reconciler_config = Arc::new(reconciler_config);
 
     // Load AWS config and create EC2 client
     let aws_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-    let ec2_client = Arc::new(RealEc2Client::new(&aws_config));
+    let ec2_client = Arc::new(Ec2::new(&aws_config));
 
     // Spawn reconciliation loop with cancellation support
     let cancel = CancellationToken::new();

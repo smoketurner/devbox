@@ -78,8 +78,10 @@ async fn claim_devbox(
     State(state): State<AppState>,
     JsonBody(req): JsonBody<ClaimRequest>,
 ) -> Result<Json<DevboxResponse>, AppError> {
-    if req.owner.trim().is_empty() {
-        return Err(AppError::BadRequest("owner field is required".into()));
+    if req.owner.trim().is_empty() || req.owner.len() > 256 {
+        return Err(AppError::BadRequest(
+            "owner must be non-empty and at most 256 characters".into(),
+        ));
     }
 
     let ready_docs = state.store.find_all::<DevboxDoc>("state", "ready").await?;
@@ -87,21 +89,26 @@ async fn claim_devbox(
         return Err(AppError::Conflict("no devboxes available".into()));
     }
 
-    // Sort candidates: preferred instance_type first
+    // Sort candidates: prefer matching instance_type first, then by created_at
+    // ascending (longest-waiting first).
     let mut candidates = ready_docs;
-    if let Some(ref pref) = req.instance_type {
-        candidates.sort_by(|a, b| {
+    candidates.sort_by(|a, b| {
+        if let Some(ref pref) = req.instance_type {
             let a_match = a.data.instance_type == *pref;
             let b_match = b.data.instance_type == *pref;
-            b_match.cmp(&a_match)
-        });
-    }
+            if a_match != b_match {
+                return b_match.cmp(&a_match);
+            }
+        }
+        a.data.created_at.cmp(&b.data.created_at)
+    });
 
     for candidate in candidates {
         let mut updated = candidate.data.clone();
         updated.state = DevboxState::Claimed;
         updated.owner = Some(req.owner.clone());
         updated.claimed_at = Some(jiff::Timestamp::now());
+        updated.owner_tag_applied = false;
 
         let success = state
             .store
@@ -121,7 +128,7 @@ async fn claim_devbox(
     }
 
     Err(AppError::Conflict(
-        "no devboxes available (all claimed concurrently)".into(),
+        "pool exhausted: all candidates failed concurrent claim".into(),
     ))
 }
 
@@ -151,9 +158,16 @@ async fn release_devbox(
 
     let mut updated = doc.data.clone();
     updated.state = DevboxState::Terminating;
-    updated.owner = None;
 
-    state.store.update(&id, &updated).await?;
+    let success = state
+        .store
+        .compare_and_update(&doc.id, doc.version, &updated)
+        .await?;
+    if !success {
+        return Err(AppError::Conflict(
+            "devbox was modified concurrently".into(),
+        ));
+    }
 
     let refreshed = state
         .store
@@ -169,7 +183,6 @@ async fn pool_metrics(
 ) -> Result<Json<PoolMetricsResponse>, AppError> {
     let docs = state.store.list_all::<DevboxDoc>().await?;
 
-    let mut launching = 0u32;
     let mut warming = 0u32;
     let mut ready = 0u32;
     let mut claimed = 0u32;
@@ -177,7 +190,7 @@ async fn pool_metrics(
 
     for doc in &docs {
         match doc.data.state {
-            DevboxState::Launching => launching = launching.saturating_add(1),
+            DevboxState::Launching => {}
             DevboxState::Warming => warming = warming.saturating_add(1),
             DevboxState::Ready => ready = ready.saturating_add(1),
             DevboxState::Claimed => claimed = claimed.saturating_add(1),
@@ -185,18 +198,17 @@ async fn pool_metrics(
         }
     }
 
-    let target = state.reconciler_config.target_pool_size;
+    let target = state.reconciler_config.target_warm_pool_size;
     let ready_delta = i32::try_from(target)
         .unwrap_or(i32::MAX)
         .saturating_sub(i32::try_from(ready).unwrap_or(0));
 
     Ok(Json(PoolMetricsResponse {
-        launching,
         warming,
         ready,
         claimed,
         terminating,
-        target_pool_size: target,
+        target_warm_pool_size: target,
         ready_delta,
     }))
 }

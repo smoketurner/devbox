@@ -7,7 +7,7 @@ This plan implements the pool reconciliation system for the devbox-server. The w
 ## Tasks
 
 - [ ] 1. Add dependencies and restructure modules
-  - [ ] 1.1 Add aws-sdk-ec2 and proptest dependencies to Cargo.toml
+  - [x] 1.1 Add aws-sdk-ec2 and proptest dependencies to Cargo.toml
     - Add `aws-sdk-ec2` to `[dependencies]` in `crates/devbox-server/Cargo.toml` with features `["rt-tokio", "default-https-client", "behavior-version-latest"]`
     - Add `proptest` to `[dev-dependencies]`
     - _Requirements: 8.1_

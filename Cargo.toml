@@ -119,6 +119,7 @@ anyhow = { version = "=1.0.102", default-features = false }
 askama = { version = "=0.16.0", default-features = false }
 aws-config = { version = "=1.8.18", default-features = false }
 aws-lc-rs = { version = "=1.17.0", default-features = false }
+aws-sdk-autoscaling = { version = "=1.120.0", default-features = false }
 aws-sdk-dsql = { version = "=1.60.0", default-features = false }
 aws-sdk-ec2 = { version = "=1.232.0", default-features = false }
 axum = { version = "=0.8.9", default-features = false }
