@@ -110,12 +110,62 @@ work; this spec is the design of record.)
 - **IDE-native.** Plain SSH means VS Code Remote-SSH / JetBrains Gateway work with
   no bespoke integration.
 
+## Why a command and not user-data writing a file?
+
+A natural question: why run `AuthorizedPrincipalsCommand` on every auth instead of
+having **user-data read the `devbox:owner` tag once and write an
+`AuthorizedPrincipalsFile`**? The answer is **lifecycle timing**.
+
+In a warm pool, instances are launched and brought to `Ready` *before* anyone
+claims them:
+
+```
+ASG launches ──> user-data runs ONCE ──> Warming ──> Ready   (unclaimed, NO devbox:owner tag)
+                                                         │
+                                  ... sits warm ...      │
+                                                         ▼
+        agent/human claims ──> reconciler tags the *already-running* box  devbox:owner=<principal>
+```
+
+User-data executes at first boot, when the box is still generic and **unowned** —
+there is no `devbox:owner` tag to read. The owner is assigned later, by tagging a
+box that is already running and warm. A one-shot user-data write would therefore
+run minutes too early and capture nothing.
+
+Because the trigger (the claim) happens *after* boot, a "write the file" approach
+needs something to notice the tag change after user-data has finished — which means
+either:
+
+- a **polling daemon** on the box that watches IMDS and rewrites the file (a
+  long-running, stateful service with a staleness window and a stale-file failure
+  mode — strictly more moving parts than the hook), or
+- a **push from the control plane** via SSM RunCommand (adds an SSM dependency and
+  a per-claim management-plane action, and violates the rule that devboxes never
+  receive a push from the management plane).
+
+`AuthorizedPrincipalsCommand` avoids all of that: sshd invokes it lazily, only when
+someone actually connects, and it reads the *current* tag at that instant — always
+correct (even after re-tagging), no writer to keep in sync, no daemon, nothing
+written to disk, and fail-closed. Note also that no sshd directive reads an EC2 tag
+directly: `AuthorizedPrincipalsFile` only templates its *path* by `%u`, not by a tag
+value, so the choice is genuinely command (pull) vs. writer (push). Given warm-pool
+timing, pull wins.
+
+This trade-off only flips in a **cold-launch-per-claim** model, where the owner is
+known at launch and could be baked in by user-data or ASG tag-propagation-at-launch.
+That model sacrifices the sub-second claim the warm pool exists to provide, so it is
+out of scope here.
+
 ## Alternatives considered
 
+- **User-data (or ASG tag-propagation) writing `AuthorizedPrincipalsFile` at
+  launch** — runs before the box is claimed, so the owner tag does not yet exist;
+  wrong lifecycle moment for a warm pool (see above). Rejected.
+- **`AuthorizedPrincipalsFile` kept current by an on-box polling daemon** — more
+  moving parts and a staleness window versus an on-demand command. Rejected.
 - **`AuthorizedPrincipalsFile` pushed via SSM RunCommand at claim** — push-based,
-  adds a management-plane action and SSM dependency per claim. Rejected.
-- **User-data injection at launch** — runs only at boot, but claims happen after a
-  host is already warm; wrong lifecycle moment. Rejected.
+  adds a management-plane action and SSM dependency per claim, and breaks the
+  no-management-plane-callback isolation rule. Rejected.
 - **EC2 Instance Connect** — delivers ephemeral keys but is AWS-API-mediated and
   doesn't model the per-claim principal cleanly alongside a CA. Rejected in favor
   of the Vouch CA.
