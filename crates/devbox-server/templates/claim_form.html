@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Claim Devbox</title>
+    <link rel="stylesheet" href="/static/css/output.css">
+</head>
+<body class="bg-devbox-bg text-gray-200 min-h-screen">
+    <div class="max-w-xl mx-auto px-6 py-8">
+        <a href="/" class="text-blue-400 hover:text-blue-300 transition-colors mb-6 inline-block">&larr; Back to Dashboard</a>
+        <h1 class="text-2xl font-bold text-white mb-6">Claim a Devbox</h1>
+        {% if let Some(err) = error %}
+        <div class="bg-red-900/50 border border-red-700 text-red-200 px-4 py-3 rounded mb-4">
+            {{ err }}
+        </div>
+        {% endif %}
+        <div class="card p-6">
+            <form method="post" action="/devboxes/claim" class="space-y-4">
+                <div>
+                    <label for="owner" class="block text-sm text-gray-400 mb-1">Owner (required)</label>
+                    <input type="text" id="owner" name="owner" required
+                           class="w-full bg-devbox-bg border border-gray-600 rounded px-3 py-2 text-white focus:outline-none focus:border-blue-500">
+                </div>
+                <div>
+                    <label for="instance_type" class="block text-sm text-gray-400 mb-1">Instance Type (optional)</label>
+                    <input type="text" id="instance_type" name="instance_type"
+                           value="{{ instance_type.as_deref().unwrap_or_default() }}"
+                           placeholder="e.g., m5.large"
+                           class="w-full bg-devbox-bg border border-gray-600 rounded px-3 py-2 text-white focus:outline-none focus:border-blue-500">
+                </div>
+                <button type="submit" class="bg-blue-600 hover:bg-blue-700 text-white px-6 py-2 rounded transition-colors">Claim</button>
+            </form>
+        </div>
+    </div>
+</body>
+</html>

@@ -37,6 +37,87 @@ impl std::fmt::Display for DevboxId {
 }
 
 // ============================================================================
+// InstanceType
+// ============================================================================
+
+/// A strongly-typed EC2 instance type (e.g., "m5.large").
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct InstanceType(pub String);
+
+impl std::fmt::Display for InstanceType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for InstanceType {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl AsRef<str> for InstanceType {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+// ============================================================================
+// AmiId
+// ============================================================================
+
+/// A strongly-typed AMI ID (e.g., "ami-0123456789abcdef0").
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AmiId(pub String);
+
+impl std::fmt::Display for AmiId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for AmiId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl AsRef<str> for AmiId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+// ============================================================================
+// SubnetId
+// ============================================================================
+
+/// A strongly-typed subnet ID (e.g., "subnet-0123456789abcdef0").
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SubnetId(pub String);
+
+impl std::fmt::Display for SubnetId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for SubnetId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl AsRef<str> for SubnetId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+// ============================================================================
 // DevboxState
 // ============================================================================
 
@@ -81,7 +162,7 @@ pub struct ClaimRequest {
     /// The user/owner requesting a devbox.
     pub owner: String,
     /// Optional preferred instance type.
-    pub instance_type: Option<String>,
+    pub instance_type: Option<InstanceType>,
 }
 
 /// Request to release a claimed devbox.
@@ -101,8 +182,8 @@ pub struct DevboxResponse {
     pub id: String,
     pub instance_id: Option<String>,
     pub state: DevboxState,
-    pub instance_type: String,
-    pub ami_id: String,
+    pub instance_type: InstanceType,
+    pub ami_id: AmiId,
     pub owner: Option<String>,
     pub created_at: String,
     pub claimed_at: Option<String>,
@@ -119,6 +200,19 @@ pub struct DevboxListResponse {
 pub struct HealthResponse {
     pub status: String,
     pub database: String,
+}
+
+/// Pool metrics response showing instance counts by state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolMetricsResponse {
+    pub launching: u32,
+    pub warming: u32,
+    pub ready: u32,
+    pub claimed: u32,
+    pub terminating: u32,
+    pub target_pool_size: u32,
+    /// Positive = deficit (need more Ready), negative = surplus.
+    pub ready_delta: i32,
 }
 
 // ============================================================================
@@ -217,12 +311,15 @@ mod tests {
     fn test_claim_request_serde() {
         let req = ClaimRequest {
             owner: "user@example.com".to_string(),
-            instance_type: Some("m5.large".to_string()),
+            instance_type: Some(InstanceType("m5.large".to_string())),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ClaimRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.owner, "user@example.com");
-        assert_eq!(parsed.instance_type, Some("m5.large".to_string()));
+        assert_eq!(
+            parsed.instance_type,
+            Some(InstanceType("m5.large".to_string()))
+        );
     }
 
     #[test]
@@ -234,5 +331,49 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: HealthResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.status, "ok");
+    }
+
+    #[test]
+    fn test_instance_type_serde_transparent() {
+        let it = InstanceType("m5.large".to_string());
+        let json = serde_json::to_string(&it).unwrap();
+        assert_eq!(json, "\"m5.large\"");
+        let parsed: InstanceType = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, it);
+    }
+
+    #[test]
+    fn test_ami_id_serde_transparent() {
+        let ami = AmiId("ami-12345678".to_string());
+        let json = serde_json::to_string(&ami).unwrap();
+        assert_eq!(json, "\"ami-12345678\"");
+        let parsed: AmiId = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, ami);
+    }
+
+    #[test]
+    fn test_subnet_id_serde_transparent() {
+        let subnet = SubnetId("subnet-abcdef".to_string());
+        let json = serde_json::to_string(&subnet).unwrap();
+        assert_eq!(json, "\"subnet-abcdef\"");
+        let parsed: SubnetId = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, subnet);
+    }
+
+    #[test]
+    fn test_pool_metrics_response_serde() {
+        let resp = PoolMetricsResponse {
+            launching: 1,
+            warming: 2,
+            ready: 3,
+            claimed: 4,
+            terminating: 5,
+            target_pool_size: 3,
+            ready_delta: 0,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: PoolMetricsResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.launching, 1);
+        assert_eq!(parsed.ready_delta, 0);
     }
 }

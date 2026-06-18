@@ -4,7 +4,7 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::db::document_type::{DocumentType, IndexEntry};
-use devbox_common::DevboxState;
+use devbox_common::{AmiId, DevboxState, InstanceType, SubnetId};
 
 /// A devbox instance document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,11 +14,11 @@ pub struct DevboxDoc {
     /// Current state in the lifecycle.
     pub state: DevboxState,
     /// EC2 instance type (e.g., "m5.large").
-    pub instance_type: String,
+    pub instance_type: InstanceType,
     /// AMI ID used to launch the instance.
-    pub ami_id: String,
+    pub ami_id: AmiId,
     /// Subnet ID where the instance is launched.
-    pub subnet_id: String,
+    pub subnet_id: SubnetId,
     /// EBS volume ID (if attached).
     pub ebs_volume_id: Option<String>,
     /// Owner (user who claimed the devbox).
@@ -69,9 +69,9 @@ mod tests {
         DevboxDoc {
             instance_id: Some("i-1234567890abcdef0".to_string()),
             state: DevboxState::Ready,
-            instance_type: "m5.large".to_string(),
-            ami_id: "ami-12345678".to_string(),
-            subnet_id: "subnet-12345678".to_string(),
+            instance_type: InstanceType("m5.large".to_string()),
+            ami_id: AmiId("ami-12345678".to_string()),
+            subnet_id: SubnetId("subnet-12345678".to_string()),
             ebs_volume_id: Some("vol-12345678".to_string()),
             owner: None,
             claimed_at: None,
@@ -85,7 +85,7 @@ mod tests {
         let json = serde_json::to_string(&doc).unwrap();
         let parsed: DevboxDoc = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.state, DevboxState::Ready);
-        assert_eq!(parsed.instance_type, "m5.large");
+        assert_eq!(parsed.instance_type, InstanceType("m5.large".to_string()));
     }
 
     #[test]

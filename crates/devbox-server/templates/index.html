@@ -8,7 +8,15 @@
 </head>
 <body class="bg-devbox-bg text-gray-200 min-h-screen">
     <div class="max-w-6xl mx-auto px-6 py-8">
-        <h1 class="text-2xl font-bold text-white mb-6">Devbox Dashboard</h1>
+        <div class="flex items-center justify-between mb-6">
+            <h1 class="text-2xl font-bold text-white">Devbox Dashboard</h1>
+            <a href="/devboxes/claim" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded transition-colors">Claim Devbox</a>
+        </div>
+        {% if let Some(err) = error %}
+        <div class="bg-red-900/50 border border-red-700 text-red-200 px-4 py-3 rounded mb-4">
+            {{ err }}
+        </div>
+        {% endif %}
         <div class="card overflow-hidden p-0">
             <table class="w-full">
                 <thead>
@@ -23,7 +31,7 @@
                 </thead>
                 <tbody>
                     {% for devbox in devboxes %}
-                    <tr class="hover:bg-devbox-raised/50 transition-colors">
+                    <tr class="hover:bg-devbox-raised/50 transition-colors cursor-pointer" onclick="window.location='/devboxes/{{ devbox.id }}'">
                         <td class="table-cell font-mono text-xs">{{ devbox.id }}</td>
                         <td class="table-cell"><span class="status-{{ devbox.state }}">{{ devbox.state }}</span></td>
                         <td class="table-cell">{{ devbox.instance_type }}</td>
