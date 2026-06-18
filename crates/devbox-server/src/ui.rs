@@ -89,7 +89,11 @@ impl From<Document<DevboxDoc>> for DevboxDetail {
             instance_id: doc.data.instance_id.unwrap_or_default(),
             ebs_volume_id: doc.data.ebs_volume_id.unwrap_or_default(),
             owner: doc.data.owner.unwrap_or_default(),
-            claimed_at: doc.data.claimed_at.map(|ts| ts.to_string()).unwrap_or_default(),
+            claimed_at: doc
+                .data
+                .claimed_at
+                .map(|ts| ts.to_string())
+                .unwrap_or_default(),
             created_at: doc.created_at.to_string(),
         }
     }
@@ -119,7 +123,12 @@ pub struct ClaimFormTemplate {
     pub error: Option<String>,
 }
 
-impl_template_into_response!(DashboardTemplate, DevboxDetailTemplate, ErrorPageTemplate, ClaimFormTemplate);
+impl_template_into_response!(
+    DashboardTemplate,
+    DevboxDetailTemplate,
+    ErrorPageTemplate,
+    ClaimFormTemplate
+);
 
 /// A devbox entry for the dashboard template.
 pub struct DashboardDevbox {

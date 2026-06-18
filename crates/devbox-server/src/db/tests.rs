@@ -48,7 +48,10 @@ mod store_tests {
 
         let fetched = store.get::<DevboxDoc>(&inserted.id).await.unwrap().unwrap();
         assert_eq!(fetched.id, inserted.id);
-        assert_eq!(fetched.data.instance_type, InstanceType("m5.large".to_string()));
+        assert_eq!(
+            fetched.data.instance_type,
+            InstanceType("m5.large".to_string())
+        );
     }
 
     #[tokio::test]

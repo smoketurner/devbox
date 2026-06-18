@@ -74,8 +74,10 @@ async fn recover_stuck_instances(
     };
 
     for doc in docs {
-        let is_stuck_candidate =
-            matches!(doc.data.state, DevboxState::Launching | DevboxState::Warming);
+        let is_stuck_candidate = matches!(
+            doc.data.state,
+            DevboxState::Launching | DevboxState::Warming
+        );
         if !is_stuck_candidate {
             continue;
         }

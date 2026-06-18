@@ -38,14 +38,14 @@ fn build_lock_doc(config: &ReconcilerConfig, expires_at: Timestamp) -> LeaderLoc
 /// # Errors
 ///
 /// Returns an error if the database operation fails.
-pub(super) async fn try_acquire_lock(store: &DocumentStore, config: &ReconcilerConfig) -> Result<bool> {
+pub(super) async fn try_acquire_lock(
+    store: &DocumentStore,
+    config: &ReconcilerConfig,
+) -> Result<bool> {
     let now = Timestamp::now();
     let ttl_secs = config.lock_ttl.as_secs();
     let ttl_nanos = config.lock_ttl.subsec_nanos();
-    let signed_duration = SignedDuration::new(
-        i64::try_from(ttl_secs)?,
-        i32::try_from(ttl_nanos)?,
-    );
+    let signed_duration = SignedDuration::new(i64::try_from(ttl_secs)?, i32::try_from(ttl_nanos)?);
     let new_expiry = now.checked_add(signed_duration)?;
 
     match store.get::<LeaderLockDoc>(LOCK_ID).await? {

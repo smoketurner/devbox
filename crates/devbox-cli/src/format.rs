@@ -13,10 +13,7 @@ pub(crate) fn format_list_table(list: &DevboxListResponse) -> String {
 
     for d in &list.devboxes {
         let id_short = truncate(&d.id, 8);
-        let instance_short = truncate(
-            d.instance_id.as_deref().unwrap_or("-"),
-            19,
-        );
+        let instance_short = truncate(d.instance_id.as_deref().unwrap_or("-"), 19);
         let owner = d.owner.as_deref().unwrap_or("-");
         lines.push(format!(
             "{:<8}  {:<12}  {:<12}  {:<19}  {}",
@@ -57,7 +54,10 @@ pub(crate) fn format_claim_success(d: &DevboxResponse) -> String {
     let instance = d.instance_id.as_deref().unwrap_or("(pending)");
     format!(
         "Claimed devbox {}\n  Instance: {}\n  Type: {}\n  Connect: aws ssm start-session --target {}",
-        &d.id, instance, d.instance_type.as_ref(), instance
+        &d.id,
+        instance,
+        d.instance_type.as_ref(),
+        instance
     )
 }
 
@@ -100,9 +100,7 @@ mod tests {
 
     #[test]
     fn test_format_list_table_empty() {
-        let list = DevboxListResponse {
-            devboxes: vec![],
-        };
+        let list = DevboxListResponse { devboxes: vec![] };
         let output = format_list_table(&list);
         assert!(output.contains("ID"));
         assert!(output.contains("STATE"));

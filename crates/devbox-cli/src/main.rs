@@ -5,7 +5,9 @@ mod format;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use devbox_common::{ClaimRequest, DevboxListResponse, DevboxResponse, InstanceType, ReleaseRequest};
+use devbox_common::{
+    ClaimRequest, DevboxListResponse, DevboxResponse, InstanceType, ReleaseRequest,
+};
 
 /// Devbox CLI - manage remote development environments.
 #[derive(Parser)]
