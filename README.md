@@ -3,9 +3,9 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue)](LICENSE-APACHE)
 [![Rust](https://img.shields.io/badge/rust-1.96%2B-orange)](https://www.rust-lang.org)
 
-**Pre-warmed development environments for coding agents.**
+**Tooling to help any company adopt remote development machines — for engineers and the coding agents working alongside them.**
 
-A remote devbox orchestration service that manages a pool of EC2 instances, providing ephemeral, isolated development environments on demand. Inspired by [Stripe's Minions architecture](https://www.tryprompt.ai/blog/how-stripe-built-an-ai-coding-assistant).
+The control plane (HTTP API + pool reconciler) and CLI that manage a warm pool of ephemeral, isolated EC2 instances, claimable on demand over SSH. The AWS foundation (VPC, IAM, networking, AMI pipeline) is provisioned separately by Terraform in [`smoketurner/devbox-infra`](https://github.com/smoketurner/devbox-infra). Inspired by [Stripe's Minions architecture](https://www.tryprompt.ai/blog/how-stripe-built-an-ai-coding-assistant).
 
 ```bash
 # Claim a ready devbox instantly

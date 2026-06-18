@@ -4,14 +4,20 @@ Guidance for Claude Code and other agents working in this repository.
 
 ## What this is
 
-**Devbox provisions remote development machines** — pre-warmed, isolated EC2
-instances that a human engineer or a coding agent can claim in seconds, work on
-over **SSH**, and discard when done.
+**Devbox is tooling to help any company adopt and operate remote development
+machines.** It is the control plane — an HTTP API, a CLI, and a pool reconciler —
+that maintains a warm pool of isolated EC2 instances that anyone on a team
+(engineers and the coding agents working alongside them) can claim in seconds,
+work on over **SSH**, and discard when done.
+
+The underlying AWS foundation (VPC, networking, IAM, the AMI pipeline) is
+provisioned separately by Terraform in
+[`smoketurner/devbox-infra`](https://github.com/smoketurner/devbox-infra). This
+repo is the server + CLI + tooling that runs on top of that substrate.
 
 The thesis: **the remote dev machine is the right substrate for modern software
-development**, and especially for agent-driven development. A standardized,
-disposable, network-isolated instance gives you three things a laptop or a
-container can't:
+development** — for people and agents alike. A standardized, disposable,
+network-isolated instance gives you three things a laptop or a container can't:
 
 1. **Full-fidelity hardware and OS** — real Linux, real resources (up to many
    cores / hundreds of GB RAM), no "works on my machine."
@@ -141,6 +147,13 @@ authentication yet.
   **idle-claim reclaim**, pool config via **env vars**.
 - **Durable agent sessions** (reconnect while the agent keeps working).
 - **Dashboard styling** — `static/css` is a placeholder.
+
+## Related repositories
+
+- **[`smoketurner/devbox-infra`](https://github.com/smoketurner/devbox-infra)** —
+  Terraform for the AWS foundation (VPC, subnets, security groups, IAM, and the
+  AMI pipeline) that this control plane runs on. Networking and IAM live there;
+  pool/claim/lifecycle logic lives here.
 
 ## Source of truth
 
