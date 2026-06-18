@@ -25,6 +25,26 @@ These rules apply to all code in this repository without exception:
 - EC2 operations use the server's instance role (no static keys)
 - API authentication will use IAM Signature V4 or bearer tokens (not yet implemented)
 
+## SSH Access (Vouch CA)
+
+Users and agents reach devboxes over **SSH** — the access path every remote IDE
+(VS Code Remote-SSH, JetBrains Gateway, Cursor) requires.
+
+- **Certificate-based auth via Vouch's SSH CA.** Vouch issues short-lived user
+  certificates; devbox hosts trust the CA via `TrustedUserCAKeys`. There are **no
+  `authorized_keys` files to manage** and no static keys baked into AMIs.
+- **Dynamic per-claim authorization.** Claiming a devbox tags the instance
+  `devbox:owner=<principal>` (applied by the reconciler). The host reads that tag
+  from IMDSv2 (`InstanceMetadataTags=enabled`) via an `sshd`
+  `AuthorizedPrincipalsCommand`, so a CA-signed cert is accepted only for the
+  current claimant. The instance never calls back to the management plane,
+  preserving the isolation rule above.
+- **Identity contract:** the claim `owner` MUST equal the certificate principal
+  Vouch mints. The principal is not secret; all trust derives from the CA
+  signature. See [`../specs/ssh-access/`](../specs/ssh-access/).
+- Disable password auth; SSH protocol 2 only; passwordless connections still
+  flow through the CA + principals check.
+
 ## Data Handling
 
 - Document data is stored as plain JSON (no client-side encryption needed for devbox metadata)

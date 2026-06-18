@@ -1,6 +1,13 @@
 # EC2 Integration
 
-**Status:** Draft
+> **⚠️ Superseded.** This spec describes direct EC2 instance lifecycle operations
+> (`RunInstances` / `TerminateInstances` / EBS attach). The implementation now
+> manages instances through an Auto Scaling Group + Launch Template; see
+> [`asg-pool-management/`](asg-pool-management/) and the `compute` module
+> (`crates/devbox-server/src/compute/`). Retained for history; see
+> [`/CLAUDE.md`](../../CLAUDE.md) for the current architecture.
+
+**Status:** Superseded (was: Draft)
 
 ## Overview
 

@@ -1,5 +1,10 @@
 # Implementation Plan: Pool Reconciliation
 
+> **⚠️ Superseded.** This plan targets the original direct-`RunInstances`
+> reconciler. Pool management is now ASG-based — see
+> [`../asg-pool-management/`](../asg-pool-management/) and
+> [`/CLAUDE.md`](../../../CLAUDE.md). Retained for history.
+
 ## Overview
 
 This plan implements the pool reconciliation system for the devbox-server. The work is structured around module restructuring first, then building the core abstractions (config, EC2 trait, leader lock), followed by the reconciliation tick logic, the metrics endpoint, and finally integration testing. Each task builds incrementally on the previous ones and references specific requirements.

@@ -1,5 +1,11 @@
 # Design Document: Pool Reconciliation
 
+> **⚠️ Superseded.** This design predates the move to ASG-based pool management.
+> It describes the reconciler launching and terminating individual EC2 instances
+> directly. The current reconciler manages capacity through an Auto Scaling Group
+> + Launch Template — see [`../asg-pool-management/`](../asg-pool-management/) and
+> [`/CLAUDE.md`](../../../CLAUDE.md). Retained for history.
+
 ## Overview
 
 The Pool Reconciliation system is a background subsystem of the devbox-server that maintains a configurable number of ready-to-use EC2 instances. It runs as a tokio background task, periodically inspecting the state of DevboxDoc records in the DocumentStore and taking corrective actions: launching new instances when the pool is below target, advancing instances through lifecycle states, terminating decommissioned instances, and recovering from stuck states.

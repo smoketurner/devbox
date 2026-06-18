@@ -83,15 +83,22 @@ Define an AMI build pipeline using EC2 Image Builder that produces a golden AMI 
 
 ### Requirement 6: SSH Access Configuration
 
-**User Story:** As a coding agent, I want SSH access properly configured on the AMI, so that I can connect to the devbox instance securely after claiming it.
+**User Story:** As a coding agent, I want SSH access configured for certificate-based auth via the Vouch CA, so that I can connect to a claimed devbox without any per-host key management.
+
+See [`../ssh-access/`](../ssh-access/) for the full access design.
 
 #### Acceptance Criteria
 
-1. THE Component SHALL configure the SSH daemon to allow public key authentication only and disable password authentication
-2. THE Component SHALL configure the SSH daemon to use EC2 Instance Connect for public key delivery, allowing key injection at connection time without baking static keys into the AMI
-3. THE Component SHALL configure the SSH daemon to listen on port 22 with protocol version 2 only
-4. THE Component SHALL set SSH idle timeout to 3600 seconds (ClientAliveInterval 300, ClientAliveCountMax 12) to prevent premature disconnection during agent work
-5. THE Component SHALL configure the agent user account to accept SSH connections with a login shell of /bin/bash and appropriate sudoers entry (passwordless sudo for the agent user)
+1. THE Component SHALL configure the SSH daemon to allow public key (certificate) authentication only and disable password authentication
+2. THE Component SHALL bake the **Vouch SSH CA public key** into the image (e.g. `/etc/ssh/vouch_ca.pub`) and set `TrustedUserCAKeys` to it, so the host trusts Vouch-issued user certificates without any `authorized_keys` files
+3. THE Component SHALL install a `devbox-principals` resolver script (e.g. `/usr/local/sbin/devbox-principals`) and configure `AuthorizedPrincipalsCommand` + `AuthorizedPrincipalsCommandUser nobody`, where the resolver reads the `devbox:owner` instance tag from IMDSv2 and prints the authorized principal (fail-closed: empty output when untagged)
+4. THE Component SHALL configure the SSH daemon to listen on port 22 with protocol version 2 only
+5. THE Component SHALL set SSH idle timeout to 3600 seconds (ClientAliveInterval 300, ClientAliveCountMax 12) to prevent premature disconnection during agent work
+6. THE Component SHALL configure the login user account to accept SSH connections with a login shell of /bin/bash and appropriate sudoers entry (passwordless sudo for the login user)
+
+> Note: the per-claim authorization (criterion 3) also requires the Launch
+> Template to enable instance metadata tags (`InstanceMetadataTags=enabled`) so the
+> `devbox:owner` tag is readable via IMDS. See `../ssh-access/design.md`.
 
 ### Requirement 7: AMI ID Publication to SSM Parameter Store
 
