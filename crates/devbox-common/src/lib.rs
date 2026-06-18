@@ -154,7 +154,7 @@ impl AsRef<str> for SecurityGroupId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DevboxState {
-    /// Instance is being launched (EC2 RunInstances called).
+    /// Instance is being launched by the Auto Scaling Group.
     Launching,
     /// Instance is running but not yet ready (warming up).
     Warming,

@@ -10,8 +10,11 @@
 | Server library root | `crates/devbox-server/src/lib.rs` |
 | HTTP route handlers | `crates/devbox-server/src/routes.rs` |
 | UI (HTML dashboard) routes | `crates/devbox-server/src/ui.rs` |
-| Pool reconciliation loop | `crates/devbox-server/src/reconcile.rs` |
-| EC2 client trait | `crates/devbox-server/src/ec2/mod.rs` |
+| Pool reconciliation (loop, tick, config, lock) | `crates/devbox-server/src/reconcile/` |
+| Compute trait (ASG + Launch Template ops) | `crates/devbox-server/src/compute/mod.rs` |
+| Compute AWS impl + test mock | `crates/devbox-server/src/compute/ec2.rs`, `crates/devbox-server/src/compute/mock.rs` |
+| Leader-lock document | `crates/devbox-server/src/documents/leader_lock.rs` |
+| AWS type conversions | `crates/devbox-server/src/convert.rs` |
 | Database module root | `crates/devbox-server/src/db/mod.rs` |
 | Pool enum + macros | `crates/devbox-server/src/db/pool.rs` |
 | DocumentStore (generic CRUD) | `crates/devbox-server/src/db/store.rs` |
@@ -50,7 +53,7 @@
 2. Add corresponding `.sql` file in `crates/devbox-server/migrations/postgres/`
 3. Keep DDL compatible between SQLite and Postgres
 
-### New EC2 Operation
-1. Add method to `Ec2Client` trait in `crates/devbox-server/src/ec2/mod.rs`
-2. Implement in the concrete client
-3. Call from reconciliation loop or route handler
+### New Compute Operation
+1. Add method to the `Compute` trait in `crates/devbox-server/src/compute/mod.rs`
+2. Implement it in the AWS client (`compute/ec2.rs`) and the test mock (`compute/mock.rs`)
+3. Call from the reconciliation tick (`reconcile/tick.rs`) or a route handler

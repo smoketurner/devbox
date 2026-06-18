@@ -1,5 +1,10 @@
 # Requirements Document
 
+> **⚠️ Superseded.** These requirements target the original direct-`RunInstances`
+> reconciler. Pool management is now ASG-based — see
+> [`../asg-pool-management/`](../asg-pool-management/) and
+> [`/CLAUDE.md`](../../../CLAUDE.md). Retained for history.
+
 ## Introduction
 
 This document specifies the requirements for the Pool Reconciliation system and EC2 Client in the devbox server. The server operates in a stateless, multi-instance deployment model where multiple replicas may be running concurrently; all state is persisted in the database and no in-memory state is assumed to survive across ticks or restarts. The Pool Reconciliation system is a background task that maintains a configurable number of ready-to-use devbox instances by launching new EC2 instances when the pool is below target, advancing instances through their lifecycle states, terminating instances that are no longer needed, and recovering from stuck states. A distributed leader election mechanism ensures that only one Reconciler instance actively performs actions at a time, preventing duplicate launches across server replicas. The EC2 Client provides the interface to AWS for instance management, with both a real AWS SDK implementation and a mock implementation for testing.

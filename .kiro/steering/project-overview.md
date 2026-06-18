@@ -32,12 +32,20 @@ Launching -> Warming -> Ready -> Claimed -> Terminating
 - **Claimed** - A user/agent has claimed this instance and is using it
 - **Terminating** - Instance is being torn down
 
-### Pool Reconciliation
+### Pool Reconciliation (ASG-based)
 
-A background loop runs every 30 seconds to maintain the desired pool size:
-- If fewer than N instances are in Ready state, launch new ones
-- If instances have been Claimed too long without activity, reclaim them
-- If instances are stuck in Launching/Warming, handle timeouts
+Pool management is backed by an **Auto Scaling Group + Launch Template**, not
+direct `RunInstances` calls. A leader-locked background loop reconciles each tick:
+- Ensure the Launch Template and ASG exist and match the configured AMI / type /
+  security groups
+- Set `DesiredCapacity = claimed_count + target_warm_pool_size`
+- Sync `DevboxDoc` records against current ASG membership
+- Apply the `devbox:owner` tag to newly claimed instances; manage warming,
+  scale-in protection, and termination of released instances
+
+The authoritative design is in `.kiro/specs/asg-pool-management/`. (The older
+`devbox-pool-manager.md`, `pool-reconciliation/`, and `ec2-integration.md` specs
+describe a superseded direct-instance approach and are kept only as history.)
 
 ### Document Store
 
@@ -51,8 +59,13 @@ The database layer is document-oriented using a generic `DocumentStore`:
 ## Server Architecture
 
 Two route groups:
-- **API routes** (`/api/devboxes/*`, `/health`) - JSON responses for programmatic access
+- **API routes** (`/api/v1/devboxes/*`, `/api/v1/pool/metrics`, `/health`) - JSON responses for programmatic access
 - **UI routes** (`/`) - HTML dashboard via Askama templates + TailwindCSS
+
+Devbox instances are reached over **SSH**, authenticated by **Vouch's SSH CA**
+(short-lived certificates, no `authorized_keys`). Per-claim authorization is
+dynamic via the `devbox:owner` instance tag + IMDSv2 + `AuthorizedPrincipalsCommand`.
+See `.kiro/specs/ssh-access/` and `.kiro/steering/security.md`.
 
 Database: SQLite for local development, in-memory SQLite for tests, Aurora DSQL in production. The `Pool` enum dispatches at runtime based on `DATABASE_URL` scheme. Query building uses `sea-query`. Migrations in `crates/devbox-server/migrations/{sqlite,postgres}/`.
 

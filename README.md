@@ -3,16 +3,16 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue)](LICENSE-APACHE)
 [![Rust](https://img.shields.io/badge/rust-1.96%2B-orange)](https://www.rust-lang.org)
 
-**Pre-warmed development environments for coding agents.**
+**Tooling to help any company adopt remote development machines — for engineers and the coding agents working alongside them.**
 
-A remote devbox orchestration service that manages a pool of EC2 instances, providing ephemeral, isolated development environments on demand. Inspired by [Stripe's Minions architecture](https://www.tryprompt.ai/blog/how-stripe-built-an-ai-coding-assistant).
+The control plane (HTTP API + pool reconciler) and CLI that manage a warm pool of ephemeral, isolated EC2 instances, claimable on demand over SSH. The AWS foundation (VPC, IAM, networking, AMI pipeline) is provisioned separately by Terraform in [`smoketurner/devbox-infra`](https://github.com/smoketurner/devbox-infra). Inspired by [Stripe's Minions architecture](https://www.tryprompt.ai/blog/how-stripe-built-an-ai-coding-assistant).
 
 ```bash
 # Claim a ready devbox instantly
 $ devbox claim --owner agent-42
 Claimed devbox 01914a6b-... (i-0abc123def456)
 Instance type: m5.large
-Access: ssm start-session --target i-0abc123def456
+Access: ssh dev@i-0abc123def456   # via your Vouch-issued SSH certificate
 
 # When done, release it
 $ devbox release 01914a6b-...
@@ -57,7 +57,7 @@ R = Ready instance (warm, waiting for claim)
 
 1. **Pool reconciler** maintains a fixed number of warm instances
 2. **Agent claims** a devbox -- instantly gets a ready-to-use instance
-3. **Agent works** via SSM Session Manager (no SSH keys, no open ports)
+3. **Agent works** via SSH (the universal adapter every remote IDE speaks)
 4. **Agent releases** -- instance terminates, reconciler launches a replacement
 
 ## Key Features
@@ -68,8 +68,8 @@ Configurable number of instances always ready. Claim latency under 1 second.
 ### Ephemeral Instances
 Each devbox is used once and terminated on release. No state leakage between users.
 
-### SSM Access
-Agents connect via AWS Systems Manager Session Manager. No SSH keys to manage, no ports to open, full session audit logging.
+### SSH Access (Vouch CA)
+Humans and agents connect over SSH — the universal adapter every remote IDE (VS Code Remote-SSH, JetBrains Gateway, Cursor) requires. Authentication is certificate-based via [Vouch](https://www.vouch.io/)'s SSH CA: short-lived user certificates, no `authorized_keys` to manage. Per-claim authorization is dynamic — claiming tags the instance `devbox:owner=<principal>`, which the host reads via IMDSv2 and enforces through sshd's `AuthorizedPrincipalsCommand`. See [`.kiro/specs/ssh-access/`](.kiro/specs/ssh-access/).
 
 ### Snapshot-Seeded EBS
 Development tools, language runtimes, and package caches baked into EBS snapshots. New instances start with a fully-configured workspace.

@@ -1,6 +1,13 @@
 # Devbox Pool Manager
 
-**Status:** Draft
+> **⚠️ Superseded.** This spec describes the original direct-`RunInstances` /
+> `TerminateInstances` pool manager. The implementation has moved to the
+> ASG-based approach in [`asg-pool-management/`](asg-pool-management/), where the
+> reconciler manages a Launch Template + Auto Scaling Group instead of individual
+> instances. Retained for history; see [`/CLAUDE.md`](../../CLAUDE.md) for the
+> current architecture.
+
+**Status:** Superseded (was: Draft)
 
 ## Overview
 
