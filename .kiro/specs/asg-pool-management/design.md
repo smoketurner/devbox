@@ -1,5 +1,15 @@
 # Design Document: ASG Pool Management
 
+> **Provisioning boundary update.** Sections below that have the reconciler **create or
+> update** the Launch Template, ASG, or lifecycle hook (e.g. `ensure_launch_template`,
+> `ensure_asg`, `ensure_lifecycle_hook`) are superseded: those resources are now
+> **provisioned by Terraform** in `devbox-infra`, and the reconciler **adopts** them by name.
+> The runtime operations (desired capacity, scale-in protection, owner tagging, termination,
+> lifecycle completion, doc sync) are unchanged. See
+> [`../infra-boundary/`](../infra-boundary/) for the authoritative split. The create-path
+> material here is retained because it documents the exact AWS configuration Terraform must
+> reproduce.
+
 ## Overview
 
 This design replaces the current direct EC2 `RunInstances`/`TerminateInstances` approach with an Auto Scaling Group (ASG) backed pool. The reconciler shifts from instance-level CRUD to pool-level capacity management, where:

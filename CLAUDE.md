@@ -64,15 +64,20 @@ Rust workspace, three crates:
 | `devbox-server` | Axum API (`/api/v1/devboxes/*`) + HTML dashboard, document store (SQLite dev / Aurora DSQL prod), ASG-based pool reconciler, AWS compute layer |
 | `devbox-cli`    | `claim` / `release` / `list` / `status` |
 
-**Pool management is ASG-based.** The reconciler manages a Launch Template + Auto
-Scaling Group; `DesiredCapacity = claimed_count + target_warm_pool_size`. It runs
-as a leader-locked background loop (only one replica acts at a time) and syncs
-`DevboxDoc` records against ASG membership each tick.
+**Pool management is ASG-based.** The Launch Template, ASG, and warm-up lifecycle
+hook are **provisioned by Terraform** in `devbox-infra`; the reconciler **adopts**
+the ASG by name and owns only runtime state — `DesiredCapacity =
+claimed_count + target_warm_pool_size`, per-instance scale-in protection, owner
+tagging, and termination. It runs as a leader-locked background loop (only one
+replica acts at a time) and syncs `DevboxDoc` records against ASG membership each
+tick. (The reconciler still contains create paths today; moving those to Terraform
+is a tracked follow-up — see `infra-boundary`.)
 
-> Authoritative design: [`.kiro/specs/asg-pool-management/`](.kiro/specs/asg-pool-management/).
-> The older `devbox-pool-manager.md`, `pool-reconciliation/`, and
-> `ec2-integration.md` specs describe a **superseded** direct-`RunInstances`
-> approach and are retained only as history (see their headers).
+> Authoritative designs: [`.kiro/specs/asg-pool-management/`](.kiro/specs/asg-pool-management/)
+> and [`.kiro/specs/infra-boundary/`](.kiro/specs/infra-boundary/) (the
+> Terraform/control-plane ownership split). The older `devbox-pool-manager.md`,
+> `pool-reconciliation/`, and `ec2-integration.md` specs describe a **superseded**
+> direct-`RunInstances` approach and are retained only as history (see their headers).
 
 ## Commands
 
@@ -141,8 +146,12 @@ authentication yet.
 - **API authentication** — claim/release are currently unauthenticated (ownership
   is checked, identity is not).
 - **SSH/Vouch-CA host config** — `InstanceMetadataTags=enabled` on the Launch
-  Template (see `compute/ec2.rs` metadata options) plus the AMI-baked CA key,
-  sshd drop-in, and `devbox-principals` script (see `.kiro/specs/ssh-access/`).
+  Template (now owned by Terraform / `devbox-infra`, per `infra-boundary`) plus the
+  AMI-baked CA key, sshd drop-in, and `devbox-principals` script (see
+  `.kiro/specs/ssh-access/`).
+- **Move LT/ASG/lifecycle-hook provisioning to Terraform** and shrink the
+  reconciler to adopt-only (drop `ensure_*` from the `Compute` trait, trim
+  `ReconcilerConfig`) — design in `.kiro/specs/infra-boundary/`.
 - **Snapshot-seeded EBS** workspace, SSH/SSM **health-check gating** of "warming",
   **idle-claim reclaim**, pool config via **env vars**.
 - **Durable agent sessions** (reconnect while the agent keeps working).
@@ -157,6 +166,6 @@ authentication yet.
 
 ## Source of truth
 
-`.kiro/steering/*` for conventions and `.kiro/specs/asg-pool-management/` +
-`.kiro/specs/ssh-access/` for the active designs. **When a doc disagrees with the
-code, trust the code and fix the doc.**
+`.kiro/steering/*` for conventions and `.kiro/specs/asg-pool-management/`,
+`.kiro/specs/infra-boundary/`, + `.kiro/specs/ssh-access/` for the active designs.
+**When a doc disagrees with the code, trust the code and fix the doc.**

@@ -4,6 +4,13 @@
 
 Replace the current direct EC2 RunInstances/TerminateInstances approach in the pool reconciler with an Auto Scaling Group (ASG) backed by a Launch Template. The ASG manages the fleet of devbox instances, and the reconciler shifts from instance-level CRUD to pool-level capacity management. Claiming an instance means tagging one from the ASG's available pool, and DesiredCapacity is computed as claimed_count + target_warm_pool_size.
 
+> **Provisioning boundary update.** The Launch Template, ASG, and warm-up lifecycle hook
+> are now **provisioned by Terraform** in `smoketurner/devbox-infra`; the reconciler
+> **adopts** them by name and manages only runtime capacity/per-instance state. See
+> [`../infra-boundary/`](../infra-boundary/). Requirements 1 and 2 below have been updated
+> from "create/update" to "adopt"; the create-path language is retained struck-through in
+> spirit only where it documents the resulting AWS configuration that Terraform must match.
+
 ## Glossary
 
 - **Reconciler**: The background loop that periodically adjusts the devbox pool to maintain desired state
@@ -19,34 +26,33 @@ Replace the current direct EC2 RunInstances/TerminateInstances approach in the p
 
 ## Requirements
 
-### Requirement 1: Launch Template Management
+### Requirement 1: Launch Template (Terraform-provisioned, reconciler-agnostic)
 
-**User Story:** As a platform operator, I want instance configuration defined in a Launch Template, so that all devbox instances are launched consistently with the correct AMI, instance type, security groups, and IMDSv2 enforcement.
-
-#### Acceptance Criteria
-
-1. THE Reconciler SHALL create or update a Launch Template with the configured AMI ID, instance type, cpu, memory, security groups, and metadata options before creating the ASG, using the pool identifier as the Launch Template name for deterministic lookup across restarts
-2. WHEN a Launch Template is created or updated, THE Reconciler SHALL enforce IMDSv2 by setting HttpTokens to "required" and HttpPutResponseHopLimit to 2 in the metadata options
-3. WHEN a Launch Template is created or updated, THE Reconciler SHALL include instance tags for cost tracking with key "devbox:pool" set to the pool identifier and key "devbox:managed-by" set to the server_id from ReconcilerConfig
-4. IF the Launch Template creation or update fails, THEN THE Reconciler SHALL log the error and retry on the next reconciliation tick without modifying the ASG configuration
-5. THE Reconciler SHALL reference the Launch Template version number returned by the most recent successful create or update call when configuring the ASG, rather than using "$Latest" or "$Default"
-6. WHEN a Launch Template is created or updated, THE Reconciler SHALL configure EBS volumes with encryption enabled
-7. WHEN the configured AMI ID, instance type, cpu, memory, or security groups differ from the current Launch Template version, THE Reconciler SHALL create a new Launch Template version with the updated configuration
-
-### Requirement 2: Auto Scaling Group Lifecycle
-
-**User Story:** As a platform operator, I want the reconciler to manage an ASG rather than individual instances, so that AWS handles health checks, AZ distribution, and automatic instance replacement.
+**User Story:** As a platform operator, I want instance configuration defined in a Launch Template provisioned by Terraform, so that all devbox instances launch consistently and the control plane needs no Launch Template permissions.
 
 #### Acceptance Criteria
 
-1. WHEN the Reconciler starts and no ASG exists for the pool, THE Reconciler SHALL create an ASG referencing the Launch Template with MinSize of 0, MaxSize equal to the configured max_pool_size, and DesiredCapacity equal to target_warm_pool_size
-2. WHEN the Reconciler starts and an ASG already exists, THE Reconciler SHALL adopt the existing ASG by verifying its Launch Template ID and version match the current configuration, and if they do not match, THE Reconciler SHALL update the ASG to reference the current Launch Template version
-3. THE ASG SHALL be configured with health check type "EC2" and a health check grace period of 300 seconds
-4. THE ASG SHALL be configured to distribute instances across all subnet IDs specified in the ReconcilerConfig subnet_ids field for availability zone distribution
-5. IF the ASG creation fails, THEN THE Reconciler SHALL log the error and retry on the next reconciliation tick without modifying any existing instances
-6. THE Reconciler SHALL identify the ASG for a pool using a deterministic name derived from the pool identifier, and SHALL apply tags containing the pool identifier and a "managed-by" label for cost tracking and identification
-7. IF the ReconcilerConfig subnet_ids field contains fewer than 1 entry when ASG creation is attempted, THEN THE Reconciler SHALL return an error indicating that at least one subnet ID is required
-8. THE ASG SHALL be configured to propagate all ASG-level tags to instances at launch, so that newly launched instances automatically receive pool identifier, managed-by, and other ASG tags without requiring a separate tagging step
+1. THE Launch Template SHALL be provisioned by Terraform (`devbox-infra`), not by the Reconciler; the Reconciler SHALL NOT create, update, or version the Launch Template.
+2. THE Launch Template SHALL resolve its AMI from SSM (`ImageId = resolve:ssm:/devbox/ami/latest`) so launches use the current AMI without a template edit.
+3. THE Launch Template SHALL enforce IMDSv2 (HttpTokens "required", HttpPutResponseHopLimit 2) and enable instance metadata tags (`InstanceMetadataTags=enabled`, required by `../ssh-access/`).
+4. THE Launch Template SHALL configure EBS volumes with encryption enabled and attach the pool security groups and base cost-tracking tags ("devbox:pool", "devbox:managed-by").
+5. THE ASG SHALL reference a pinned Launch Template version managed by Terraform (not "$Latest"/"$Default"); the Reconciler SHALL NOT change the referenced version.
+
+> These criteria describe the AWS configuration Terraform must produce; see
+> [`../infra-boundary/requirements.md`](../infra-boundary/requirements.md) Requirement 1.
+
+### Requirement 2: Auto Scaling Group (Terraform-provisioned, reconciler-adopted)
+
+**User Story:** As a platform operator, I want the reconciler to adopt a Terraform-managed ASG, so AWS handles health checks, AZ distribution, and replacement while the two systems never fight over structure.
+
+#### Acceptance Criteria
+
+1. THE ASG SHALL be created and configured by Terraform with MinSize, MaxSize, subnet/AZ distribution, EC2 health check + 300s grace period, `propagate_tags_at_launch=true`, and `lifecycle { ignore_changes = [desired_capacity] }`.
+2. WHEN the Reconciler runs, THE Reconciler SHALL adopt the ASG by its deterministic name (`devbox-pool-<pool_id>`) via describe, and SHALL NOT create or structurally update the ASG.
+3. IF the ASG does not exist (Terraform not yet applied), THEN THE Reconciler SHALL log a warning and skip the tick without error, retrying on the next tick.
+4. THE Reconciler SHALL read MaxSize from the adopted ASG and clamp desired capacity to it, rather than carrying a configured max_pool_size.
+5. THE Reconciler SHALL NOT require ami_id, instance_type, cpu, memory_mib, subnet_ids, security_group_ids, or max_pool_size in its configuration; these belong to Terraform.
+6. THE warm-up lifecycle hook (`devbox-warmup-<pool_id>`) SHALL be created by Terraform; the Reconciler SHALL only complete lifecycle actions against it, never create or update it.
 
 ### Requirement 3: Capacity Reconciliation
 
