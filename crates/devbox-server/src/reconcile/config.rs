@@ -49,6 +49,12 @@ impl ReconcilerConfig {
         if !(60..=3600).contains(&ready_secs) {
             bail!("ready_timeout must be between 60 and 3600 seconds, got {ready_secs}");
         }
+        if self.polling_interval.is_zero() {
+            bail!("polling_interval must be greater than zero");
+        }
+        if self.lock_ttl.is_zero() {
+            bail!("lock_ttl must be greater than zero");
+        }
         Ok(())
     }
 
@@ -114,5 +120,24 @@ mod tests {
         let mut cfg = valid_config();
         cfg.ready_timeout = Duration::from_secs(3601);
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn zero_polling_interval_is_rejected() {
+        let mut cfg = valid_config();
+        cfg.polling_interval = Duration::ZERO;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn zero_lock_ttl_is_rejected() {
+        let mut cfg = valid_config();
+        cfg.lock_ttl = Duration::ZERO;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn valid_config_passes_validation() {
+        assert!(valid_config().validate().is_ok());
     }
 }
