@@ -112,31 +112,37 @@ See [`../ssh-access/`](../ssh-access/) for the full access design.
 4. THE Image_Builder_Pipeline SHALL retain the previous AMI ID value in an SSM_Parameter at path /devbox/ami/previous to enable rollback
 5. IF the SSM_Parameter write fails, THEN THE Image_Builder_Pipeline SHALL retry 3 times with exponential backoff before publishing a failure notification to the SNS topic
 
-### Requirement 8: Pool Manager AMI Discovery from SSM
+### Requirement 8: Launch Template AMI Resolution (Terraform)
 
-**User Story:** As a platform operator, I want the pool manager to read the AMI ID from SSM Parameter Store instead of a static environment variable, so that new AMIs are automatically picked up without redeploying the pool manager.
+> **Supersedes the previous "Pool Manager AMI Discovery from SSM."** The pool manager no
+> longer reads the AMI or manages Launch Template versions; the Terraform-owned Launch
+> Template resolves the AMI from SSM directly. See [`../infra-boundary/`](../infra-boundary/).
 
-#### Acceptance Criteria
-
-1. THE Pool_Manager SHALL support reading the AMI ID from an SSM_Parameter path specified by the POOL_AMI_SSM_PARAMETER environment variable (e.g., /devbox/ami/latest)
-2. WHEN POOL_AMI_SSM_PARAMETER is set, THE Pool_Manager SHALL fetch the AMI ID from SSM Parameter Store on startup and on each reconciliation tick (or at a configurable polling interval no more frequent than once per 60 seconds)
-3. WHEN POOL_AMI_SSM_PARAMETER is not set, THE Pool_Manager SHALL fall back to reading POOL_AMI_ID from the environment variable for backward compatibility
-4. IF the SSM Parameter Store fetch fails, THEN THE Pool_Manager SHALL log the error, retain the last known valid AMI ID, and retry on the next polling interval
-5. WHEN the AMI ID fetched from SSM differs from the currently configured AMI ID, THE Pool_Manager SHALL log the change and trigger AMI rotation on the next reconciliation tick
-
-### Requirement 9: AMI Rotation in the Pool Manager
-
-**User Story:** As a platform operator, I want the pool manager to gracefully rotate instances to a new AMI when one becomes available, so that the warm pool always uses the latest tested image without disrupting claimed instances.
+**User Story:** As a platform operator, I want the Launch Template to always launch the
+current AMI without anyone editing it, so new warm instances are current automatically.
 
 #### Acceptance Criteria
 
-1. WHEN a new AMI ID is detected, THE Pool_Manager SHALL update the Launch Template with the new AMI ID and create a new Launch Template version
-2. WHEN a new Launch Template version is created for AMI rotation, THE Pool_Manager SHALL update the ASG to reference the new Launch Template version
-3. THE Pool_Manager SHALL NOT terminate or disturb instances that are in Claimed state during AMI rotation
-4. WHEN AMI rotation is triggered, THE Pool_Manager SHALL terminate unclaimed Ready instances running the old AMI in batches (configurable batch size, default 1 at a time) on successive reconciliation ticks, allowing the ASG to replace them with instances using the new AMI
-5. IF the pool has zero Ready instances available during rotation, THEN THE Pool_Manager SHALL pause old-instance termination until at least one new-AMI instance reaches Ready state, ensuring the pool is never fully drained
-6. THE Pool_Manager SHALL log AMI rotation progress including: rotation start, each batch of old instances terminated, each new instance reaching Ready state, and rotation completion
-7. WHEN all unclaimed instances are running the new AMI, THE Pool_Manager SHALL log rotation completion and resume normal reconciliation behavior
+1. THE Terraform-managed Launch Template SHALL set `ImageId = resolve:ssm:/devbox/ami/latest` so that any instance the ASG launches uses the AMI currently published by the pipeline.
+2. THE Pool_Manager (control plane) SHALL NOT read the AMI ID, update the Launch Template, or manage Launch Template versions.
+3. Because `/devbox/ami/latest` is the resolution source, new launches (warm-pool growth and refresh replacements) SHALL pick up a new AMI with no Launch Template change.
+
+### Requirement 9: AMI Rotation via EventBridge Instance Refresh
+
+> **Supersedes the previous "AMI Rotation in the Pool Manager."** Rotation is now event-driven
+> infrastructure, not pool-manager logic.
+
+**User Story:** As a platform operator, I want existing idle warm instances to roll onto a new
+AMI automatically when one is published, without disrupting any in-use devbox.
+
+#### Acceptance Criteria
+
+1. WHEN the pipeline publishes a new AMI (updates `/devbox/ami/latest`), an **EventBridge rule** SHALL trigger an ASG **instance refresh** for the pool (via an SSM Automation or Lambda target).
+2. THE instance refresh SHALL be configured with `ScaleInProtectedInstances = Ignore` so that **scale-in-protected (Claimed/in-use) instances are not replaced**; only unclaimed warm instances are rolled.
+3. THE instance refresh SHALL set a `MinHealthyPercentage` (and honor the warm-up lifecycle hook on replacements) such that warm capacity remains available during the roll and the pool is never fully drained.
+4. Claimed instances SHALL adopt the new AMI naturally when released and replaced by the ASG; the refresh SHALL NOT force-terminate them.
+5. THE refresh executor SHALL require only `autoscaling:StartInstanceRefresh`, `DescribeInstanceRefreshes`, and `DescribeAutoScalingGroups`, and SHALL be provisioned by Terraform.
+6. Reusing scale-in protection as the "in use" signal is intentional and conservative: protection tracks `Claimed`, and per `../ssh-access/` an unclaimed host authorizes no SSH principals, so an unprotected (Ready) host reliably has no connections.
 
 ### Requirement 10: AMI Build Triggers
 
