@@ -641,7 +641,6 @@ pub(crate) fn is_retryable_db_error(err: &anyhow::Error) -> bool {
 }
 
 /// Check whether an error is a unique/primary-key constraint violation.
-#[allow(dead_code, reason = "utility used by higher-level store operations")]
 pub(crate) fn is_unique_violation(err: &anyhow::Error) -> bool {
     if let Some(sqlx_err) = err.downcast_ref::<sqlx::Error>()
         && let sqlx::Error::Database(db_err) = sqlx_err

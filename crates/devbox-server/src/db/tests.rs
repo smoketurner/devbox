@@ -256,4 +256,20 @@ mod store_tests {
             .unwrap();
         pool.is_healthy().await.unwrap();
     }
+
+    #[tokio::test]
+    async fn test_duplicate_id_insert_is_unique_violation() {
+        use crate::documents::leader_lock::LeaderLockDoc;
+
+        let store = setup_store().await;
+        let doc = LeaderLockDoc {
+            holder_id: "server-a".to_string(),
+            expires_at: Timestamp::now(),
+        };
+
+        store.insert_with_id("dup-lock-id", &doc).await.unwrap();
+
+        let err = store.insert_with_id("dup-lock-id", &doc).await.unwrap_err();
+        assert!(crate::db::pool::is_unique_violation(&err));
+    }
 }
