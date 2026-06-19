@@ -128,7 +128,7 @@ devbox release --server-url http://localhost:3000 01914a6b-...
 |-------|-------------|
 | [`devbox-common`](crates/devbox-common/) | Shared types: `DevboxId`, `DevboxState` enum, API request/response types, configuration |
 | [`devbox-server`](crates/devbox-server/) | Axum HTTP server with database layer (SQLite/DSQL), pool reconciliation, EC2 orchestration, HTML dashboard |
-| [`devbox-cli`](crates/devbox-cli/) | CLI binary with `claim`, `release`, `list`, `status` subcommands via reqwest |
+| [`devbox-cli`](crates/devbox-cli/) | CLI binary with `claim`, `release`, `list`, `status`, `ssh` subcommands via reqwest |
 
 ## Configuration
 
@@ -139,6 +139,7 @@ devbox release --server-url http://localhost:3000 01914a6b-...
 | `DATABASE_URL` | Database connection string (`sqlite:...` or `postgres://...`) | `sqlite::memory:` |
 | `RUST_LOG` | Tracing filter directive | `info` |
 | `PORT` | Server listen port | `3000` |
+| `DEVBOX_TOKEN` | Bearer token for CLI authentication (Vouch OIDC) | (none) |
 
 ### Pool Configuration (planned)
 

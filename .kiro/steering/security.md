@@ -23,7 +23,7 @@ These rules apply to all code in this repository without exception:
 - The devbox-server uses an IAM role with least-privilege permissions
 - DSQL access uses IAM-generated auth tokens (short-lived, auto-refreshed)
 - EC2 operations use the server's instance role (no static keys)
-- API authentication will use IAM Signature V4 or bearer tokens (not yet implemented)
+- API authentication uses Vouch JWT bearer tokens (CLI `--token` / `DEVBOX_TOKEN`) or ALB OIDC data (`x-amzn-oidc-data`), binding `owner` to the verified principal
 
 ## SSH Access (Vouch CA)
 
@@ -41,7 +41,7 @@ Users and agents reach devboxes over **SSH** — the access path every remote ID
   preserving the isolation rule above.
 - **Identity contract:** the claim `owner` MUST equal the certificate principal
   Vouch mints. The principal is not secret; all trust derives from the CA
-  signature. See [`../specs/ssh-access/`](../specs/ssh-access/).
+  signature.
 - Disable password auth; SSH protocol 2 only; passwordless connections still
   flow through the CA + principals check.
 
