@@ -104,18 +104,26 @@ fn exec_ssh(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Render an argument vector for display, single-quoting args with whitespace.
+/// Render an argument vector for display as a copy-pasteable shell command.
+/// Shell-safe arguments pass through unquoted; anything else is single-quoted
+/// with embedded single quotes escaped (`'\''`).
 fn shell_join(args: &[String]) -> String {
     args.iter()
-        .map(|arg| {
-            if arg.contains(char::is_whitespace) {
-                format!("'{arg}'")
-            } else {
-                arg.clone()
-            }
-        })
+        .map(|arg| shell_quote(arg))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Single-quote `arg` unless every character is shell-safe.
+fn shell_quote(arg: &str) -> String {
+    let safe = |c: char| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '@' | '%' | '+' | '=' | ':' | ',' | '.' | '/' | '-' | '_')
+    };
+    if !arg.is_empty() && arg.chars().all(safe) {
+        return arg.to_string();
+    }
+    format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]
@@ -206,5 +214,23 @@ mod tests {
     fn errors_without_owner_or_user() {
         let devbox = claimed(Some("i-0abc"), None);
         assert!(build_args(&devbox, &opts()).is_err());
+    }
+
+    #[test]
+    fn shell_join_escapes_embedded_single_quote() {
+        let args = vec!["foo'bar baz".to_string()];
+        assert_eq!(shell_join(&args), "'foo'\\''bar baz'");
+    }
+
+    #[test]
+    fn shell_join_passes_safe_arg_unquoted() {
+        let args = vec!["jplock@i-0abc".to_string()];
+        assert_eq!(shell_join(&args), "jplock@i-0abc");
+    }
+
+    #[test]
+    fn shell_join_quotes_whitespace_without_quote() {
+        let args = vec!["a b".to_string()];
+        assert_eq!(shell_join(&args), "'a b'");
     }
 }
