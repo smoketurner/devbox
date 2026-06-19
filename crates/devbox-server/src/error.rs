@@ -25,6 +25,8 @@ pub struct ErrorBody {
 pub enum AppError {
     /// 400 Bad Request — malformed input.
     BadRequest(String),
+    /// 401 Unauthorized — missing or invalid credential.
+    Unauthorized(String),
     /// 403 Forbidden — ownership mismatch.
     Forbidden(String),
     /// 404 Not Found — resource does not exist.
@@ -39,6 +41,7 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
+            Self::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg),
             Self::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
             Self::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
             Self::Conflict(msg) => (StatusCode::CONFLICT, msg),
@@ -58,6 +61,13 @@ impl IntoResponse for AppError {
 impl From<anyhow::Error> for AppError {
     fn from(err: anyhow::Error) -> Self {
         Self::Internal(err)
+    }
+}
+
+/// Authentication failures map to 401.
+impl From<crate::auth::AuthError> for AppError {
+    fn from(err: crate::auth::AuthError) -> Self {
+        Self::Unauthorized(err.to_string())
     }
 }
 

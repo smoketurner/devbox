@@ -1,0 +1,49 @@
+# devbox-server
+
+The devbox control plane: an [Axum](https://github.com/tokio-rs/axum) HTTP API
+and HTML dashboard, a document store, and the pool reconciler. It maintains a
+warm pool of EC2 dev boxes that callers claim over SSH. See the
+[project CLAUDE.md](../../CLAUDE.md) for the full architecture.
+
+## What it does
+
+- **API + dashboard** (`routes.rs`, `ui.rs`) — `claim` / `release` / `list` /
+  `status` / pool metrics, plus an HTML dashboard. Claim is exactly-once under
+  optimistic concurrency.
+- **Auth** (`auth/`) — when enabled, resolves the caller from the ALB's
+  `x-amzn-oidc-data` (dashboard) or a `Bearer` Vouch JWT (CLI/agents), and binds
+  `owner` to the verified principal.
+- **Document store** (`db/`) — typed documents over SQLite (dev) or Aurora DSQL
+  (prod, IAM-auth), with optimistic concurrency (`compare_and_update`) and
+  queries built with `sea-query` (no raw SQL).
+- **Reconciler** (`reconcile/`) — an adopt-only, leader-locked loop that adopts
+  the Terraform-provisioned ASG by name, syncs `DevboxDoc` records with ASG
+  membership, and maintains desired capacity, scale-in protection, owner
+  tagging, and terminations. It never creates infrastructure.
+- **Compute** (`compute/`) — the AWS EC2 / Auto Scaling trait, its EC2 impl, and
+  a mock for tests.
+
+## API
+
+| Method + path | Purpose |
+|---|---|
+| `GET /health` | Server + database health |
+| `GET /api/v1/devboxes` | List devboxes |
+| `GET /api/v1/devboxes/{id}` | Get one |
+| `POST /api/v1/devboxes/claim` | Claim a Ready devbox |
+| `POST /api/v1/devboxes/{id}/release` | Release a Claimed devbox |
+| `GET /api/v1/pool/metrics` | Pool counts vs target |
+| `GET /` | HTML dashboard |
+
+## Run locally
+
+```bash
+DATABASE_URL="sqlite:devbox-dev.db?mode=rwc" \
+RUST_LOG=info,devbox_server=debug \
+cargo run --bin devbox-server            # serves http://localhost:3000
+```
+
+Key env vars: `DATABASE_URL`, `PORT`, `POOL_ID`, `POOL_TARGET_WARM_SIZE`, and
+`AUTH_ENABLED` (+ `AUTH_OIDC_ISSUER` / `AUTH_OIDC_JWKS_URI` / `AUTH_OIDC_AUDIENCE`
+/ `AUTH_PRINCIPAL_CLAIM`). The reconciler adopts the ASG named
+`devbox-pool-<POOL_ID>`.

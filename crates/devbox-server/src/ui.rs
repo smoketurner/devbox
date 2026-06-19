@@ -8,7 +8,7 @@ use askama::Template;
 use axum::Form;
 use axum::Router;
 use axum::extract::{Path, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use rust_embed::Embed;
@@ -230,17 +230,47 @@ async fn claim_form() -> Response {
     .into_response()
 }
 
+/// Resolve the submitter's owner: the ALB-OIDC principal when auth is enabled,
+/// otherwise the form-supplied owner. `Err` carries a user-facing message.
+async fn ui_owner(
+    state: &AppState,
+    headers: &HeaderMap,
+    form_owner: &str,
+) -> Result<String, String> {
+    match &state.auth {
+        Some(auth) => auth
+            .authenticate(headers)
+            .await
+            .map(|principal| principal.0)
+            .map_err(|e| format!("Authentication failed: {e}")),
+        None => {
+            if form_owner.trim().is_empty() {
+                Err("Owner field is required.".to_string())
+            } else {
+                Ok(form_owner.to_string())
+            }
+        }
+    }
+}
+
 /// Process the claim form submission.
 ///
 /// POST /devboxes/claim
-async fn submit_claim(State(state): State<AppState>, Form(form): Form<ClaimFormData>) -> Response {
-    if form.owner.trim().is_empty() {
-        return ClaimFormTemplate {
-            instance_type: form.instance_type,
-            error: Some("Owner field is required.".to_string()),
+async fn submit_claim(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ClaimFormData>,
+) -> Response {
+    let owner = match ui_owner(&state, &headers, &form.owner).await {
+        Ok(owner) => owner,
+        Err(message) => {
+            return ClaimFormTemplate {
+                instance_type: form.instance_type,
+                error: Some(message),
+            }
+            .into_response();
         }
-        .into_response();
-    }
+    };
 
     let ready_docs = match state.store.find_all::<DevboxDoc>("state", "ready").await {
         Ok(docs) => docs,
@@ -275,7 +305,7 @@ async fn submit_claim(State(state): State<AppState>, Form(form): Form<ClaimFormD
     for candidate in candidates {
         let mut updated = candidate.data.clone();
         updated.state = DevboxState::Claimed;
-        updated.owner = Some(form.owner.clone());
+        updated.owner = Some(owner.clone());
         updated.claimed_at = Some(jiff::Timestamp::now());
 
         match state
@@ -307,7 +337,11 @@ async fn submit_claim(State(state): State<AppState>, Form(form): Form<ClaimFormD
 /// Process the release form submission from the detail page.
 ///
 /// POST /devboxes/{id}/release
-async fn submit_release(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+async fn submit_release(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
     let doc = match state.store.get::<DevboxDoc>(&id).await {
         Ok(Some(doc)) => doc,
         Ok(None) => {
@@ -332,6 +366,28 @@ async fn submit_release(State(state): State<AppState>, Path(id): Path<String>) -
             error: Some("Cannot release devbox in current state.".to_string()),
         }
         .into_response();
+    }
+
+    // When auth is enabled, only the claimant may release.
+    if let Some(auth) = &state.auth {
+        let owner = doc.data.owner.clone().unwrap_or_default();
+        match auth.authenticate(&headers).await {
+            Ok(principal) if principal.0 == owner => {}
+            Ok(_) => {
+                return DevboxDetailTemplate {
+                    devbox: doc.into(),
+                    error: Some("You can only release a devbox you claimed.".to_string()),
+                }
+                .into_response();
+            }
+            Err(e) => {
+                return DevboxDetailTemplate {
+                    devbox: doc.into(),
+                    error: Some(format!("Authentication failed: {e}")),
+                }
+                .into_response();
+            }
+        }
     }
 
     let mut updated = doc.data.clone();

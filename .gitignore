@@ -16,3 +16,6 @@ crates/devbox-server/static/css/output.css
 .vscode/
 *.swp
 *.swo
+
+# Local agent scratch (plans, handoff)
+.local/

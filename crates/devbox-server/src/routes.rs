@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::{Path, State};
+use axum::http::HeaderMap;
 use axum::response::Json;
 use axum::routing::{get, post};
 
@@ -12,6 +13,7 @@ use devbox_common::{
     PoolMetricsResponse, ReleaseRequest,
 };
 
+use crate::auth::Authenticator;
 use crate::db::DocumentStore;
 use crate::documents::devbox::DevboxDoc;
 use crate::error::{AppError, JsonBody};
@@ -23,6 +25,30 @@ use crate::ui::build_ui_router;
 pub struct AppState {
     pub store: Arc<DocumentStore>,
     pub reconciler_config: Arc<ReconcilerConfig>,
+    /// When set, claim/release require an authenticated principal and bind
+    /// `owner` to it. When `None` (local dev), the request body's `owner` is
+    /// trusted.
+    pub auth: Option<Arc<Authenticator>>,
+}
+
+/// Resolve the caller's `owner`: the authenticated principal when auth is
+/// enabled, otherwise the (validated) body-supplied owner.
+async fn resolve_owner(
+    state: &AppState,
+    headers: &HeaderMap,
+    body_owner: &str,
+) -> Result<String, AppError> {
+    match &state.auth {
+        Some(auth) => Ok(auth.authenticate(headers).await?.0),
+        None => {
+            if body_owner.trim().is_empty() || body_owner.len() > 256 {
+                return Err(AppError::BadRequest(
+                    "owner must be non-empty and at most 256 characters".into(),
+                ));
+            }
+            Ok(body_owner.to_string())
+        }
+    }
 }
 
 /// Build the Axum router with all routes.
@@ -76,13 +102,10 @@ async fn get_devbox(
 /// Claim an available devbox.
 async fn claim_devbox(
     State(state): State<AppState>,
+    headers: HeaderMap,
     JsonBody(req): JsonBody<ClaimRequest>,
 ) -> Result<Json<DevboxResponse>, AppError> {
-    if req.owner.trim().is_empty() || req.owner.len() > 256 {
-        return Err(AppError::BadRequest(
-            "owner must be non-empty and at most 256 characters".into(),
-        ));
-    }
+    let owner = resolve_owner(&state, &headers, &req.owner).await?;
 
     let ready_docs = state.store.find_all::<DevboxDoc>("state", "ready").await?;
     if ready_docs.is_empty() {
@@ -106,7 +129,7 @@ async fn claim_devbox(
     for candidate in candidates {
         let mut updated = candidate.data.clone();
         updated.state = DevboxState::Claimed;
-        updated.owner = Some(req.owner.clone());
+        updated.owner = Some(owner.clone());
         updated.claimed_at = Some(jiff::Timestamp::now());
         updated.owner_tag_applied = false;
 
@@ -136,8 +159,11 @@ async fn claim_devbox(
 async fn release_devbox(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     JsonBody(req): JsonBody<ReleaseRequest>,
 ) -> Result<Json<DevboxResponse>, AppError> {
+    let caller = resolve_owner(&state, &headers, &req.owner).await?;
+
     let doc = state
         .store
         .get::<DevboxDoc>(&id)
@@ -152,7 +178,7 @@ async fn release_devbox(
     }
 
     let current_owner = doc.data.owner.as_deref().unwrap_or("");
-    if current_owner != req.owner {
+    if current_owner != caller {
         return Err(AppError::Forbidden("ownership mismatch".into()));
     }
 

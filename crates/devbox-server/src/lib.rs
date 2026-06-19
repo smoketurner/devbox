@@ -1,5 +1,6 @@
 //! Devbox orchestration API server.
 
+pub mod auth;
 pub mod compute;
 pub mod convert;
 pub mod db;

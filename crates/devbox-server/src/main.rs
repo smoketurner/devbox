@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
+use devbox_server::auth::{AuthConfig, Authenticator};
 use devbox_server::compute::ec2::Ec2;
 use devbox_server::db::{DocumentStore, Pool, PoolConfig};
 use devbox_server::reconcile::{ReconcilerConfig, spawn_reconciliation_loop};
@@ -94,6 +95,7 @@ async fn main() -> Result<()> {
     let app = build_router(AppState {
         store: Arc::clone(&store),
         reconciler_config: Arc::clone(&reconciler_config),
+        auth: build_authenticator(),
     });
 
     // Start server
@@ -113,6 +115,39 @@ async fn main() -> Result<()> {
     tracing::info!("server shut down");
 
     Ok(())
+}
+
+/// Build the request authenticator from the environment.
+///
+/// Returns `None` (auth disabled, owner taken from the request body) unless
+/// `AUTH_ENABLED` is truthy. OIDC endpoints default to Vouch.
+fn build_authenticator() -> Option<Arc<Authenticator>> {
+    let enabled = std::env::var("AUTH_ENABLED").is_ok_and(|v| v == "true" || v == "1");
+    if !enabled {
+        tracing::warn!(
+            "API authentication disabled (set AUTH_ENABLED=true); owner is taken from the request body"
+        );
+        return None;
+    }
+
+    let config = AuthConfig {
+        issuer: std::env::var("AUTH_OIDC_ISSUER")
+            .unwrap_or_else(|_| "https://us.vouch.sh".to_string()),
+        jwks_uri: std::env::var("AUTH_OIDC_JWKS_URI")
+            .unwrap_or_else(|_| "https://us.vouch.sh/oauth/jwks".to_string()),
+        audience: std::env::var("AUTH_OIDC_AUDIENCE")
+            .ok()
+            .filter(|s| !s.is_empty()),
+        principal_claim: std::env::var("AUTH_PRINCIPAL_CLAIM")
+            .unwrap_or_else(|_| "sub".to_string()),
+        alb_region: std::env::var("AWS_REGION").ok().filter(|s| !s.is_empty()),
+    };
+    tracing::info!(
+        issuer = %config.issuer,
+        principal_claim = %config.principal_claim,
+        "API authentication enabled"
+    );
+    Some(Arc::new(Authenticator::new(config)))
 }
 
 /// Wait for shutdown signal (Ctrl+C).

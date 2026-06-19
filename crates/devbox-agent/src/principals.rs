@@ -13,8 +13,8 @@
 use crate::imds;
 
 /// Print the authorized principal for `login_user`, or nothing.
-pub(crate) fn run(login_user: &str) {
-    if let Some(owner) = current_owner()
+pub(crate) async fn run(login_user: &str) {
+    if let Some(owner) = current_owner().await
         && owner == login_user
     {
         println!("{owner}");
@@ -22,9 +22,9 @@ pub(crate) fn run(login_user: &str) {
 }
 
 /// Read the `devbox:owner` tag from IMDS, returning `None` on any failure.
-fn current_owner() -> Option<String> {
-    let token = imds::fetch_token().ok()?;
-    let owner = imds::instance_tag(&token, "devbox:owner").ok()??;
+async fn current_owner() -> Option<String> {
+    let client = imds::client();
+    let owner = imds::instance_tag(&client, "devbox:owner").await.ok()??;
     let owner = owner.trim();
     if owner.is_empty() {
         return None;

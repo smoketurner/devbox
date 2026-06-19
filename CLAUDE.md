@@ -88,11 +88,11 @@ one replica acts at a time) and syncs `DevboxDoc` records against ASG membership
 each tick. The host's `devbox-agent warmup` completes the launch lifecycle hook
 (`Pending:Wait` → `InService`); the reconciler then marks the box `Ready`.
 
-> Authoritative design: [`.kiro/specs/ami-image-builder/`](.kiro/specs/ami-image-builder/)
-> (the golden-AMI pipeline; AMI-refresh automation and a few components are still
-> unbuilt). The Vouch-CA access model, the adopt-only reconciler, and the
-> Terraform/control-plane boundary are described above and realized in
-> `devbox-infra` (the `pool` module).
+> There are no active `.kiro/specs/` left — this file plus the Terraform in
+> `devbox-infra` (the `image-builder`, `pool`, and `control-plane` modules) are the
+> source of truth. The golden-AMI pipeline, the adopt-only reconciler, the Vouch-CA
+> access model, and the Terraform/control-plane boundary are described above and
+> realized in those modules.
 
 ## Commands
 
@@ -159,16 +159,28 @@ shutdown, dashboard scaffolding, unit tests. **SSH/Vouch-CA path:** `devbox-agen
 (principals resolver + per-principal account provisioning + warm-up hook
 completion) baked into the AMI; Terraform `pool` module provides the host instance
 profile (SSM core + lifecycle), `InstanceMetadataTags=enabled`, and sshd
-`AuthorizedPrincipalsCommand` config. Release enforces **ownership** (owner must
-match) but there is no caller authentication yet.
+`AuthorizedPrincipalsCommand` config. **AMI rotation:** the Launch Template resolves
+`resolve:ssm:/devbox/ami/latest`, and the `pool` module's EventBridge → SSM
+Automation rolls unclaimed warm hosts onto a new AMI via an ASG instance refresh
+(`ScaleInProtectedInstances = Ignore`, so Claimed hosts are skipped). **Deployment:**
+the `control-plane` module provisions Aurora DSQL (IAM-auth, no static password),
+an ECR repo, and the server on ECS/Fargate (arm64) behind an internal ALB whose
+**dashboard is gated by Vouch OIDC**. **CI/CD is keyless and immutable:**
+`.github/workflows/deploy.yml` assumes a GitHub-OIDC-federated role (from the
+`control-plane` module) to push a commit-SHA-tagged image to ECR, register a new
+ECS task-definition revision pinned to it, and roll the service — with the ECS
+deployment circuit breaker auto-rolling-back a failed deploy. No static AWS keys. **API auth** (`AUTH_ENABLED`): the server (`src/auth/`)
+resolves the caller from the ALB's `x-amzn-oidc-data` (dashboard) or a `Bearer`
+Vouch JWT (CLI `--token` / `DEVBOX_TOKEN`), verifies it (ALB regional key / Vouch
+JWKS), and **binds `owner` to the verified principal** — so claim/release act only
+as the authenticated identity. Read endpoints stay open.
 
 **Planned / not yet built** (ideas borrowed from [`.kiro/references.md`](.kiro/references.md)
 are tagged inline):
-- **API authentication** — claim/release are currently unauthenticated (ownership
-  is checked, identity is not).
-- **AMI-refresh automation** — EventBridge rule + instance-refresh executor that
-  rolls idle warm hosts onto a new AMI (see `.kiro/specs/ami-image-builder/`
-  reqs 8–9); the Launch Template already resolves `resolve:ssm:/devbox/ami/latest`.
+- **Principal ↔ Unix-username alignment** — `AUTH_PRINCIPAL_CLAIM` must select the
+  Vouch claim that equals the SSH cert principal (a Unix-safe username), since
+  `owner` drives both the box tag and the login account. Verify the Vouch config
+  end-to-end (OIDC claim == cert principal == `owner-sync` account).
 - **Snapshot-seeded EBS workspace** — attach a periodically-refreshed snapshot
   (pre-cloned repos + warm caches) at launch, with **lazy write-gating** (reads
   immediate, writes gated until a background `git` sync finishes). _(cf. Ramp Inspect)_
@@ -200,6 +212,7 @@ External systems that inform devbox's roadmap — annotated with what we borrow 
 
 ## Source of truth
 
-`.kiro/steering/*` for conventions and `.kiro/specs/ami-image-builder/` for the
-remaining AMI-pipeline work. The access model lives in "Access model" above.
+`.kiro/steering/*` for conventions; this file plus the `devbox-infra` Terraform are
+the source of truth (no active `.kiro/specs/` remain). The access model lives in
+"Access model" above.
 **When a doc disagrees with the code, trust the code and fix the doc.**

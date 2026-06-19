@@ -13,10 +13,10 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
-use std::thread::sleep;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use aws_config::imds::client::Client;
 
 use crate::imds;
 
@@ -26,31 +26,56 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// Shared workspace handed to the claimant on provisioning.
 const WORKSPACE: &str = "/workspace";
 
-/// Run the provisioning loop forever (driven by a systemd service).
-pub(crate) fn run() -> ! {
-    tracing::info!("owner-sync started; polling for devbox:owner");
+/// Outcome of one provisioning pass.
+enum Pass {
+    /// The box is still unclaimed (no owner tag); keep polling.
+    Waiting,
+    /// The owner has appeared and been handled; the service can exit.
+    Done,
+}
+
+/// Poll IMDS until the box is claimed, provision the claimant's account, then
+/// return. A devbox is claimed once and terminated on release (cattle), so there
+/// is nothing to do after provisioning — the systemd unit uses
+/// `Restart=on-failure` so a clean exit stays stopped.
+pub(crate) async fn run() {
+    tracing::info!("owner-sync started; waiting for devbox:owner");
+    let client = imds::client();
     loop {
-        if let Err(e) = tick() {
-            tracing::warn!(error = %format!("{e:#}"), "owner-sync tick failed");
+        match tick(&client).await {
+            Ok(Pass::Done) => {
+                tracing::info!("owner-sync finished; exiting");
+                return;
+            }
+            Ok(Pass::Waiting) => {}
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "owner-sync tick failed; will retry");
+            }
         }
-        sleep(POLL_INTERVAL);
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
 /// One provisioning pass: read the owner tag and ensure its account exists.
-fn tick() -> Result<()> {
-    let token = imds::fetch_token()?;
-    let Some(owner) = imds::instance_tag(&token, "devbox:owner")? else {
-        return Ok(()); // unclaimed — nothing to provision yet
+async fn tick(client: &Client) -> Result<Pass> {
+    let Some(owner) = imds::instance_tag(client, "devbox:owner").await? else {
+        return Ok(Pass::Waiting); // unclaimed — nothing to provision yet
     };
     let owner = owner.trim();
     if owner.is_empty() {
-        return Ok(());
+        return Ok(Pass::Waiting);
     }
     if !is_valid_username(owner) {
-        bail!("refusing to provision unsafe principal as a Unix account: {owner:?}");
+        // The owner appeared but cannot be a Unix account; polling more won't
+        // help (the owner does not change), so stop. SSH will fail, surfacing it.
+        tracing::error!(
+            owner,
+            "refusing to provision unsafe principal as a Unix account"
+        );
+        return Ok(Pass::Done);
     }
-    ensure_user(owner)
+    ensure_user(owner)?;
+    Ok(Pass::Done)
 }
 
 /// Create the login account for `user` if it does not already exist.

@@ -1,0 +1,91 @@
+name: Deploy
+
+# Builds the devbox-server image, pushes it to ECR under an immutable commit-SHA
+# tag, registers a new ECS task-definition revision pinned to that image, and
+# rolls the service. Auth is keyless: GitHub Actions assumes the control-plane
+# deploy role via OIDC. ECS's deployment circuit breaker rolls back a failed
+# deploy automatically.
+#
+# Required repository variables (from the `control-plane` module outputs):
+#   AWS_REGION, AWS_DEPLOY_ROLE_ARN (github_deploy_role_arn),
+#   ECR_REPOSITORY (ecr_repository_name), ECS_CLUSTER (ecs_cluster_name),
+#   ECS_SERVICE (service_name), ECS_TASK_FAMILY (ecs_task_family).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  deploy:
+    name: Build image + roll ECS
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      id-token: write # assume the AWS deploy role via OIDC
+      contents: read
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+      ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+      ECS_TASK_FAMILY: ${{ vars.ECS_TASK_FAMILY }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64 # v2.1.6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Build and push image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/arm64
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=gha,scope=deploy
+          cache-to: type=gha,mode=max,scope=deploy
+
+      - name: Download current task definition
+        run: |
+          set -euo pipefail
+          aws ecs describe-task-definition --task-definition "$ECS_TASK_FAMILY" \
+            --query 'taskDefinition' --output json \
+            | jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy, .enableFaultInjection)' \
+            > task-definition.json
+
+      - name: Render task definition with the new image
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@6853cfae8c3a7d978fbf68b5a55453395541dfbb # v1.8.5
+        with:
+          task-definition: task-definition.json
+          container-name: devbox-server
+          image: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+      - name: Deploy new revision to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@a310a830f5c14e583e35d84e4e1ec7dd177c3c9c # v2.6.2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true

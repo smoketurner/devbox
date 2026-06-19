@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true, features = ["std"] }
-clap = { workspace = true, features = ["std", "derive"] }
+clap = { workspace = true, features = ["std", "derive", "env"] }
 devbox-common = { path = "../devbox-common" }
 reqwest = { workspace = true, features = ["json", "rustls"] }
 serde = { workspace = true, features = ["std", "derive"] }

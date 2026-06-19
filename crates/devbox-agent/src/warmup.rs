@@ -28,12 +28,15 @@ const LAUNCHING_TRANSITION: &str = "autoscaling:EC2_INSTANCE_LAUNCHING";
 pub(crate) async fn run() -> Result<()> {
     ensure_docker_running();
 
-    let token = imds::fetch_token().context("acquire IMDS token")?;
-    let instance_id = imds::get(&token, "/latest/meta-data/instance-id")?
+    let imds_client = imds::client();
+    let instance_id = imds::get(&imds_client, "/latest/meta-data/instance-id")
+        .await?
         .context("instance-id unavailable from IMDS")?;
-    let region = imds::get(&token, "/latest/meta-data/placement/region")?
+    let region = imds::get(&imds_client, "/latest/meta-data/placement/region")
+        .await?
         .context("region unavailable from IMDS")?;
-    let asg_name = imds::instance_tag(&token, "aws:autoscaling:groupName")?
+    let asg_name = imds::instance_tag(&imds_client, "aws:autoscaling:groupName")
+        .await?
         .context("instance is not part of an ASG (aws:autoscaling:groupName tag missing)")?;
 
     let client = autoscaling_client(region).await;

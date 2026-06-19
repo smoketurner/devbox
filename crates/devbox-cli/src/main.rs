@@ -18,8 +18,20 @@ struct Cli {
     #[arg(long, default_value = "http://localhost:3000", global = true)]
     server_url: String,
 
+    /// Bearer token (Vouch OIDC) for authenticated API calls.
+    #[arg(long, env = "DEVBOX_TOKEN", global = true)]
+    token: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
+}
+
+/// Attach a Bearer token to a request when one is configured.
+fn with_auth(builder: reqwest::RequestBuilder, token: Option<&String>) -> reqwest::RequestBuilder {
+    match token {
+        Some(token) => builder.bearer_auth(token),
+        None => builder,
+    }
 }
 
 #[derive(Subcommand)]
@@ -88,9 +100,7 @@ async fn main() -> Result<()> {
                 owner,
                 instance_type: instance_type.map(InstanceType),
             };
-            let resp = client
-                .post(&url)
-                .json(&req)
+            let resp = with_auth(client.post(&url).json(&req), cli.token.as_ref())
                 .send()
                 .await
                 .context("failed to send claim request")?;
@@ -109,9 +119,7 @@ async fn main() -> Result<()> {
         Commands::Release { id, owner } => {
             let url = format!("{}/api/v1/devboxes/{}/release", cli.server_url, id);
             let req = ReleaseRequest { owner };
-            let resp = client
-                .post(&url)
-                .json(&req)
+            let resp = with_auth(client.post(&url).json(&req), cli.token.as_ref())
                 .send()
                 .await
                 .context("failed to send release request")?;
@@ -129,8 +137,7 @@ async fn main() -> Result<()> {
         }
         Commands::List => {
             let url = format!("{}/api/v1/devboxes", cli.server_url);
-            let resp = client
-                .get(&url)
+            let resp = with_auth(client.get(&url), cli.token.as_ref())
                 .send()
                 .await
                 .context("failed to send list request")?;
@@ -152,8 +159,7 @@ async fn main() -> Result<()> {
         }
         Commands::Status { id } => {
             let url = format!("{}/api/v1/devboxes/{}", cli.server_url, id);
-            let resp = client
-                .get(&url)
+            let resp = with_auth(client.get(&url), cli.token.as_ref())
                 .send()
                 .await
                 .context("failed to send status request")?;
@@ -178,8 +184,7 @@ async fn main() -> Result<()> {
             args,
         } => {
             let url = format!("{}/api/v1/devboxes/{}", cli.server_url, id);
-            let resp = client
-                .get(&url)
+            let resp = with_auth(client.get(&url), cli.token.as_ref())
                 .send()
                 .await
                 .context("failed to look up devbox")?;
