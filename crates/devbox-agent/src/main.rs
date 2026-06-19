@@ -5,7 +5,8 @@
 //!
 //! - `principals <login-user>` — sshd `AuthorizedPrincipalsCommand` resolver.
 //! - `owner-sync` — provision the claimant's Unix account, then exit.
-//! - `warmup` — release the ASG launch lifecycle hook once the host is ready.
+//! - `warmup` — warm the host and self-tag `devbox:ready=true` so the reconciler
+//!   marks the `DevboxDoc` Ready; boxes that never tag ready are reaped.
 
 mod imds;
 mod owner_sync;
@@ -35,7 +36,7 @@ enum Command {
     /// Provision the claimant's Unix login account from the `devbox:owner` tag,
     /// then exit. Runs as a systemd service (poll while unclaimed).
     OwnerSync,
-    /// Warm the host and signal CONTINUE to the ASG launch lifecycle hook.
+    /// Warm the host and self-tag the instance `devbox:ready=true` via EC2.
     Warmup,
 }
 

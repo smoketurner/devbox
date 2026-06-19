@@ -13,7 +13,7 @@ One binary, three subcommands, each wired to a different host trigger:
 |------------|--------------|-----|
 | `principals <login-user>` | sshd `AuthorizedPrincipalsCommand`, per auth (as `nobody`) | Print the authorized principal, or nothing |
 | `owner-sync` | `devbox-owner-sync.service` (systemd) | Provision the claimant's Unix account, then exit |
-| `warmup` | `devbox-warmup.service` (systemd, at boot) | Release the ASG launch lifecycle hook |
+| `warmup` | `devbox-warmup.service` (systemd, at boot) | Self-tag `devbox:ready=true` once the host is warmed |
 
 ## `principals` — per-claim SSH authorization
 
@@ -40,23 +40,24 @@ clean exit stays stopped.
 Polling is the only on-host option: there is no event for an instance-tag change,
 and the isolation rules forbid the control plane from pushing to the box.
 
-## `warmup` — release the ASG launch lifecycle hook
+## `warmup` — self-tag the instance ready
 
-The warm-pool handshake. The pool ASG holds each newly launched instance in
-`Pending:Wait` behind an `EC2_INSTANCE_LAUNCHING` lifecycle hook whose default
-result is `ABANDON` — the box does **not** join the pool until it is signalled
-ready. `warmup` (a oneshot service at boot):
+The warm-pool handshake. The pool ASG has no launch lifecycle hook; instances
+go `Pending → InService` on their own. `warmup` (a oneshot service at boot)
+performs host-side preparation and then records readiness in the control plane
+via an EC2 tag. **`devbox:ready=true` is set only when all steps succeed**:
 
-1. Best-effort `systemctl start docker`.
-2. Reads the instance id, region, and ASG name (`aws:autoscaling:groupName` tag)
-   from IMDS.
-3. Finds the launching hook via `DescribeLifecycleHooks`.
-4. Calls `CompleteLifecycleAction` with `CONTINUE` — the instance moves to
-   `InService`, and the reconciler then marks its `DevboxDoc` Ready.
+1. `systemctl start docker` — fail-closed: if Docker fails, `warmup` exits
+   with a non-zero status and the tag is never set.
+2. Reads the instance id and region from IMDS.
+3. Calls `ec2:CreateTags` to set `devbox:ready=true` on its own instance.
 
-On any failure it signals `ABANDON`, so the ASG terminates and replaces the
-half-baked box. The local warming is light today (mainly the hook handshake);
-richer pre-warming (e.g. snapshot-seeded caches) is on the roadmap.
+The reconciler reads that tag on each tick and flips the `DevboxDoc` from
+`Warming` to `Ready`; only Ready boxes can be claimed. If `warmup` fails the
+agent exits with a non-zero status and the reconciler's reaper terminates the
+box after `ready_timeout` — the ASG then relaunches a replacement. No
+`ABANDON` signal is needed. The local warming is light today; richer
+pre-warming (e.g. snapshot-seeded caches) is on the roadmap.
 
 ## Design
 
@@ -67,7 +68,8 @@ richer pre-warming (e.g. snapshot-seeded caches) is on the roadmap.
 - **IMDS** access goes through `aws_config::imds::Client` (manages the IMDSv2
   token + retries); a `404` (absent path/tag) maps to `None`.
 - **No inbound, no control-plane callback** — the agent only reads its own IMDS
-  and acts on its own instance.
+  and writes to its own EC2 instance tags (`devbox:ready` on warmup,
+  `devbox:owner` read by `principals`).
 
 ## Build & install
 
