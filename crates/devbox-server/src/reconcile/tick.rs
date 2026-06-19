@@ -367,7 +367,9 @@ async fn reap_unready_instances(
         }
 
         // Flip doc to Terminating FIRST. handle_terminating_instances (step 6)
-        // issues the AWS terminate call on the same tick. This ordering prevents a
+        // issues the AWS terminate call on the NEXT tick: it iterates the
+        // `all_docs` snapshot that was read before this reap ran, so it still sees
+        // the doc as Warming this tick and skips it. This ordering prevents a
         // double-terminate: if the version-guarded write fails (Ok(false)), we skip
         // the AWS call and retry next tick without having touched AWS.
         let mut updated_doc = doc.data.clone();
@@ -406,16 +408,16 @@ async fn reap_unready_instances(
 /// Step 6: Handle Terminating instances.
 ///
 /// For docs in Terminating state:
-/// - If instance_id is Some: terminate in ASG (idempotent — logs warn if already
-///   gone), then delete doc regardless of the terminate result.
-/// - If instance_id is None: just delete doc.
+/// - If instance_id is Some: attempt to terminate in ASG. On a transient error
+///   (throttle / 5xx), log a warning and leave the Terminating doc in place so
+///   the reap retries on the next tick. The stale-cleanup path in
+///   `sync_docs_with_asg` deletes the doc once the instance leaves the ASG.
+/// - On a successful terminate (or no instance_id): delete the doc.
 ///
-/// The terminate call is treated as best-effort: EC2 returns an error if the
-/// instance is already terminated or not found. We log a warning and proceed to
-/// delete the doc so it does not linger. The reaper (`reap_unready_instances`)
-/// flips docs to Terminating first and then relies on this function to make the
-/// AWS call, so terminate errors here are expected in the "already gone" case and
-/// must not block doc cleanup.
+/// Deleting the doc on a terminate error would let `sync_docs_with_asg` recreate
+/// a fresh Warming doc on the next tick (while the instance is still InService),
+/// resetting the reap timer — the exact failure mode the reaper's doc comment warns
+/// against.
 async fn handle_terminating_instances(
     store: &DocumentStore,
     compute: &(impl Compute + ?Sized),
@@ -427,22 +429,19 @@ async fn handle_terminating_instances(
             continue;
         }
 
-        if let Some(ref instance_id) = doc.data.instance_id {
-            // Terminate in ASG (don't decrement — let ASG manage replacement).
-            // Log a warning on error but always proceed to delete the doc: the
-            // instance may already be gone (terminated by the reaper on a prior
-            // tick), and leaving the doc would cause repeated spurious errors.
-            if let Err(e) = compute.terminate_instance_in_asg(instance_id, false).await {
-                tracing::warn!(
-                    error = %e,
-                    instance_id = %instance_id,
-                    doc_id = %doc.id,
-                    "terminate instance in ASG returned error (may be already gone); proceeding to delete doc"
-                );
-            }
+        if let Some(ref instance_id) = doc.data.instance_id
+            && let Err(e) = compute.terminate_instance_in_asg(instance_id, false).await
+        {
+            tracing::warn!(
+                error = %e,
+                instance_id = %instance_id,
+                doc_id = %doc.id,
+                "failed to terminate instance in ASG; will retry next tick"
+            );
+            continue; // leave Terminating doc; stale-cleanup deletes once instance leaves ASG
         }
 
-        // Delete the doc — always, even if the terminate call above failed.
+        // Terminate succeeded (or no instance_id) — safe to delete now.
         if let Err(e) = store.delete(&doc.id).await {
             tracing::error!(
                 error = %e,

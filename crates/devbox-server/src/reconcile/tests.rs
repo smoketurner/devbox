@@ -231,7 +231,9 @@ mod reconcile_tests {
             compute.get_instance_tags(&instance_id).is_none(),
             "instance should be gone from mock ASG after tick 3 terminate"
         );
-        // Doc is deleted by the stale-cleanup path (instance no longer in ASG).
+        // Doc is deleted by step 6 directly: the mock removes the instance on
+        // terminate, so the doc is cleaned up in the same tick (step 6 succeeds
+        // and deletes the doc; stale-cleanup would also catch it, but step 6 wins).
         let all = store.list_all::<DevboxDoc>().await.unwrap();
         assert!(
             all.is_empty(),
