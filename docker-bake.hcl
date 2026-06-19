@@ -24,7 +24,7 @@ target "ci" {
   inherits = ["_common"]
   args = {
     TARGET            = TARGET
-    CARGO_PACKAGES    = "-p devbox-cli -p devbox-server"
+    CARGO_PACKAGES    = "-p devbox-cli -p devbox-server -p devbox-agent"
     SOURCE_DATE_EPOCH = "0"
     GENERATE_SBOM     = "false"
   }
@@ -54,4 +54,16 @@ target "server" {
   }
   cache-from = ["type=gha,scope=bake-server-${TARGET}"]
   cache-to   = ["type=gha,mode=max,ignore-error=true,scope=bake-server-${TARGET}"]
+}
+
+target "agent" {
+  inherits = ["_common"]
+  args = {
+    TARGET            = TARGET
+    CARGO_PACKAGES    = "-p devbox-agent"
+    SOURCE_DATE_EPOCH = SOURCE_DATE_EPOCH
+    GENERATE_SBOM     = GENERATE_SBOM
+  }
+  cache-from = ["type=gha,scope=bake-agent-${TARGET}"]
+  cache-to   = ["type=gha,mode=max,ignore-error=true,scope=bake-agent-${TARGET}"]
 }

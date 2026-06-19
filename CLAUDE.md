@@ -41,43 +41,58 @@ Machines are **cattle, not pets**: each is used once and terminated on release.
   short-lived user certificates; devbox hosts trust the CA through
   `TrustedUserCAKeys`. There are **no `authorized_keys` files to manage.**
 - **Per-claim authorization is dynamic.** Claiming a devbox tags the instance
-  `devbox:owner=<principal>` (already done by the reconciler's
-  `apply_pending_owner_tags`). The host exposes that tag via IMDSv2
-  (`InstanceMetadataTags=enabled`) and an `sshd` `AuthorizedPrincipalsCommand`
-  reads it, so a CA-signed cert is accepted only for the current claimant — the
-  box never calls back to the management plane.
+  `devbox:owner=<principal>` (done by the reconciler's `apply_pending_owner_tags`).
+  The host exposes that tag via IMDSv2 (`InstanceMetadataTags=enabled`) and an
+  `sshd` `AuthorizedPrincipalsCommand` — `devbox-agent principals %u` — reads it,
+  so a CA-signed cert is accepted only when the login user equals the current
+  claimant. The box never calls back to the management plane.
+  - *Why a command, not an `AuthorizedPrincipalsFile`:* warm-pool timing. A box
+    boots and reaches Ready **before** anyone claims it, so at user-data time there
+    is no `devbox:owner` tag to write into a file. The owner arrives later (on
+    claim), so `sshd` must read the *current* tag lazily on each auth — a command
+    pulls it; a file would need a writer/daemon kept in sync. Fail-closed: no tag →
+    no principals authorized.
+- **The login user is the certificate principal.** There is no shared `dev`
+  account: `devbox-agent owner-sync` provisions a Unix account named after the
+  `devbox:owner` principal (passwordless sudo, owns `/workspace`). `devbox ssh`
+  logs in as that principal over an SSM Session Manager tunnel (no public IP).
 - **Integration contract:** the `owner` in a claim request MUST equal the
   certificate principal Vouch issues (same identity namespace for humans and
   agents). The principal is not secret; security lives in the CA signature.
 - Isolation per instance: dedicated security group, IMDSv2 required, no
   production IAM, EBS encrypted at rest.
 
-See [`.kiro/specs/ssh-access/`](.kiro/specs/ssh-access/) for the full design.
+The host side is baked into the AMI by the `devbox-infra` `04-devbox` Image Builder
+component (sshd drop-in + Vouch CA key + `devbox-agent`); the SSH login itself is
+`crates/devbox-cli/src/ssh.rs` and `crates/devbox-agent/`.
 
 ## Architecture (30-second version)
 
-Rust workspace, three crates:
+Rust workspace, four crates:
 
 | Crate | Role |
 |-------|------|
 | `devbox-common` | Shared types: `DevboxId`, `DevboxState`, API request/response |
-| `devbox-server` | Axum API (`/api/v1/devboxes/*`) + HTML dashboard, document store (SQLite dev / Aurora DSQL prod), ASG-based pool reconciler, AWS compute layer |
-| `devbox-cli`    | `claim` / `release` / `list` / `status` |
+| `devbox-server` | Axum API (`/api/v1/devboxes/*`) + HTML dashboard, document store (SQLite dev / Aurora DSQL prod), ASG-adopting pool reconciler, AWS compute layer |
+| `devbox-cli`    | `claim` / `release` / `list` / `status` / `ssh` |
+| `devbox-agent`  | On-host binary baked into the AMI: `principals` (sshd resolver), `owner-sync` (provision the claimant's account), `warmup` (release the ASG launch hook). musl static; built/released by CI, downloaded into the golden AMI |
 
-**Pool management is ASG-based.** The Launch Template, ASG, and warm-up lifecycle
-hook are **provisioned by Terraform** in `devbox-infra`; the reconciler **adopts**
-the ASG by name and owns only runtime state — `DesiredCapacity =
-claimed_count + target_warm_pool_size`, per-instance scale-in protection, owner
-tagging, and termination. It runs as a leader-locked background loop (only one
-replica acts at a time) and syncs `DevboxDoc` records against ASG membership each
-tick. (The reconciler still contains create paths today; moving those to Terraform
-is a tracked follow-up — see `infra-boundary`.)
+**Pool management is ASG-based and the reconciler is adopt-only.** The Launch
+Template, ASG, and warm-up lifecycle hook are **provisioned by Terraform** in
+`devbox-infra`; the reconciler **adopts** the ASG by name (skipping the tick if it
+is absent) and owns only runtime state — `DesiredCapacity = min(claimed_count +
+target_warm_pool_size, ASG max)`, per-instance scale-in protection, owner tagging,
+and termination. Instance metadata (type/AMI/subnet) is read from
+`DescribeInstances`, not config. It runs as a leader-locked background loop (only
+one replica acts at a time) and syncs `DevboxDoc` records against ASG membership
+each tick. The host's `devbox-agent warmup` completes the launch lifecycle hook
+(`Pending:Wait` → `InService`); the reconciler then marks the box `Ready`.
 
-> Authoritative designs: [`.kiro/specs/asg-pool-management/`](.kiro/specs/asg-pool-management/)
-> and [`.kiro/specs/infra-boundary/`](.kiro/specs/infra-boundary/) (the
-> Terraform/control-plane ownership split). The older `devbox-pool-manager.md`,
-> `pool-reconciliation/`, and `ec2-integration.md` specs describe a **superseded**
-> direct-`RunInstances` approach and are retained only as history (see their headers).
+> Authoritative design: [`.kiro/specs/ami-image-builder/`](.kiro/specs/ami-image-builder/)
+> (the golden-AMI pipeline; AMI-refresh automation and a few components are still
+> unbuilt). The Vouch-CA access model, the adopt-only reconciler, and the
+> Terraform/control-plane boundary are described above and realized in
+> `devbox-infra` (the `pool` module).
 
 ## Commands
 
@@ -111,7 +126,8 @@ cargo run --bin devbox-server          # serves http://localhost:3000
 | Need | Location |
 |------|----------|
 | Shared types | `crates/devbox-common/src/lib.rs` |
-| CLI | `crates/devbox-cli/src/main.rs` |
+| CLI (incl. `ssh` over SSM) | `crates/devbox-cli/src/main.rs`, `crates/devbox-cli/src/ssh.rs` |
+| On-host agent (principals / owner-sync / warmup) | `crates/devbox-agent/src/` |
 | Server entry / config / shutdown | `crates/devbox-server/src/main.rs` |
 | HTTP routes | `crates/devbox-server/src/routes.rs` |
 | Dashboard UI | `crates/devbox-server/src/ui.rs` |
@@ -135,26 +151,39 @@ cargo run --bin devbox-server          # serves http://localhost:3000
 
 ## Status: implemented vs planned
 
-**Implemented:** API + CLI (claim/release/list/status), document store over
-SQLite/DSQL with optimistic concurrency, ASG-based reconciler (Launch Template +
-ASG + lifecycle hooks + scale-in protection + `devbox:owner` tagging on claim via
-`apply_pending_owner_tags`), graceful shutdown, dashboard scaffolding, unit tests.
-Release enforces **ownership** (owner must match) but there is no caller
-authentication yet.
+**Implemented:** API + CLI (claim/release/list/status/**ssh**), document store over
+SQLite/DSQL with optimistic concurrency, **adopt-only** ASG reconciler (adopts the
+Terraform ASG by name, syncs membership, maintains desired capacity, scale-in
+protection, `devbox:owner` tagging via `apply_pending_owner_tags`), graceful
+shutdown, dashboard scaffolding, unit tests. **SSH/Vouch-CA path:** `devbox-agent`
+(principals resolver + per-principal account provisioning + warm-up hook
+completion) baked into the AMI; Terraform `pool` module provides the host instance
+profile (SSM core + lifecycle), `InstanceMetadataTags=enabled`, and sshd
+`AuthorizedPrincipalsCommand` config. Release enforces **ownership** (owner must
+match) but there is no caller authentication yet.
 
-**Planned / not yet built:**
+**Planned / not yet built** (ideas borrowed from [`.kiro/references.md`](.kiro/references.md)
+are tagged inline):
 - **API authentication** — claim/release are currently unauthenticated (ownership
   is checked, identity is not).
-- **SSH/Vouch-CA host config** — `InstanceMetadataTags=enabled` on the Launch
-  Template (now owned by Terraform / `devbox-infra`, per `infra-boundary`) plus the
-  AMI-baked CA key, sshd drop-in, and `devbox-principals` script (see
-  `.kiro/specs/ssh-access/`).
-- **Move LT/ASG/lifecycle-hook provisioning to Terraform** and shrink the
-  reconciler to adopt-only (drop `ensure_*` from the `Compute` trait, trim
-  `ReconcilerConfig`) — design in `.kiro/specs/infra-boundary/`.
-- **Snapshot-seeded EBS** workspace, SSH/SSM **health-check gating** of "warming",
-  **idle-claim reclaim**, pool config via **env vars**.
-- **Durable agent sessions** (reconnect while the agent keeps working).
+- **AMI-refresh automation** — EventBridge rule + instance-refresh executor that
+  rolls idle warm hosts onto a new AMI (see `.kiro/specs/ami-image-builder/`
+  reqs 8–9); the Launch Template already resolves `resolve:ssm:/devbox/ami/latest`.
+- **Snapshot-seeded EBS workspace** — attach a periodically-refreshed snapshot
+  (pre-cloned repos + warm caches) at launch, with **lazy write-gating** (reads
+  immediate, writes gated until a background `git` sync finishes). _(cf. Ramp Inspect)_
+- **Health-check gating of "warming"** — `devbox-agent warmup` should gate Ready on
+  real readiness (docker/repos/network), not just hook completion; **idle-claim
+  reclaim**.
+- **Durable agent sessions** — snapshot-on-release so a later follow-up restores
+  even after the box is reclaimed. _(cf. Ramp Inspect)_
+- **Allowlisting egress proxy** — route outbound through a controlled proxy that
+  enforces allowlists and **injects per-claim VCS tokens**, instead of baking a
+  shared `devbox/git-token` secret onto the box (today's `03-repos` credential
+  helper). _(cf. WorkOS Horizon)_
+- **Predictive / multi-pool warming** — pre-claim warming and pools keyed by
+  profile/repo rather than one generic pool. _(cf. Ramp Inspect)_
+- **Stop/resume long-lived claims** (persist EBS) as a cost lever. _(cf. WorkOS Horizon)_
 - **Dashboard styling** — `static/css` is a placeholder.
 
 ## Related repositories
@@ -164,8 +193,13 @@ authentication yet.
   AMI pipeline) that this control plane runs on. Networking and IAM live there;
   pool/claim/lifecycle logic lives here.
 
+## Related reading
+
+External systems that inform devbox's roadmap — annotated with what we borrow — in
+[`.kiro/references.md`](.kiro/references.md) (WorkOS Project Horizon, Ramp Inspect).
+
 ## Source of truth
 
-`.kiro/steering/*` for conventions and `.kiro/specs/asg-pool-management/`,
-`.kiro/specs/infra-boundary/`, + `.kiro/specs/ssh-access/` for the active designs.
+`.kiro/steering/*` for conventions and `.kiro/specs/ami-image-builder/` for the
+remaining AMI-pipeline work. The access model lives in "Access model" above.
 **When a doc disagrees with the code, trust the code and fix the doc.**

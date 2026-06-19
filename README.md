@@ -69,7 +69,7 @@ Configurable number of instances always ready. Claim latency under 1 second.
 Each devbox is used once and terminated on release. No state leakage between users.
 
 ### SSH Access (Vouch CA)
-Humans and agents connect over SSH — the universal adapter every remote IDE (VS Code Remote-SSH, JetBrains Gateway, Cursor) requires. Authentication is certificate-based via [Vouch](https://www.vouch.io/)'s SSH CA: short-lived user certificates, no `authorized_keys` to manage. Per-claim authorization is dynamic — claiming tags the instance `devbox:owner=<principal>`, which the host reads via IMDSv2 and enforces through sshd's `AuthorizedPrincipalsCommand`. See [`.kiro/specs/ssh-access/`](.kiro/specs/ssh-access/).
+Humans and agents connect over SSH — the universal adapter every remote IDE (VS Code Remote-SSH, JetBrains Gateway, Cursor) requires. Authentication is certificate-based via [Vouch](https://www.vouch.io/)'s SSH CA: short-lived user certificates, no `authorized_keys` to manage. Per-claim authorization is dynamic — claiming tags the instance `devbox:owner=<principal>`, which the host reads via IMDSv2 and enforces through sshd's `AuthorizedPrincipalsCommand` (`devbox-agent principals`). The login user is the certificate principal itself. See the "Access model" section of [`CLAUDE.md`](CLAUDE.md).
 
 ### Snapshot-Seeded EBS
 Development tools, language runtimes, and package caches baked into EBS snapshots. New instances start with a fully-configured workspace.

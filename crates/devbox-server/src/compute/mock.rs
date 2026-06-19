@@ -1,4 +1,4 @@
-//! Mock compute client for testing.
+//! Mock compute client for testing the adopt-only reconciler.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -6,36 +6,19 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 
-use super::{
-    AsgConfig, AsgDescription, AsgInstance, Compute, LaunchTemplateConfig,
-    LaunchTemplateResult, LifecycleHookConfig,
-};
+use super::{AsgDescription, AsgInstance, Compute, InstanceInfo};
 
-/// Internal state of the mock ASG.
+/// Internal state of the mock ASG (provisioned out-of-band, like Terraform).
 struct MockAsgState {
-    launch_template: Option<MockLaunchTemplate>,
     asg: Option<MockAsg>,
     instances: HashMap<String, MockInstance>,
 }
 
-/// Stored launch template configuration.
-struct MockLaunchTemplate {
-    id: String,
-    version: i64,
-    config: LaunchTemplateConfig,
-}
-
-/// Stored ASG configuration.
-#[allow(dead_code, reason = "fields are written but only read in describe_asg")]
+/// Stored ASG state the reconciler adopts and reads.
 struct MockAsg {
-    name: String,
     desired_capacity: u32,
     min_size: u32,
     max_size: u32,
-    lifecycle_hook: Option<LifecycleHookConfig>,
-    propagate_tags_at_launch: bool,
-    pool_id: String,
-    managed_by: String,
 }
 
 /// A single mock instance in the ASG.
@@ -44,6 +27,9 @@ struct MockInstance {
     lifecycle_state: String,
     health_status: String,
     protected_from_scale_in: bool,
+    instance_type: String,
+    ami_id: String,
+    subnet_id: String,
     tags: HashMap<String, String>,
 }
 
@@ -76,11 +62,10 @@ pub struct MockCompute {
 }
 
 impl MockCompute {
-    /// Create a new mock client with empty state.
+    /// Create a new mock client with no ASG (Terraform has not "applied" yet).
     pub fn new() -> Self {
         Self {
             asg_state: Arc::new(Mutex::new(MockAsgState {
-                launch_template: None,
                 asg: None,
                 instances: HashMap::new(),
             })),
@@ -89,11 +74,20 @@ impl MockCompute {
         }
     }
 
-    /// Add an instance with the given lifecycle state.
-    ///
-    /// Returns the generated instance ID (e.g., "i-mock-0001").
-    /// If `propagate_tags_at_launch` is true and an ASG exists,
-    /// applies pool_id and managed_by tags to the new instance.
+    /// Seed the ASG that the reconciler adopts (stands in for Terraform).
+    pub fn seed_asg(&self, min_size: u32, max_size: u32, desired_capacity: u32) {
+        let mut state = self
+            .asg_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.asg = Some(MockAsg {
+            desired_capacity,
+            min_size,
+            max_size,
+        });
+    }
+
+    /// Add an instance with the given lifecycle state, returning its ID.
     pub fn add_instance(&self, lifecycle_state: &str) -> String {
         let id_num = self.next_id.fetch_add(1, Ordering::Relaxed);
         let instance_id = format!("i-mock-{id_num:04}");
@@ -103,19 +97,6 @@ impl MockCompute {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        let mut tags = HashMap::new();
-
-        // If propagate_tags_at_launch is enabled and ASG exists, apply tags.
-        if let Some(ref asg) = state.asg
-            && asg.propagate_tags_at_launch
-        {
-            tags.insert("devbox:pool".to_string(), asg.pool_id.clone());
-            tags.insert(
-                "devbox:managed-by".to_string(),
-                asg.managed_by.clone(),
-            );
-        }
-
         state.instances.insert(
             instance_id.clone(),
             MockInstance {
@@ -123,7 +104,10 @@ impl MockCompute {
                 lifecycle_state: lifecycle_state.to_string(),
                 health_status: "Healthy".to_string(),
                 protected_from_scale_in: false,
-                tags,
+                instance_type: "m7g.large".to_string(),
+                ami_id: "ami-mock0000000000".to_string(),
+                subnet_id: "subnet-mock00000000".to_string(),
+                tags: HashMap::new(),
             },
         );
 
@@ -143,8 +127,6 @@ impl MockCompute {
     }
 
     /// Inject an error to be returned on the next call to the specified method.
-    ///
-    /// The error is consumed (removed) on the next call to that method.
     pub fn set_error(&self, method: &str, error: String) {
         let mut errors = self
             .errors
@@ -160,18 +142,6 @@ impl MockCompute {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.instances.get(id).map(|inst| inst.tags.clone())
-    }
-
-    /// Get the current `propagate_tags_at_launch` setting.
-    pub fn get_propagate_tags_at_launch(&self) -> bool {
-        let state = self
-            .asg_state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state
-            .asg
-            .as_ref()
-            .is_some_and(|asg| asg.propagate_tags_at_launch)
     }
 
     /// Check for an injected error and return it if present.
@@ -194,88 +164,6 @@ impl Default for MockCompute {
 }
 
 impl Compute for MockCompute {
-    async fn ensure_launch_template(
-        &self,
-        config: &LaunchTemplateConfig,
-    ) -> Result<LaunchTemplateResult> {
-        self.check_error("ensure_launch_template")?;
-
-        let mut state = self
-            .asg_state
-            .lock()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
-
-        let lt_id = "lt-mock".to_string();
-
-        let version = if let Some(ref existing) = state.launch_template {
-            // Check if config changed — compare relevant fields.
-            let changed = existing.config.ami_id != config.ami_id
-                || existing.config.instance_type != config.instance_type
-                || existing.config.cpu != config.cpu
-                || existing.config.memory_mib != config.memory_mib
-                || existing.config.security_group_ids != config.security_group_ids;
-
-            if changed {
-                existing
-                    .version
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("version overflow"))?
-            } else {
-                existing.version
-            }
-        } else {
-            1
-        };
-
-        state.launch_template = Some(MockLaunchTemplate {
-            id: lt_id.clone(),
-            version,
-            config: config.clone(),
-        });
-
-        Ok(LaunchTemplateResult { id: lt_id, version })
-    }
-
-    async fn ensure_asg(&self, config: &AsgConfig) -> Result<String> {
-        self.check_error("ensure_asg")?;
-
-        let mut state = self
-            .asg_state
-            .lock()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
-
-        state.asg = Some(MockAsg {
-            name: config.name.clone(),
-            desired_capacity: config.desired_capacity,
-            min_size: config.min_size,
-            max_size: config.max_size,
-            lifecycle_hook: None,
-            propagate_tags_at_launch: config.propagate_tags_at_launch,
-            pool_id: config.pool_id.clone(),
-            managed_by: config.managed_by.clone(),
-        });
-
-        Ok(config.name.clone())
-    }
-
-    async fn ensure_lifecycle_hook(&self, config: &LifecycleHookConfig) -> Result<()> {
-        self.check_error("ensure_lifecycle_hook")?;
-
-        let mut state = self
-            .asg_state
-            .lock()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
-
-        let asg = state
-            .asg
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("ASG not created yet"))?;
-
-        asg.lifecycle_hook = Some(config.clone());
-
-        Ok(())
-    }
-
     async fn set_desired_capacity(&self, _asg_name: &str, desired: u32) -> Result<()> {
         self.check_error("set_desired_capacity")?;
 
@@ -287,7 +175,7 @@ impl Compute for MockCompute {
         let asg = state
             .asg
             .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("ASG not created yet"))?;
+            .ok_or_else(|| anyhow::anyhow!("ASG not provisioned"))?;
 
         asg.desired_capacity = desired;
 
@@ -305,16 +193,7 @@ impl Compute for MockCompute {
         let asg = state
             .asg
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("ASG not created yet"))?;
-
-        let lt_id = state
-            .launch_template
-            .as_ref()
-            .map(|lt| lt.id.clone());
-        let lt_version = state
-            .launch_template
-            .as_ref()
-            .map(|lt| lt.version.to_string());
+            .ok_or_else(|| anyhow::anyhow!("ASG not provisioned"))?;
 
         let instances = state
             .instances
@@ -331,10 +210,32 @@ impl Compute for MockCompute {
             desired_capacity: asg.desired_capacity,
             min_size: asg.min_size,
             max_size: asg.max_size,
-            launch_template_id: lt_id,
-            launch_template_version: lt_version,
+            launch_template_id: None,
+            launch_template_version: None,
             instances,
         })
+    }
+
+    async fn describe_instances(&self, instance_ids: &[&str]) -> Result<Vec<InstanceInfo>> {
+        self.check_error("describe_instances")?;
+
+        let state = self
+            .asg_state
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+
+        let infos = instance_ids
+            .iter()
+            .filter_map(|id| state.instances.get(*id))
+            .map(|inst| InstanceInfo {
+                instance_id: inst.instance_id.clone(),
+                instance_type: inst.instance_type.clone(),
+                ami_id: inst.ami_id.clone(),
+                subnet_id: inst.subnet_id.clone(),
+            })
+            .collect();
+
+        Ok(infos)
     }
 
     async fn terminate_instance_in_asg(
@@ -352,49 +253,16 @@ impl Compute for MockCompute {
         state
             .instances
             .remove(instance_id)
-            .ok_or_else(|| {
-                anyhow::anyhow!("instance {instance_id} not found")
-            })?;
+            .ok_or_else(|| anyhow::anyhow!("instance {instance_id} not found"))?;
 
-        if should_decrement
-            && let Some(ref mut asg) = state.asg
-        {
-            asg.desired_capacity =
-                asg.desired_capacity.saturating_sub(1);
+        if should_decrement && let Some(ref mut asg) = state.asg {
+            asg.desired_capacity = asg.desired_capacity.saturating_sub(1);
         }
 
         Ok(())
     }
 
-    async fn complete_lifecycle_action(
-        &self,
-        _asg_name: &str,
-        _hook_name: &str,
-        instance_id: &str,
-        _action_result: &str,
-    ) -> Result<()> {
-        self.check_error("complete_lifecycle_action")?;
-
-        let state = self
-            .asg_state
-            .lock()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
-
-        // Validate the instance exists.
-        if !state.instances.contains_key(instance_id) {
-            return Err(anyhow::anyhow!(
-                "instance {instance_id} not found"
-            ));
-        }
-
-        Ok(())
-    }
-
-    async fn tag_instance(
-        &self,
-        instance_id: &str,
-        tags: &[(&str, &str)],
-    ) -> Result<()> {
+    async fn tag_instance(&self, instance_id: &str, tags: &[(&str, &str)]) -> Result<()> {
         self.check_error("tag_instance")?;
 
         let mut state = self
@@ -405,9 +273,7 @@ impl Compute for MockCompute {
         let instance = state
             .instances
             .get_mut(instance_id)
-            .ok_or_else(|| {
-                anyhow::anyhow!("instance {instance_id} not found")
-            })?;
+            .ok_or_else(|| anyhow::anyhow!("instance {instance_id} not found"))?;
 
         for (key, value) in tags {
             instance
@@ -435,9 +301,7 @@ impl Compute for MockCompute {
             let instance = state
                 .instances
                 .get_mut(*id)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("instance {id} not found")
-                })?;
+                .ok_or_else(|| anyhow::anyhow!("instance {id} not found"))?;
             instance.protected_from_scale_in = protected;
         }
 

@@ -12,7 +12,7 @@ DOCKER ?= docker
 IMAGE_NAME ?= devbox
 IMAGE_TAG ?= latest
 
-.PHONY: all build test run-server clean help docker-build docker-run css-dev css-build fmt lint check bake-cli bake-server bake-all
+.PHONY: all build test run-server clean help docker-build docker-run css-dev css-build fmt lint check bake-cli bake-server bake-agent bake-all
 
 all: build
 
@@ -66,6 +66,9 @@ bake-cli: ## Build CLI musl binary via Docker Bake
 
 bake-server: ## Build Server musl binary via Docker Bake
 	$(DOCKER) buildx bake server
+
+bake-agent: ## Build Agent musl binary via Docker Bake
+	$(DOCKER) buildx bake agent
 
 bake-all: ## Build all musl binaries via Docker Bake
 	$(DOCKER) buildx bake ci

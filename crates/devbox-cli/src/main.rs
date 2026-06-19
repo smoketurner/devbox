@@ -1,6 +1,7 @@
 //! Devbox CLI client.
 
 mod format;
+mod ssh;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -48,6 +49,27 @@ enum Commands {
         /// Devbox ID to check.
         #[arg(long)]
         id: String,
+    },
+    /// SSH into a claimed devbox over an SSM tunnel.
+    Ssh {
+        /// Devbox ID to connect to.
+        #[arg(long)]
+        id: String,
+        /// Login user (defaults to the devbox owner / certificate principal).
+        #[arg(long)]
+        user: Option<String>,
+        /// AWS region for the SSM tunnel (defaults to your aws CLI config).
+        #[arg(long)]
+        region: Option<String>,
+        /// AWS profile for the SSM tunnel.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Print the ssh command instead of running it.
+        #[arg(long)]
+        print: bool,
+        /// Arguments passed through to ssh (e.g. a remote command after `--`).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
 }
 
@@ -146,6 +168,38 @@ async fn main() -> Result<()> {
                 eprintln!("{} {}", status.as_u16(), body);
                 std::process::exit(1);
             }
+        }
+        Commands::Ssh {
+            id,
+            user,
+            region,
+            profile,
+            print,
+            args,
+        } => {
+            let url = format!("{}/api/v1/devboxes/{}", cli.server_url, id);
+            let resp = client
+                .get(&url)
+                .send()
+                .await
+                .context("failed to look up devbox")?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                eprintln!("{} {}", status.as_u16(), body);
+                std::process::exit(1);
+            }
+
+            let devbox: DevboxResponse = resp.json().await.context("failed to parse response")?;
+            let opts = ssh::SshOptions {
+                user,
+                region,
+                profile,
+                print,
+                extra: args,
+            };
+            ssh::connect(&devbox, &opts)?;
         }
     }
 

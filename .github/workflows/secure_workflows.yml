@@ -1,0 +1,31 @@
+name: Lockdown untrusted workflows
+
+# 1. Scans for any external GitHub Action used without SHA pinning (@<sha> vs @v3)
+# 2. Fails CI and blocks the PR if any unpinned action is found
+#
+# Triggered whenever workflow files change.
+
+on:
+  push:
+    paths:
+      - ".github/workflows/**"
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+
+permissions:
+  contents: read
+
+jobs:
+  enforce_pinned_workflows:
+    name: Harden Security
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # checkout code and subsequently GitHub action workflows
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Ensure 3rd party workflows have SHA pinned
+        uses: zgosalvez/github-actions-ensure-sha-pinned-actions@ca46236c6ce584ae24bc6283ba8dcf4b3ec8a066 # v5.0.4

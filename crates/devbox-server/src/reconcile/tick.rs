@@ -1,19 +1,21 @@
 //! Reconciliation tick logic.
 //!
-//! Contains the per-tick reconciliation steps implementing the ASG-based
-//! pool management flow. Each tick ensures infrastructure (Launch Template,
-//! ASG, lifecycle hook), syncs document state with ASG membership, handles
-//! lifecycle transitions, and maintains desired capacity.
+//! The reconciler is adopt-only: Terraform provisions the Launch Template, ASG,
+//! and lifecycle hook (see CLAUDE.md). Each tick looks the
+//! ASG up by name, syncs `DevboxDoc` records with its membership, observes
+//! host-driven lifecycle transitions, and writes only runtime state — desired
+//! capacity (clamped to the ASG's max), scale-in protection, owner tags, and
+//! terminations.
 
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use jiff::Timestamp;
 
-use crate::compute::{AsgConfig, Compute, LifecycleHookConfig};
+use crate::compute::Compute;
 use crate::db::DocumentStore;
 use crate::documents::devbox::DevboxDoc;
-use devbox_common::{DevboxState, SubnetId};
+use devbox_common::{AmiId, DevboxState, InstanceType, SubnetId};
 
 use super::config::ReconcilerConfig;
 
@@ -48,104 +50,74 @@ fn count_by_state(
 
 /// Execute a single reconciliation tick.
 ///
-/// This implements the full ASG-based pool management flow:
-/// 1. Ensure Launch Template
-/// 2. Compute initial desired capacity from DB state
-/// 3. Ensure ASG exists
-/// 4. Ensure lifecycle hook
-/// 5. Describe ASG to get current instances
-/// 6. Sync DevboxDoc records with ASG membership
-/// 7. Handle Warming instances (complete lifecycle for InService ones)
-/// 8. Handle Terminating instances (terminate + delete doc)
-/// 9. Recompute desired capacity and update if changed
-/// 10. Update scale-in protection
-/// 11. Apply pending owner tags
+/// Adopt-only flow:
+/// 1. Look up the ASG by name; skip the tick if it does not exist yet.
+/// 2. Sync DevboxDoc records with ASG membership.
+/// 3. Mark Warming instances Ready once the host drives them InService.
+/// 4. Terminate Terminating instances and delete their docs.
+/// 5. Recompute desired capacity (clamped to the ASG's max) and update.
+/// 6. Update scale-in protection for Claimed instances.
+/// 7. Apply pending owner tags.
 ///
 /// # Errors
 ///
-/// Returns an error if critical infrastructure steps (1, 3, 4, 5) fail.
-/// Non-critical steps (7, 8, 10, 11) log errors and continue.
+/// Returns an error only if the document store is unreadable. A missing ASG is
+/// logged and skipped (no crash-loop while Terraform is being applied); other
+/// per-instance AWS failures are logged and the tick continues.
 pub(super) async fn reconciliation_tick(
     store: &DocumentStore,
     compute: &(impl Compute + ?Sized),
     config: &ReconcilerConfig,
 ) -> Result<()> {
-    // Step 1: Ensure Launch Template (abort on failure)
-    let lt = compute
-        .ensure_launch_template(&config.to_launch_template_config())
-        .await?;
+    // Step 1: Adopt the Terraform-provisioned ASG by name; skip if absent.
+    let asg_name = config.asg_name();
+    let asg_desc = match compute.describe_asg(&asg_name).await {
+        Ok(desc) => desc,
+        Err(e) => {
+            tracing::warn!(
+                asg = %asg_name,
+                error = %e,
+                "ASG not found; skipping tick (is the pool Terraform applied?)"
+            );
+            return Ok(());
+        }
+    };
 
-    // Step 2: Compute initial desired capacity from DB state
-    let all_docs = store.list_all::<DevboxDoc>().await?;
-    let claimed_count = count_by_state(&all_docs, DevboxState::Claimed);
-    let initial_desired = compute_desired_capacity(
-        claimed_count,
-        config.target_warm_pool_size,
-        config.max_pool_size,
-    );
+    // Step 2: Sync DevboxDoc records with ASG membership.
+    sync_docs_with_asg(store, compute, &asg_desc.instances).await;
 
-    // Step 3: Ensure ASG exists (abort on failure)
-    let asg_name = compute
-        .ensure_asg(&AsgConfig {
-            name: config.asg_name(),
-            launch_template_id: lt.id,
-            launch_template_version: lt.version,
-            subnet_ids: config.subnet_ids.iter().map(|s| s.0.clone()).collect(),
-            min_size: 0,
-            max_size: config.max_pool_size,
-            desired_capacity: initial_desired,
-            health_check_grace_period: 300,
-            propagate_tags_at_launch: true,
-            pool_id: config.pool_id.clone(),
-            managed_by: config.server_id.clone(),
-        })
-        .await?;
-
-    // Step 4: Ensure lifecycle hook (abort on failure)
-    compute
-        .ensure_lifecycle_hook(&LifecycleHookConfig {
-            asg_name: asg_name.clone(),
-            hook_name: config.lifecycle_hook_name(),
-            heartbeat_timeout_secs: config.lifecycle_hook_timeout_secs(),
-        })
-        .await?;
-
-    // Step 5: Describe ASG to get current instances (abort on failure)
-    let asg_desc = compute.describe_asg(&asg_name).await?;
-
-    // Step 6: Sync DevboxDoc records with ASG membership
-    sync_docs_with_asg(store, config, &asg_desc.instances).await;
-
-    // Re-read docs after sync to get fresh state
+    // Re-read docs after sync to get fresh state.
     let all_docs = store.list_all::<DevboxDoc>().await?;
 
-    // Step 7: Handle Warming instances
-    handle_warming_instances(store, compute, config, &asg_name, &all_docs, &asg_desc.instances)
-        .await;
+    // Step 3: Mark Warming instances Ready once the host drives them InService.
+    handle_warming_instances(store, &all_docs, &asg_desc.instances).await;
 
-    // Step 8: Handle Terminating instances
+    // Step 4: Handle Terminating instances.
     handle_terminating_instances(store, compute, &asg_name, &all_docs).await;
 
-    // Step 9: Recompute desired capacity and update if changed
+    // Step 5: Recompute desired capacity and update if changed.
     recompute_desired_capacity(store, compute, config, &asg_name, &asg_desc).await;
 
-    // Step 10: Update scale-in protection
+    // Step 6: Update scale-in protection.
     update_scale_in_protection(store, compute, &asg_name, &asg_desc.instances).await;
 
-    // Step 11: Apply pending owner tags
+    // Step 7: Apply pending owner tags.
     apply_pending_owner_tags(store, compute, &all_docs).await;
 
     Ok(())
 }
 
-/// Step 6: Sync DevboxDoc records with ASG membership.
+/// Step 2: Sync DevboxDoc records with ASG membership.
 ///
 /// - Delete docs whose instance_id is NOT in ASG instance set (stale cleanup)
 /// - Create new Warming docs for instances in "Pending:Wait" with no doc
 /// - Create new Ready docs for instances in "InService" with no doc
+///
+/// Instance metadata (type, AMI, subnet) is read from `DescribeInstances` rather
+/// than carried in config — the running instance is the source of truth.
 async fn sync_docs_with_asg(
     store: &DocumentStore,
-    config: &ReconcilerConfig,
+    compute: &(impl Compute + ?Sized),
     asg_instances: &[crate::compute::AsgInstance],
 ) {
     // Build set of instance IDs currently in the ASG
@@ -184,34 +156,58 @@ async fn sync_docs_with_asg(
         .filter_map(|d| d.data.instance_id.clone())
         .collect();
 
-    // Get the first subnet from config for new docs
-    let subnet_id = config
-        .subnet_ids
-        .first()
-        .cloned()
-        .unwrap_or_else(|| SubnetId("unknown".to_string()));
+    // ASG instances that need a new doc (only adoptable lifecycle states).
+    let new_instances: Vec<&crate::compute::AsgInstance> = asg_instances
+        .iter()
+        .filter(|inst| !doc_instance_ids.contains(&inst.instance_id))
+        .filter(|inst| {
+            inst.lifecycle_state == "Pending:Wait" || inst.lifecycle_state == "InService"
+        })
+        .collect();
 
-    // Create docs for ASG instances that have no doc
-    for inst in asg_instances {
-        if doc_instance_ids.contains(&inst.instance_id) {
-            continue;
+    if new_instances.is_empty() {
+        return;
+    }
+
+    // Enrich with EC2 metadata; without it we cannot populate the doc, so retry
+    // on the next tick rather than inventing values.
+    let ids: Vec<&str> = new_instances
+        .iter()
+        .map(|inst| inst.instance_id.as_str())
+        .collect();
+    let infos = match compute.describe_instances(&ids).await {
+        Ok(infos) => infos,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to describe new instances; will retry");
+            return;
         }
+    };
+    let info_by_id: HashMap<&str, &crate::compute::InstanceInfo> = infos
+        .iter()
+        .map(|info| (info.instance_id.as_str(), info))
+        .collect();
 
+    for inst in new_instances {
         let state = if inst.lifecycle_state == "Pending:Wait" {
             DevboxState::Warming
-        } else if inst.lifecycle_state == "InService" {
-            DevboxState::Ready
         } else {
-            // Skip instances in other states (Terminating, etc.)
+            DevboxState::Ready
+        };
+
+        let Some(info) = info_by_id.get(inst.instance_id.as_str()) else {
+            tracing::warn!(
+                instance_id = %inst.instance_id,
+                "no DescribeInstances result; will retry next tick"
+            );
             continue;
         };
 
         let new_doc = DevboxDoc {
             instance_id: Some(inst.instance_id.clone()),
             state,
-            instance_type: config.instance_type.clone(),
-            ami_id: config.ami_id.clone(),
-            subnet_id: subnet_id.clone(),
+            instance_type: InstanceType(info.instance_type.clone()),
+            ami_id: AmiId(info.ami_id.clone()),
+            subnet_id: SubnetId(info.subnet_id.clone()),
             ebs_volume_id: None,
             owner: None,
             claimed_at: None,
@@ -232,13 +228,12 @@ async fn sync_docs_with_asg(
 
 /// Step 7: Handle Warming instances.
 ///
-/// For Warming docs whose ASG instance is now InService:
-/// call `complete_lifecycle_action` with "CONTINUE", then update state to Ready.
+/// The host's `devbox-agent warmup` completes the ASG launch lifecycle hook once
+/// the box is ready, moving it from `Pending:Wait` to `InService`. The reconciler
+/// observes that transition and flips the corresponding `DevboxDoc` to Ready. It
+/// does not complete the hook itself — only the host knows when warm-up is done.
 async fn handle_warming_instances(
     store: &DocumentStore,
-    compute: &(impl Compute + ?Sized),
-    config: &ReconcilerConfig,
-    asg_name: &str,
     all_docs: &[crate::db::document_type::Document<DevboxDoc>],
     asg_instances: &[crate::compute::AsgInstance],
 ) {
@@ -247,8 +242,6 @@ async fn handle_warming_instances(
         .iter()
         .map(|inst| (inst.instance_id.as_str(), inst.lifecycle_state.as_str()))
         .collect();
-
-    let hook_name = config.lifecycle_hook_name();
 
     for doc in all_docs {
         if doc.data.state != DevboxState::Warming {
@@ -260,25 +253,12 @@ async fn handle_warming_instances(
             None => continue,
         };
 
-        // Check if ASG instance is now InService
+        // Wait for the host to complete the hook (Pending:Wait -> InService).
         let is_in_service = instance_states
             .get(instance_id)
             .is_some_and(|s| *s == "InService");
 
         if !is_in_service {
-            continue;
-        }
-
-        // Complete lifecycle action
-        if let Err(e) = compute
-            .complete_lifecycle_action(asg_name, &hook_name, instance_id, "CONTINUE")
-            .await
-        {
-            tracing::error!(
-                error = %e,
-                instance_id = %instance_id,
-                "failed to complete lifecycle action"
-            );
             continue;
         }
 
@@ -332,10 +312,7 @@ async fn handle_terminating_instances(
 
         if let Some(ref instance_id) = doc.data.instance_id {
             // Terminate instance in ASG (don't decrement — let ASG manage replacement)
-            if let Err(e) = compute
-                .terminate_instance_in_asg(instance_id, false)
-                .await
-            {
+            if let Err(e) = compute.terminate_instance_in_asg(instance_id, false).await {
                 tracing::error!(
                     error = %e,
                     instance_id = %instance_id,
@@ -357,7 +334,10 @@ async fn handle_terminating_instances(
     }
 }
 
-/// Step 9: Recompute desired capacity and update if changed.
+/// Step 5: Recompute desired capacity and update if changed.
+///
+/// The maximum is read from the adopted ASG (Terraform owns `MaxSize`), not from
+/// config.
 async fn recompute_desired_capacity(
     store: &DocumentStore,
     compute: &(impl Compute + ?Sized),
@@ -365,7 +345,7 @@ async fn recompute_desired_capacity(
     asg_name: &str,
     asg_desc: &crate::compute::AsgDescription,
 ) {
-    // Re-read docs to get current state after steps 7 and 8
+    // Re-read docs to get current state after the warming/terminating steps.
     let docs = match store.list_all::<DevboxDoc>().await {
         Ok(d) => d,
         Err(e) => {
@@ -378,17 +358,17 @@ async fn recompute_desired_capacity(
     let desired = compute_desired_capacity(
         claimed_count,
         config.target_warm_pool_size,
-        config.max_pool_size,
+        asg_desc.max_size,
     );
 
-    // Log warning if unclamped value exceeds max
+    // Log warning if the unclamped value exceeds the ASG's max.
     let unclamped = claimed_count.saturating_add(config.target_warm_pool_size);
-    if unclamped > config.max_pool_size {
+    if unclamped > asg_desc.max_size {
         tracing::warn!(
             unclamped_desired = unclamped,
-            max_pool_size = config.max_pool_size,
+            max_size = asg_desc.max_size,
             claimed_count = claimed_count,
-            "computed desired capacity exceeds max_pool_size"
+            "computed desired capacity exceeds ASG max_size"
         );
     }
 
@@ -425,12 +405,7 @@ async fn update_scale_in_protection(
     // Build map of instance_id -> doc state
     let doc_states: HashMap<&str, DevboxState> = docs
         .iter()
-        .filter_map(|d| {
-            d.data
-                .instance_id
-                .as_deref()
-                .map(|id| (id, d.data.state))
-        })
+        .filter_map(|d| d.data.instance_id.as_deref().map(|id| (id, d.data.state)))
         .collect();
 
     // Build map of instance_id -> currently protected
@@ -443,8 +418,7 @@ async fn update_scale_in_protection(
     let to_protect: Vec<&str> = doc_states
         .iter()
         .filter(|(id, state)| {
-            **state == DevboxState::Claimed
-                && instance_protection.get(*id).copied() == Some(false)
+            **state == DevboxState::Claimed && instance_protection.get(*id).copied() == Some(false)
         })
         .map(|(id, _)| *id)
         .collect();
@@ -453,8 +427,7 @@ async fn update_scale_in_protection(
     let to_unprotect: Vec<&str> = doc_states
         .iter()
         .filter(|(id, state)| {
-            **state != DevboxState::Claimed
-                && instance_protection.get(*id).copied() == Some(true)
+            **state != DevboxState::Claimed && instance_protection.get(*id).copied() == Some(true)
         })
         .map(|(id, _)| *id)
         .collect();

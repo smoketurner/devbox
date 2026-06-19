@@ -18,8 +18,8 @@ use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::db::DocumentStore;
 use crate::compute::Compute;
+use crate::db::DocumentStore;
 
 /// Spawn the pool reconciliation background task.
 ///

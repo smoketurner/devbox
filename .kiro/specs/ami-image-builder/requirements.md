@@ -85,20 +85,22 @@ Define an AMI build pipeline using EC2 Image Builder that produces a golden AMI 
 
 **User Story:** As a coding agent, I want SSH access configured for certificate-based auth via the Vouch CA, so that I can connect to a claimed devbox without any per-host key management.
 
-See [`../ssh-access/`](../ssh-access/) for the full access design.
+The access model (per-claim principal authorization, login-as-principal) is
+described in the "Access model" section of [`/CLAUDE.md`](../../../CLAUDE.md);
+this requirement covers only what the AMI bakes in.
 
 #### Acceptance Criteria
 
 1. THE Component SHALL configure the SSH daemon to allow public key (certificate) authentication only and disable password authentication
 2. THE Component SHALL bake the **Vouch SSH CA public key** into the image (e.g. `/etc/ssh/vouch_ca.pub`) and set `TrustedUserCAKeys` to it, so the host trusts Vouch-issued user certificates without any `authorized_keys` files
-3. THE Component SHALL install a `devbox-principals` resolver script (e.g. `/usr/local/sbin/devbox-principals`) and configure `AuthorizedPrincipalsCommand` + `AuthorizedPrincipalsCommandUser nobody`, where the resolver reads the `devbox:owner` instance tag from IMDSv2 and prints the authorized principal (fail-closed: empty output when untagged)
+3. THE Component SHALL configure `AuthorizedPrincipalsCommand /usr/local/sbin/devbox-agent principals %u` + `AuthorizedPrincipalsCommandUser nobody`, where `devbox-agent` reads the `devbox:owner` instance tag from IMDSv2 and prints it only when it equals the login user `%u` (fail-closed: nothing on absent tag or mismatch)
 4. THE Component SHALL configure the SSH daemon to listen on port 22 with protocol version 2 only
 5. THE Component SHALL set SSH idle timeout to 3600 seconds (ClientAliveInterval 300, ClientAliveCountMax 12) to prevent premature disconnection during agent work
-6. THE Component SHALL configure the login user account to accept SSH connections with a login shell of /bin/bash and appropriate sudoers entry (passwordless sudo for the login user)
+6. THE login user SHALL be the certificate principal itself (no shared account); `devbox-agent owner-sync` provisions a `/bin/bash` account named after the `devbox:owner` principal with passwordless sudo once the box is claimed
 
 > Note: the per-claim authorization (criterion 3) also requires the Launch
 > Template to enable instance metadata tags (`InstanceMetadataTags=enabled`) so the
-> `devbox:owner` tag is readable via IMDS. See `../ssh-access/design.md`.
+> `devbox:owner` tag is readable via IMDS — set by the `devbox-infra` `pool` module.
 
 ### Requirement 7: AMI ID Publication to SSM Parameter Store
 
@@ -116,7 +118,8 @@ See [`../ssh-access/`](../ssh-access/) for the full access design.
 
 > **Supersedes the previous "Pool Manager AMI Discovery from SSM."** The pool manager no
 > longer reads the AMI or manages Launch Template versions; the Terraform-owned Launch
-> Template resolves the AMI from SSM directly. See [`../infra-boundary/`](../infra-boundary/).
+> Template resolves the AMI from SSM directly. The control plane is adopt-only (see
+> [`/CLAUDE.md`](../../../CLAUDE.md)).
 
 **User Story:** As a platform operator, I want the Launch Template to always launch the
 current AMI without anyone editing it, so new warm instances are current automatically.
@@ -142,7 +145,7 @@ AMI automatically when one is published, without disrupting any in-use devbox.
 3. THE instance refresh SHALL set a `MinHealthyPercentage` (and honor the warm-up lifecycle hook on replacements) such that warm capacity remains available during the roll and the pool is never fully drained.
 4. Claimed instances SHALL adopt the new AMI naturally when released and replaced by the ASG; the refresh SHALL NOT force-terminate them.
 5. THE refresh executor SHALL require only `autoscaling:StartInstanceRefresh`, `DescribeInstanceRefreshes`, and `DescribeAutoScalingGroups`, and SHALL be provisioned by Terraform.
-6. Reusing scale-in protection as the "in use" signal is intentional and conservative: protection tracks `Claimed`, and per `../ssh-access/` an unclaimed host authorizes no SSH principals, so an unprotected (Ready) host reliably has no connections.
+6. Reusing scale-in protection as the "in use" signal is intentional and conservative: protection tracks `Claimed`, and per the access model an unclaimed host authorizes no SSH principals, so an unprotected (Ready) host reliably has no connections.
 
 ### Requirement 10: AMI Build Triggers
 

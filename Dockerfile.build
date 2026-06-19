@@ -50,7 +50,8 @@ ARG CARGO_PACKAGES="-p devbox-cli -p devbox-server"
 RUN touch -d "@${SOURCE_DATE_EPOCH}" \
       crates/devbox-common/src/lib.rs \
       crates/devbox-cli/src/main.rs \
-      crates/devbox-server/src/main.rs
+      crates/devbox-server/src/main.rs \
+      crates/devbox-agent/src/main.rs
 
 RUN cargo build --release --locked --target "${TARGET}" ${CARGO_PACKAGES}
 
@@ -62,7 +63,7 @@ RUN if [ "${GENERATE_SBOM}" = "true" ]; then \
 
 # Collect only release binaries and SBOMs
 RUN mkdir -p "/out/target/${TARGET}/release" \
-    && for bin in devbox-cli devbox-server; do \
+    && for bin in devbox-cli devbox-server devbox-agent; do \
          if [ -f "target/${TARGET}/release/${bin}" ]; then \
            cp "target/${TARGET}/release/${bin}" "/out/target/${TARGET}/release/"; \
          fi; \
