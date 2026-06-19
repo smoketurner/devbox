@@ -86,22 +86,29 @@ pub(super) async fn reconciliation_tick(
         }
     };
 
-    // Step 2: Describe all instances in the ASG upfront to get the ready tag.
+    // Step 2: Describe all instances in the ASG upfront to read the `devbox:ready`
+    // tag for the warming→ready transition and the reaper.
     //
-    // This single call covers both new instances (for sync_docs_with_asg) and
-    // already-warming instances (for handle_warming_instances and the reaper),
-    // ensuring we read the `devbox:ready` tag for every instance regardless of
-    // when it was first adopted.
+    // A describe failure must NOT abort the whole tick: owner-tagging, capacity,
+    // scale-in protection, and Terminating cleanup do not depend on the tag and
+    // still need to run — a just-claimed box must get its `devbox:owner` tag so the
+    // claimant can SSH in, even during a transient EC2 describe brownout. On failure
+    // we proceed with empty tag data and skip only the tag-dependent steps, crucially
+    // the reaper: running it with no tag data would treat every box as unready and
+    // reap the entire warm pool.
     let all_ids: Vec<&str> = asg_desc
         .instances
         .iter()
         .map(|inst| inst.instance_id.as_str())
         .collect();
-    let instance_infos = match compute.describe_instances(&all_ids).await {
-        Ok(infos) => infos,
+    let (instance_infos, describe_ok) = match compute.describe_instances(&all_ids).await {
+        Ok(infos) => (infos, true),
         Err(e) => {
-            tracing::error!(error = %e, "failed to describe ASG instances; skipping tick");
-            return Ok(());
+            tracing::warn!(
+                error = %e,
+                "failed to describe ASG instances; skipping tag-dependent steps this tick"
+            );
+            (Vec::new(), false)
         }
     };
     let info_by_id: HashMap<&str, &InstanceInfo> = instance_infos
@@ -115,11 +122,15 @@ pub(super) async fn reconciliation_tick(
     // Re-read docs after sync to get fresh state.
     let all_docs = store.list_all::<DevboxDoc>().await?;
 
-    // Step 4: Mark Warming instances Ready when the `devbox:ready` tag is present.
-    handle_warming_instances(store, &all_docs, &info_by_id).await;
+    // Steps 4 & 5 depend on fresh `devbox:ready` tag data; skip them when the
+    // describe failed (empty tag data would falsely reap the whole warm pool).
+    if describe_ok {
+        // Step 4: Mark Warming instances Ready when the `devbox:ready` tag is present.
+        handle_warming_instances(store, &all_docs, &info_by_id).await;
 
-    // Step 5: Reap Warming instances that never became ready within ready_timeout.
-    reap_unready_instances(store, config, &all_docs, &info_by_id).await;
+        // Step 5: Reap Warming instances that never became ready within ready_timeout.
+        reap_unready_instances(store, compute, config, &all_docs, &info_by_id).await;
+    }
 
     // Step 6: Handle Terminating instances.
     handle_terminating_instances(store, compute, &asg_name, &all_docs).await;
@@ -314,8 +325,15 @@ async fn handle_warming_instances(
 /// recreate a fresh Warming doc on the next tick (while the box is still shutting
 /// down), resetting the timer. Leaving a Terminating doc lets step 6 and the
 /// "instance gone from ASG" stale-cleanup path handle final removal.
-async fn reap_unready_instances(
+///
+/// Before terminating a timed-out box, the reaper re-describes that single
+/// instance: `info_by_id` is a tick-start snapshot, and `warmup` may have set
+/// `devbox:ready=true` in the window since. If the fresh read reports ready (or
+/// itself fails), the reap is skipped — never terminate a box that just reported
+/// ready, and never reap on a transient describe failure.
+pub(super) async fn reap_unready_instances(
     store: &DocumentStore,
+    compute: &(impl Compute + ?Sized),
     config: &ReconcilerConfig,
     all_docs: &[crate::db::document_type::Document<DevboxDoc>],
     info_by_id: &HashMap<&str, &InstanceInfo>,
@@ -364,6 +382,36 @@ async fn reap_unready_instances(
         if deadline >= now {
             // Not yet timed out.
             continue;
+        }
+
+        // Stale-snapshot guard: `info_by_id` was captured at tick start. `warmup`
+        // may have set `devbox:ready=true` in the window since, so re-describe this
+        // one instance before terminating it and skip the reap if it now reports
+        // ready. Fail-safe: skip on a re-describe error too — never terminate a
+        // possibly-healthy box on a transient failure.
+        match compute.describe_instances(&[instance_id]).await {
+            Ok(infos) => {
+                if infos
+                    .iter()
+                    .any(|i| i.instance_id.as_str() == instance_id && i.ready)
+                {
+                    tracing::info!(
+                        instance_id = %instance_id,
+                        doc_id = %doc.id,
+                        "reap candidate reported ready since tick start; skipping reap"
+                    );
+                    continue;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    instance_id = %instance_id,
+                    doc_id = %doc.id,
+                    "failed to re-describe reap candidate; skipping reap this tick"
+                );
+                continue;
+            }
         }
 
         // Flip doc to Terminating FIRST. handle_terminating_instances (step 6)

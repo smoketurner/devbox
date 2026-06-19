@@ -18,7 +18,7 @@ mod reconcile_tests {
     use crate::db::store::DocumentStore;
     use crate::documents::devbox::DevboxDoc;
     use crate::reconcile::config::ReconcilerConfig;
-    use crate::reconcile::tick::reconciliation_tick;
+    use crate::reconcile::tick::{reap_unready_instances, reconciliation_tick};
     use devbox_common::{AmiId, DevboxState, InstanceType, SubnetId};
 
     /// Build an in-memory SQLite document store with migrations applied.
@@ -307,6 +307,134 @@ mod reconcile_tests {
         assert!(
             compute.get_instance_tags(&claimed_id).is_some(),
             "Claimed instance must not be reaped (claimed_id={claimed_id})"
+        );
+    }
+
+    /// Test: a `describe_instances` failure does not abort the whole tick.
+    ///
+    /// Regression guard (bugbot: "describe failure skips reconciliation"). A
+    /// describe failure must skip only the tag-dependent steps. Owner-tagging still
+    /// runs — a just-claimed box must get its `devbox:owner` tag even during a
+    /// transient EC2 describe brownout — and the reaper must NOT run, since empty
+    /// tag data would treat every box as unready and reap the warm pool.
+    #[tokio::test]
+    async fn test_describe_failure_does_not_block_owner_tags_or_reap() {
+        let store = setup_store().await;
+        let compute = MockCompute::new();
+        let config = test_config(); // ready_timeout = 60s
+
+        compute.seed_asg(2, 5, 2);
+        let claimed_id = compute.add_instance("InService");
+        let warming_id = compute.add_instance("InService");
+
+        // A claimed box awaiting its owner tag (describe-independent step 9).
+        let claimed_doc = DevboxDoc {
+            instance_id: Some(claimed_id.clone()),
+            state: DevboxState::Claimed,
+            instance_type: InstanceType("m7g.large".to_string()),
+            ami_id: AmiId("ami-mock".to_string()),
+            subnet_id: SubnetId("subnet-mock".to_string()),
+            ebs_volume_id: None,
+            owner: Some("alice".to_string()),
+            claimed_at: None,
+            created_at: Timestamp::now(),
+            owner_tag_applied: false,
+        };
+        // A timed-out, unready Warming box the reaper would normally reap.
+        let past = Timestamp::from_second(0).unwrap();
+        let warming_doc = DevboxDoc {
+            instance_id: Some(warming_id.clone()),
+            state: DevboxState::Warming,
+            instance_type: InstanceType("m7g.large".to_string()),
+            ami_id: AmiId("ami-mock".to_string()),
+            subnet_id: SubnetId("subnet-mock".to_string()),
+            ebs_volume_id: None,
+            owner: None,
+            claimed_at: None,
+            created_at: past,
+            owner_tag_applied: false,
+        };
+        store.insert(&claimed_doc).await.unwrap();
+        store.insert(&warming_doc).await.unwrap();
+
+        // Inject a one-shot describe_instances failure (consumed by step 2).
+        compute.set_error("describe_instances", "throttled".to_string());
+
+        reconciliation_tick(&store, &compute, &config)
+            .await
+            .unwrap();
+
+        // Owner tag WAS applied despite the describe failure.
+        let tags = compute
+            .get_instance_tags(&claimed_id)
+            .expect("claimed instance still in ASG");
+        assert_eq!(
+            tags.get("devbox:owner").map(String::as_str),
+            Some("alice"),
+            "owner tag must be applied even when describe_instances fails"
+        );
+
+        // The timed-out Warming doc was NOT reaped (reaper skipped on describe fail).
+        let warming = find_doc_by_state(&store, DevboxState::Warming).await;
+        assert_eq!(
+            warming.data.instance_id.as_deref(),
+            Some(warming_id.as_str()),
+            "Warming doc must survive: reaper must not run without fresh tag data"
+        );
+    }
+
+    /// Test: the reaper re-checks readiness with a fresh describe before terminating.
+    ///
+    /// Regression guard (bugbot: "stale tags cause false reap"). If `warmup` sets
+    /// `devbox:ready=true` after the tick-start describe but before the reaper runs,
+    /// the box must not be reaped. Simulated by passing a stale (empty) `info_by_id`
+    /// while the mock instance actually carries the ready tag, so the reaper's fresh
+    /// re-describe is what saves it.
+    #[tokio::test]
+    async fn test_reap_rechecks_readiness_before_terminating() {
+        use std::collections::HashMap;
+
+        let store = setup_store().await;
+        let compute = MockCompute::new();
+        let config = test_config(); // ready_timeout = 60s
+
+        compute.seed_asg(1, 5, 1);
+        let instance_id = compute.add_instance("InService");
+        // The box reported ready AFTER the (simulated) tick-start snapshot.
+        compute.set_instance_ready(&instance_id, true);
+
+        // A timed-out Warming doc that a stale snapshot would reap.
+        let past = Timestamp::from_second(0).unwrap();
+        let warming_doc = DevboxDoc {
+            instance_id: Some(instance_id.clone()),
+            state: DevboxState::Warming,
+            instance_type: InstanceType("m7g.large".to_string()),
+            ami_id: AmiId("ami-mock".to_string()),
+            subnet_id: SubnetId("subnet-mock".to_string()),
+            ebs_volume_id: None,
+            owner: None,
+            claimed_at: None,
+            created_at: past,
+            owner_tag_applied: false,
+        };
+        store.insert(&warming_doc).await.unwrap();
+
+        let all_docs = store.list_all::<DevboxDoc>().await.unwrap();
+        // Stale snapshot: empty map → the reaper sees the instance as not-ready.
+        let info_by_id = HashMap::new();
+
+        reap_unready_instances(&store, &compute, &config, &all_docs, &info_by_id).await;
+
+        // The fresh re-describe saw devbox:ready=true → reap skipped, doc unchanged.
+        let all = store.list_all::<DevboxDoc>().await.unwrap();
+        assert_eq!(
+            all.first().unwrap().data.state,
+            DevboxState::Warming,
+            "box that reported ready since the snapshot must not be reaped"
+        );
+        assert!(
+            compute.get_instance_tags(&instance_id).is_some(),
+            "instance must not be terminated"
         );
     }
 }
