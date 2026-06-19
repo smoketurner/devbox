@@ -1,18 +1,18 @@
 //! Reconciliation tick logic.
 //!
-//! The reconciler is adopt-only: Terraform provisions the Launch Template, ASG,
-//! and lifecycle hook (see CLAUDE.md). Each tick looks the
-//! ASG up by name, syncs `DevboxDoc` records with its membership, observes
-//! host-driven lifecycle transitions, and writes only runtime state — desired
-//! capacity (clamped to the ASG's max), scale-in protection, owner tags, and
-//! terminations.
+//! The reconciler is adopt-only: Terraform provisions the Launch Template and
+//! ASG (see CLAUDE.md). Each tick looks the ASG up by name, syncs `DevboxDoc`
+//! records with its membership, observes the host-set `devbox:ready` tag to
+//! transition Warming→Ready, reaps boxes that never become ready, and writes
+//! only runtime state — desired capacity (clamped to the ASG's max), scale-in
+//! protection, owner tags, and terminations.
 
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
-use jiff::Timestamp;
+use jiff::{SignedDuration, Timestamp};
 
-use crate::compute::Compute;
+use crate::compute::{Compute, InstanceInfo};
 use crate::db::DocumentStore;
 use crate::documents::devbox::DevboxDoc;
 use devbox_common::{AmiId, DevboxState, InstanceType, SubnetId};
@@ -52,12 +52,15 @@ fn count_by_state(
 ///
 /// Adopt-only flow:
 /// 1. Look up the ASG by name; skip the tick if it does not exist yet.
-/// 2. Sync DevboxDoc records with ASG membership.
-/// 3. Mark Warming instances Ready once the host drives them InService.
-/// 4. Terminate Terminating instances and delete their docs.
-/// 5. Recompute desired capacity (clamped to the ASG's max) and update.
-/// 6. Update scale-in protection for Claimed instances.
-/// 7. Apply pending owner tags.
+/// 2. Describe all ASG instances to build an id→InstanceInfo map (includes the
+///    `devbox:ready` tag).
+/// 3. Sync DevboxDoc records with ASG membership.
+/// 4. Mark Warming instances Ready when `InstanceInfo.ready` is true.
+/// 5. Reap Warming instances that have exceeded `ready_timeout`.
+/// 6. Terminate Terminating instances and delete their docs.
+/// 7. Recompute desired capacity (clamped to the ASG's max) and update.
+/// 8. Update scale-in protection.
+/// 9. Apply pending owner tags.
 ///
 /// # Errors
 ///
@@ -83,42 +86,83 @@ pub(super) async fn reconciliation_tick(
         }
     };
 
-    // Step 2: Sync DevboxDoc records with ASG membership.
-    sync_docs_with_asg(store, compute, &asg_desc.instances).await;
+    // Step 2: Describe all instances in the ASG upfront to read the `devbox:ready`
+    // tag for the warming→ready transition and the reaper.
+    //
+    // A describe failure must NOT abort the whole tick: owner-tagging, capacity,
+    // scale-in protection, and Terminating cleanup do not depend on the tag and
+    // still need to run — a just-claimed box must get its `devbox:owner` tag so the
+    // claimant can SSH in, even during a transient EC2 describe brownout. On failure
+    // we proceed with empty tag data and skip only the tag-dependent steps, crucially
+    // the reaper: running it with no tag data would treat every box as unready and
+    // reap the entire warm pool.
+    let all_ids: Vec<&str> = asg_desc
+        .instances
+        .iter()
+        .map(|inst| inst.instance_id.as_str())
+        .collect();
+    let (instance_infos, describe_ok) = match compute.describe_instances(&all_ids).await {
+        Ok(infos) => (infos, true),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "failed to describe ASG instances; skipping tag-dependent steps this tick"
+            );
+            (Vec::new(), false)
+        }
+    };
+    let info_by_id: HashMap<&str, &InstanceInfo> = instance_infos
+        .iter()
+        .map(|info| (info.instance_id.as_str(), info))
+        .collect();
+
+    // Step 3: Sync DevboxDoc records with ASG membership.
+    sync_docs_with_asg(store, &asg_desc.instances, &info_by_id).await;
 
     // Re-read docs after sync to get fresh state.
     let all_docs = store.list_all::<DevboxDoc>().await?;
 
-    // Step 3: Mark Warming instances Ready once the host drives them InService.
-    handle_warming_instances(store, &all_docs, &asg_desc.instances).await;
+    // Steps 4 & 5 depend on fresh `devbox:ready` tag data; skip them when the
+    // describe failed (empty tag data would falsely reap the whole warm pool).
+    if describe_ok {
+        // Step 4: Mark Warming instances Ready when the `devbox:ready` tag is present.
+        handle_warming_instances(store, &all_docs, &info_by_id).await;
 
-    // Step 4: Handle Terminating instances.
+        // Step 5: Reap Warming instances that never became ready within ready_timeout.
+        reap_unready_instances(store, compute, config, &all_docs, &info_by_id).await;
+    }
+
+    // Step 6: Handle Terminating instances.
     handle_terminating_instances(store, compute, &asg_name, &all_docs).await;
 
-    // Step 5: Recompute desired capacity and update if changed.
+    // Step 7: Recompute desired capacity and update if changed.
     recompute_desired_capacity(store, compute, config, &asg_name, &asg_desc).await;
 
-    // Step 6: Update scale-in protection.
+    // Step 8: Update scale-in protection.
     update_scale_in_protection(store, compute, &asg_name, &asg_desc.instances).await;
 
-    // Step 7: Apply pending owner tags.
+    // Step 9: Apply pending owner tags.
     apply_pending_owner_tags(store, compute, &all_docs).await;
 
     Ok(())
 }
 
-/// Step 2: Sync DevboxDoc records with ASG membership.
+/// Step 3: Sync DevboxDoc records with ASG membership.
 ///
-/// - Delete docs whose instance_id is NOT in ASG instance set (stale cleanup)
-/// - Create new Warming docs for instances in "Pending:Wait" with no doc
-/// - Create new Ready docs for instances in "InService" with no doc
+/// - Delete docs whose instance_id is NOT in the ASG (stale cleanup).
+/// - Create new Warming docs for instances in a live lifecycle state with no doc.
 ///
-/// Instance metadata (type, AMI, subnet) is read from `DescribeInstances` rather
-/// than carried in config — the running instance is the source of truth.
+/// All new docs are created in `Warming` state regardless of lifecycle state —
+/// readiness is gated on the `devbox:ready` tag, not on `InService`. Creating
+/// a doc Ready here would bypass the tag gate.
+///
+/// The creation filter accepts `Pending*` and `InService` states because, with
+/// no lifecycle hook, instances go directly `Pending → InService`; the reconciler
+/// may first observe them in either state.
 async fn sync_docs_with_asg(
     store: &DocumentStore,
-    compute: &(impl Compute + ?Sized),
     asg_instances: &[crate::compute::AsgInstance],
+    info_by_id: &HashMap<&str, &InstanceInfo>,
 ) {
     // Build set of instance IDs currently in the ASG
     let asg_instance_ids: HashSet<&str> = asg_instances
@@ -157,11 +201,13 @@ async fn sync_docs_with_asg(
         .collect();
 
     // ASG instances that need a new doc (only adoptable lifecycle states).
+    // With no lifecycle hook, instances go Pending → InService directly; we
+    // accept any Pending* variant and InService to catch either observation.
     let new_instances: Vec<&crate::compute::AsgInstance> = asg_instances
         .iter()
         .filter(|inst| !doc_instance_ids.contains(&inst.instance_id))
         .filter(|inst| {
-            inst.lifecycle_state == "Pending:Wait" || inst.lifecycle_state == "InService"
+            inst.lifecycle_state.starts_with("Pending") || inst.lifecycle_state == "InService"
         })
         .collect();
 
@@ -169,31 +215,7 @@ async fn sync_docs_with_asg(
         return;
     }
 
-    // Enrich with EC2 metadata; without it we cannot populate the doc, so retry
-    // on the next tick rather than inventing values.
-    let ids: Vec<&str> = new_instances
-        .iter()
-        .map(|inst| inst.instance_id.as_str())
-        .collect();
-    let infos = match compute.describe_instances(&ids).await {
-        Ok(infos) => infos,
-        Err(e) => {
-            tracing::error!(error = %e, "failed to describe new instances; will retry");
-            return;
-        }
-    };
-    let info_by_id: HashMap<&str, &crate::compute::InstanceInfo> = infos
-        .iter()
-        .map(|info| (info.instance_id.as_str(), info))
-        .collect();
-
     for inst in new_instances {
-        let state = if inst.lifecycle_state == "Pending:Wait" {
-            DevboxState::Warming
-        } else {
-            DevboxState::Ready
-        };
-
         let Some(info) = info_by_id.get(inst.instance_id.as_str()) else {
             tracing::warn!(
                 instance_id = %inst.instance_id,
@@ -202,9 +224,12 @@ async fn sync_docs_with_asg(
             continue;
         };
 
+        // Always create Warming: readiness is gated on devbox:ready tag, never
+        // on lifecycle state alone. handle_warming_instances will flip to Ready
+        // on the next tick once the tag is seen.
         let new_doc = DevboxDoc {
             instance_id: Some(inst.instance_id.clone()),
-            state,
+            state: DevboxState::Warming,
             instance_type: InstanceType(info.instance_type.clone()),
             ami_id: AmiId(info.ami_id.clone()),
             subnet_id: SubnetId(info.subnet_id.clone()),
@@ -226,23 +251,16 @@ async fn sync_docs_with_asg(
     }
 }
 
-/// Step 7: Handle Warming instances.
+/// Step 4: Transition Warming instances to Ready when `devbox:ready=true` is set.
 ///
-/// The host's `devbox-agent warmup` completes the ASG launch lifecycle hook once
-/// the box is ready, moving it from `Pending:Wait` to `InService`. The reconciler
-/// observes that transition and flips the corresponding `DevboxDoc` to Ready. It
-/// does not complete the hook itself — only the host knows when warm-up is done.
+/// The host's `devbox-agent warmup` sets the `devbox:ready=true` tag on its own
+/// instance once warm-up is complete. The reconciler observes that tag (surfaced
+/// in `InstanceInfo.ready`) and flips the corresponding `DevboxDoc` to Ready.
 async fn handle_warming_instances(
     store: &DocumentStore,
     all_docs: &[crate::db::document_type::Document<DevboxDoc>],
-    asg_instances: &[crate::compute::AsgInstance],
+    info_by_id: &HashMap<&str, &InstanceInfo>,
 ) {
-    // Build map of instance_id -> lifecycle_state
-    let instance_states: HashMap<&str, &str> = asg_instances
-        .iter()
-        .map(|inst| (inst.instance_id.as_str(), inst.lifecycle_state.as_str()))
-        .collect();
-
     for doc in all_docs {
         if doc.data.state != DevboxState::Warming {
             continue;
@@ -253,16 +271,12 @@ async fn handle_warming_instances(
             None => continue,
         };
 
-        // Wait for the host to complete the hook (Pending:Wait -> InService).
-        let is_in_service = instance_states
-            .get(instance_id)
-            .is_some_and(|s| *s == "InService");
+        let is_ready = info_by_id.get(instance_id).is_some_and(|info| info.ready);
 
-        if !is_in_service {
+        if !is_ready {
             continue;
         }
 
-        // Update doc state to Ready
         let mut updated_doc = doc.data.clone();
         updated_doc.state = DevboxState::Ready;
 
@@ -274,7 +288,7 @@ async fn handle_warming_instances(
                 tracing::info!(
                     instance_id = %instance_id,
                     doc_id = %doc.id,
-                    "warming instance transitioned to ready"
+                    "warming instance transitioned to ready (devbox:ready tag seen)"
                 );
             }
             Ok(false) => {
@@ -294,11 +308,164 @@ async fn handle_warming_instances(
     }
 }
 
-/// Step 8: Handle Terminating instances.
+/// Step 5: Reap Warming instances that exceed `ready_timeout` without becoming ready.
+///
+/// For each Warming doc whose instance is NOT ready and whose `created_at` is
+/// older than `config.ready_timeout`, the doc is flipped to `Terminating` FIRST
+/// (via a version-guarded write), then `handle_terminating_instances` (step 6)
+/// issues the AWS terminate call on the next iteration over the doc list.
+///
+/// Ordering matters: setting the doc state before the AWS call means that on a
+/// version conflict (`Ok(false)`) the AWS call is skipped entirely — the doc
+/// remains in its actual state and we retry cleanly next tick. Calling AWS first
+/// would terminate an instance whose doc might still read `Warming`, leading to a
+/// double-terminate on the next tick and a spurious "failed to terminate" error log.
+///
+/// The doc is set to `Terminating`, NOT deleted: deleting lets `sync_docs_with_asg`
+/// recreate a fresh Warming doc on the next tick (while the box is still shutting
+/// down), resetting the timer. Leaving a Terminating doc lets step 6 and the
+/// "instance gone from ASG" stale-cleanup path handle final removal.
+///
+/// Before terminating a timed-out box, the reaper re-describes that single
+/// instance: `info_by_id` is a tick-start snapshot, and `warmup` may have set
+/// `devbox:ready=true` in the window since. If the fresh read reports ready (or
+/// itself fails), the reap is skipped — never terminate a box that just reported
+/// ready, and never reap on a transient describe failure.
+pub(super) async fn reap_unready_instances(
+    store: &DocumentStore,
+    compute: &(impl Compute + ?Sized),
+    config: &ReconcilerConfig,
+    all_docs: &[crate::db::document_type::Document<DevboxDoc>],
+    info_by_id: &HashMap<&str, &InstanceInfo>,
+) {
+    let now = Timestamp::now();
+    let timeout_secs = config.ready_timeout.as_secs();
+    let timeout_nanos = config.ready_timeout.subsec_nanos();
+    let timeout_signed = match (i64::try_from(timeout_secs), i32::try_from(timeout_nanos)) {
+        (Ok(secs), Ok(nanos)) => SignedDuration::new(secs, nanos),
+        _ => {
+            tracing::error!("ready_timeout duration overflow; skipping reap");
+            return;
+        }
+    };
+
+    for doc in all_docs {
+        if doc.data.state != DevboxState::Warming {
+            continue;
+        }
+
+        let instance_id = match doc.data.instance_id {
+            Some(ref id) => id.as_str(),
+            None => continue,
+        };
+
+        // Skip instances that have already set the ready tag.
+        let is_ready = info_by_id.get(instance_id).is_some_and(|info| info.ready);
+        if is_ready {
+            continue;
+        }
+
+        // Check if the doc's created_at + ready_timeout has elapsed.
+        // deadline = created_at + timeout; if deadline < now → timed out.
+        let deadline = match doc.data.created_at.checked_add(timeout_signed) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    doc_id = %doc.id,
+                    "timestamp overflow computing reap deadline; skipping"
+                );
+                continue;
+            }
+        };
+
+        if deadline >= now {
+            // Not yet timed out.
+            continue;
+        }
+
+        // Stale-snapshot guard: `info_by_id` was captured at tick start. `warmup`
+        // may have set `devbox:ready=true` in the window since, so re-describe this
+        // one instance before terminating it and skip the reap if it now reports
+        // ready. Fail-safe: skip on a re-describe error too — never terminate a
+        // possibly-healthy box on a transient failure.
+        match compute.describe_instances(&[instance_id]).await {
+            Ok(infos) => {
+                if infos
+                    .iter()
+                    .any(|i| i.instance_id.as_str() == instance_id && i.ready)
+                {
+                    tracing::info!(
+                        instance_id = %instance_id,
+                        doc_id = %doc.id,
+                        "reap candidate reported ready since tick start; skipping reap"
+                    );
+                    continue;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    instance_id = %instance_id,
+                    doc_id = %doc.id,
+                    "failed to re-describe reap candidate; skipping reap this tick"
+                );
+                continue;
+            }
+        }
+
+        // Flip doc to Terminating FIRST. handle_terminating_instances (step 6)
+        // issues the AWS terminate call on the NEXT tick: it iterates the
+        // `all_docs` snapshot that was read before this reap ran, so it still sees
+        // the doc as Warming this tick and skips it. This ordering prevents a
+        // double-terminate: if the version-guarded write fails (Ok(false)), we skip
+        // the AWS call and retry next tick without having touched AWS.
+        let mut updated_doc = doc.data.clone();
+        updated_doc.state = DevboxState::Terminating;
+
+        match store
+            .compare_and_update(&doc.id, doc.version, &updated_doc)
+            .await
+        {
+            Ok(true) => {
+                tracing::warn!(
+                    instance_id = %instance_id,
+                    doc_id = %doc.id,
+                    created_at = %doc.data.created_at,
+                    "reaping warming instance that exceeded ready_timeout; set to Terminating"
+                );
+                // handle_terminating_instances (step 6) will issue the AWS call.
+            }
+            Ok(false) => {
+                tracing::warn!(
+                    doc_id = %doc.id,
+                    "version conflict marking warming doc Terminating for reap; will retry next tick"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    doc_id = %doc.id,
+                    "failed to set reaped warming doc to Terminating"
+                );
+            }
+        }
+    }
+}
+
+/// Step 6: Handle Terminating instances.
 ///
 /// For docs in Terminating state:
-/// - If instance_id is Some: terminate in ASG, then delete doc
-/// - If instance_id is None: just delete doc
+/// - If instance_id is Some: attempt to terminate in ASG. On a transient error
+///   (throttle / 5xx), log a warning and leave the Terminating doc in place so
+///   the reap retries on the next tick. The stale-cleanup path in
+///   `sync_docs_with_asg` deletes the doc once the instance leaves the ASG.
+/// - On a successful terminate (or no instance_id): delete the doc.
+///
+/// Deleting the doc on a terminate error would let `sync_docs_with_asg` recreate
+/// a fresh Warming doc on the next tick (while the instance is still InService),
+/// resetting the reap timer — the exact failure mode the reaper's doc comment warns
+/// against.
 async fn handle_terminating_instances(
     store: &DocumentStore,
     compute: &(impl Compute + ?Sized),
@@ -310,20 +477,19 @@ async fn handle_terminating_instances(
             continue;
         }
 
-        if let Some(ref instance_id) = doc.data.instance_id {
-            // Terminate instance in ASG (don't decrement — let ASG manage replacement)
-            if let Err(e) = compute.terminate_instance_in_asg(instance_id, false).await {
-                tracing::error!(
-                    error = %e,
-                    instance_id = %instance_id,
-                    doc_id = %doc.id,
-                    "failed to terminate instance in ASG"
-                );
-                continue;
-            }
+        if let Some(ref instance_id) = doc.data.instance_id
+            && let Err(e) = compute.terminate_instance_in_asg(instance_id, false).await
+        {
+            tracing::warn!(
+                error = %e,
+                instance_id = %instance_id,
+                doc_id = %doc.id,
+                "failed to terminate instance in ASG; will retry next tick"
+            );
+            continue; // leave Terminating doc; stale-cleanup deletes once instance leaves ASG
         }
 
-        // Delete the doc
+        // Terminate succeeded (or no instance_id) — safe to delete now.
         if let Err(e) = store.delete(&doc.id).await {
             tracing::error!(
                 error = %e,
@@ -334,7 +500,7 @@ async fn handle_terminating_instances(
     }
 }
 
-/// Step 5: Recompute desired capacity and update if changed.
+/// Step 7: Recompute desired capacity and update if changed.
 ///
 /// The maximum is read from the adopted ASG (Terraform owns `MaxSize`), not from
 /// config.
@@ -383,7 +549,7 @@ async fn recompute_desired_capacity(
     }
 }
 
-/// Step 10: Update scale-in protection.
+/// Step 8: Update scale-in protection.
 ///
 /// - Enable for Claimed instances that are NOT already protected
 /// - Disable for non-Claimed instances that ARE protected
@@ -457,7 +623,7 @@ async fn update_scale_in_protection(
     }
 }
 
-/// Step 11: Apply pending owner tags.
+/// Step 9: Apply pending owner tags.
 ///
 /// For Claimed docs with `owner_tag_applied=false`, `instance_id` set, and
 /// `owner` set: call `tag_instance` and mark as applied on success.

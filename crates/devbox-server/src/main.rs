@@ -70,6 +70,12 @@ async fn main() -> Result<()> {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
         ),
+        ready_timeout: Duration::from_secs(
+            std::env::var("POOL_READY_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300),
+        ),
     };
 
     reconciler_config

@@ -144,6 +144,27 @@ impl MockCompute {
         state.instances.get(id).map(|inst| inst.tags.clone())
     }
 
+    /// Set or remove the `devbox:ready` tag on an instance.
+    ///
+    /// Mirrors the real implementation: readiness is stored as a tag, not a
+    /// separate bool, so describe_instances derives `InstanceInfo.ready` from it.
+    pub fn set_instance_ready(&self, id: &str, ready: bool) {
+        let mut state = self
+            .asg_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if let Some(instance) = state.instances.get_mut(id) {
+            if ready {
+                instance
+                    .tags
+                    .insert("devbox:ready".to_string(), "true".to_string());
+            } else {
+                instance.tags.remove("devbox:ready");
+            }
+        }
+    }
+
     /// Check for an injected error and return it if present.
     fn check_error(&self, method: &str) -> Result<()> {
         let mut errors = self
@@ -232,6 +253,7 @@ impl Compute for MockCompute {
                 instance_type: inst.instance_type.clone(),
                 ami_id: inst.ami_id.clone(),
                 subnet_id: inst.subnet_id.clone(),
+                ready: inst.tags.get("devbox:ready").map(String::as_str) == Some("true"),
             })
             .collect();
 

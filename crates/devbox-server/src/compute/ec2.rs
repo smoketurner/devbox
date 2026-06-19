@@ -113,6 +113,9 @@ impl Compute for Ec2 {
         }
 
         let ids: Vec<String> = instance_ids.iter().map(|id| (*id).to_string()).collect();
+        // Note: a single .send() truncates at 1000 results. At current pool
+        // sizes this is harmless. Switch to .into_paginator() if the pool
+        // scales toward that limit.
         let output = self
             .ec2_client
             .describe_instances()
@@ -127,6 +130,11 @@ impl Compute for Ec2 {
                 let Some(instance_id) = instance.instance_id() else {
                     continue;
                 };
+                let ready = instance
+                    .tags()
+                    .iter()
+                    .any(|t| t.key() == Some("devbox:ready") && t.value() == Some("true"));
+
                 infos.push(InstanceInfo {
                     instance_id: instance_id.to_string(),
                     instance_type: instance
@@ -135,6 +143,7 @@ impl Compute for Ec2 {
                         .unwrap_or_default(),
                     ami_id: instance.image_id().unwrap_or_default().to_string(),
                     subnet_id: instance.subnet_id().unwrap_or_default().to_string(),
+                    ready,
                 });
             }
         }

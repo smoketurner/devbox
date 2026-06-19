@@ -75,18 +75,21 @@ Rust workspace, four crates:
 | `devbox-common` | Shared types: `DevboxId`, `DevboxState`, API request/response |
 | `devbox-server` | Axum API (`/api/v1/devboxes/*`) + HTML dashboard, document store (SQLite dev / Aurora DSQL prod), ASG-adopting pool reconciler, AWS compute layer |
 | `devbox-cli`    | `claim` / `release` / `list` / `status` / `ssh` |
-| `devbox-agent`  | On-host binary baked into the AMI: `principals` (sshd resolver), `owner-sync` (provision the claimant's account), `warmup` (release the ASG launch hook). musl static; built/released by CI, downloaded into the golden AMI |
+| `devbox-agent`  | On-host binary baked into the AMI: `principals` (sshd resolver), `owner-sync` (provision the claimant's account), `warmup` (self-tags `devbox:ready=true` once warmed). musl static; built/released by CI, downloaded into the golden AMI |
 
 **Pool management is ASG-based and the reconciler is adopt-only.** The Launch
-Template, ASG, and warm-up lifecycle hook are **provisioned by Terraform** in
-`devbox-infra`; the reconciler **adopts** the ASG by name (skipping the tick if it
-is absent) and owns only runtime state — `DesiredCapacity = min(claimed_count +
-target_warm_pool_size, ASG max)`, per-instance scale-in protection, owner tagging,
-and termination. Instance metadata (type/AMI/subnet) is read from
-`DescribeInstances`, not config. It runs as a leader-locked background loop (only
-one replica acts at a time) and syncs `DevboxDoc` records against ASG membership
-each tick. The host's `devbox-agent warmup` completes the launch lifecycle hook
-(`Pending:Wait` → `InService`); the reconciler then marks the box `Ready`.
+Template and ASG are **provisioned by Terraform** in `devbox-infra`; there is no
+launch lifecycle hook. The reconciler **adopts** the ASG by name (skipping the
+tick if it is absent) and owns only runtime state — `DesiredCapacity =
+min(claimed_count + target_warm_pool_size, ASG max)`, per-instance scale-in
+protection, owner tagging, and termination. Instance metadata (type/AMI/subnet)
+is read from `DescribeInstances`, not config. It runs as a leader-locked
+background loop (only one replica acts at a time) and syncs `DevboxDoc` records
+against ASG membership each tick. The host's `devbox-agent warmup` sets the
+instance tag `devbox:ready=true` once the host is ready; the reconciler then
+marks the `DevboxDoc` `Ready`. Boxes that never tag ready within `ready_timeout`
+(default 300 s, env `POOL_READY_TIMEOUT_SECS`) are terminated by the reconciler
+and the ASG relaunches a replacement.
 
 > There are no active `.kiro/specs/` left — this file plus the Terraform in
 > `devbox-infra` (the `image-builder`, `pool`, and `control-plane` modules) are the
@@ -155,11 +158,16 @@ cargo run --bin devbox-server          # serves http://localhost:3000
 SQLite/DSQL with optimistic concurrency, **adopt-only** ASG reconciler (adopts the
 Terraform ASG by name, syncs membership, maintains desired capacity, scale-in
 protection, `devbox:owner` tagging via `apply_pending_owner_tags`), graceful
-shutdown, dashboard scaffolding, unit tests. **SSH/Vouch-CA path:** `devbox-agent`
-(principals resolver + per-principal account provisioning + warm-up hook
-completion) baked into the AMI; Terraform `pool` module provides the host instance
-profile (SSM core + lifecycle), `InstanceMetadataTags=enabled`, and sshd
-`AuthorizedPrincipalsCommand` config. **AMI rotation:** the Launch Template resolves
+shutdown, dashboard scaffolding, unit tests. **Tag-based readiness gate:** instances
+auto-join the ASG (no launch lifecycle hook); `devbox-agent warmup` self-sets
+`devbox:ready=true` via `ec2:CreateTags`; the reconciler flips `DevboxDoc`
+`Warming → Ready` on that tag; boxes that never tag ready within `ready_timeout`
+(`POOL_READY_TIMEOUT_SECS`, default 300 s, validated 60–3600 s) are terminated and
+the ASG relaunches them. **SSH/Vouch-CA path:** `devbox-agent` (principals resolver
++ per-principal account provisioning + warmup) baked into the AMI; Terraform `pool`
+module provides the host instance profile (SSM core + `ec2:CreateTags` for
+`devbox:ready`), `InstanceMetadataTags=enabled`, and sshd `AuthorizedPrincipalsCommand`
+config. **AMI rotation:** the Launch Template resolves
 `resolve:ssm:/devbox/ami/latest`, and the `pool` module's EventBridge → SSM
 Automation rolls unclaimed warm hosts onto a new AMI via an ASG instance refresh
 (`ScaleInProtectedInstances = Ignore`, so Claimed hosts are skipped). **Deployment:**
@@ -169,11 +177,12 @@ an ECR repo, and the server on ECS/Fargate (arm64) behind an internal ALB whose
 `.github/workflows/deploy.yml` assumes a GitHub-OIDC-federated role (from the
 `control-plane` module) to push a commit-SHA-tagged image to ECR, register a new
 ECS task-definition revision pinned to it, and roll the service — with the ECS
-deployment circuit breaker auto-rolling-back a failed deploy. No static AWS keys. **API auth** (`AUTH_ENABLED`): the server (`src/auth/`)
-resolves the caller from the ALB's `x-amzn-oidc-data` (dashboard) or a `Bearer`
-Vouch JWT (CLI `--token` / `DEVBOX_TOKEN`), verifies it (ALB regional key / Vouch
-JWKS), and **binds `owner` to the verified principal** — so claim/release act only
-as the authenticated identity. Read endpoints stay open.
+deployment circuit breaker auto-rolling-back a failed deploy. No static AWS keys.
+**API auth** (`AUTH_ENABLED`): the server (`src/auth/`) resolves the caller from
+the ALB's `x-amzn-oidc-data` (dashboard) or a `Bearer` Vouch JWT (CLI `--token` /
+`DEVBOX_TOKEN`), verifies it (ALB regional key / Vouch JWKS), and **binds `owner`
+to the verified principal** — so claim/release act only as the authenticated
+identity. Read endpoints stay open.
 
 **Planned / not yet built** (ideas borrowed from [`.kiro/references.md`](.kiro/references.md)
 are tagged inline):

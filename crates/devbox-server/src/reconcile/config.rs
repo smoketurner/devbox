@@ -22,6 +22,11 @@ pub struct ReconcilerConfig {
     pub polling_interval: Duration,
     /// Leader lock time-to-live.
     pub lock_ttl: Duration,
+    /// Maximum time a Warming instance may remain un-ready before being reaped.
+    ///
+    /// A Warming doc older than this whose instance has not set `devbox:ready=true`
+    /// is terminated (ASG relaunches a replacement) and its doc set to Terminating.
+    pub ready_timeout: Duration,
 }
 
 impl ReconcilerConfig {
@@ -39,6 +44,10 @@ impl ReconcilerConfig {
                 "target_warm_pool_size must be between 1 and 100, got {}",
                 self.target_warm_pool_size
             );
+        }
+        let ready_secs = self.ready_timeout.as_secs();
+        if !(60..=3600).contains(&ready_secs) {
+            bail!("ready_timeout must be between 60 and 3600 seconds, got {ready_secs}");
         }
         Ok(())
     }
@@ -58,6 +67,52 @@ impl Default for ReconcilerConfig {
             target_warm_pool_size: 2,
             polling_interval: Duration::from_secs(30),
             lock_ttl: Duration::from_secs(60),
+            ready_timeout: Duration::from_secs(300),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a valid default config for use in boundary tests.
+    fn valid_config() -> ReconcilerConfig {
+        ReconcilerConfig {
+            pool_id: "test".to_string(),
+            server_id: "test-server".to_string(),
+            target_warm_pool_size: 2,
+            polling_interval: Duration::from_secs(30),
+            lock_ttl: Duration::from_secs(60),
+            ready_timeout: Duration::from_secs(300),
+        }
+    }
+
+    #[test]
+    fn ready_timeout_at_minimum_is_valid() {
+        let mut cfg = valid_config();
+        cfg.ready_timeout = Duration::from_secs(60);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn ready_timeout_at_maximum_is_valid() {
+        let mut cfg = valid_config();
+        cfg.ready_timeout = Duration::from_secs(3600);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn ready_timeout_below_minimum_is_rejected() {
+        let mut cfg = valid_config();
+        cfg.ready_timeout = Duration::from_secs(59);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn ready_timeout_above_maximum_is_rejected() {
+        let mut cfg = valid_config();
+        cfg.ready_timeout = Duration::from_secs(3601);
+        assert!(cfg.validate().is_err());
     }
 }

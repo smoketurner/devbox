@@ -14,7 +14,7 @@ pub mod mock;
 pub struct AsgInstance {
     /// EC2 instance ID.
     pub instance_id: String,
-    /// ASG lifecycle state (e.g., "Pending:Wait", "InService", "Terminating").
+    /// ASG lifecycle state (e.g., "Pending", "InService", "Terminating").
     pub lifecycle_state: String,
     /// Health status ("Healthy" or "Unhealthy").
     pub health_status: String,
@@ -34,6 +34,8 @@ pub struct InstanceInfo {
     pub ami_id: String,
     /// Subnet the instance is in.
     pub subnet_id: String,
+    /// Whether the instance has self-reported readiness via the `devbox:ready=true` tag.
+    pub ready: bool,
 }
 
 /// Result of describing an ASG.
@@ -55,10 +57,10 @@ pub struct AsgDescription {
 
 /// Trait defining pool-level compute operations needed by the Reconciler.
 ///
-/// The reconciler is **adopt-only**: Terraform provisions the Launch Template,
-/// ASG, and lifecycle hook (see CLAUDE.md). The control plane only reads the ASG
-/// and writes runtime state — desired capacity,
-/// per-instance scale-in protection, owner tags, and terminations.
+/// The reconciler is **adopt-only**: Terraform provisions the Launch Template
+/// and ASG (see CLAUDE.md). The control plane only reads the ASG and writes
+/// runtime state — desired capacity, per-instance scale-in protection, owner
+/// tags, and terminations.
 pub trait Compute: Send + Sync {
     /// Set the desired capacity of the named ASG.
     ///

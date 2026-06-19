@@ -1,32 +1,33 @@
-//! Host warm-up: prepare the box, then release the ASG launch lifecycle hook.
+//! Host warm-up: prepare the box and self-tag `devbox:ready=true`.
 //!
-//! The pool ASG holds each new instance in `Pending:Wait` behind an
-//! `EC2_INSTANCE_LAUNCHING` lifecycle hook whose default result is `ABANDON`.
-//! Only when the host signals readiness (`CONTINUE`) does the instance reach
-//! `InService`; the reconciler then marks the `DevboxDoc` Ready. If warm-up
-//! fails we signal `ABANDON` so the ASG recycles the half-baked box.
+//! Once the box is warmed, the agent sets `devbox:ready=true` on its own EC2
+//! instance via `ec2:CreateTags`. The reconciler observes that tag and flips
+//! the `DevboxDoc` from `Warming` to `Ready`; only Ready boxes can be claimed.
 //!
-//! The ASG name is discovered from the `aws:autoscaling:groupName` instance tag
-//! (propagated by the ASG and readable via IMDS), and the hook name from
-//! `DescribeLifecycleHooks`, so the host needs no static pool configuration.
+//! If warm-up fails the agent exits with a non-zero status. The reconciler's
+//! reaper terminates boxes that never become ready within `ready_timeout` and
+//! the ASG relaunches a replacement — no lifecycle-hook `ABANDON` signal needed.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use aws_config::BehaviorVersion;
-use aws_sdk_autoscaling::config::Region;
+use aws_sdk_ec2::config::Region;
+use aws_sdk_ec2::types::Tag;
 
 use crate::imds;
 
-/// The launch transition whose hook this host is responsible for releasing.
-const LAUNCHING_TRANSITION: &str = "autoscaling:EC2_INSTANCE_LAUNCHING";
-
-/// Run warm-up and release (or abandon) the launch lifecycle hook.
+/// Run warm-up and self-tag the instance `devbox:ready=true`.
+///
+/// `devbox:ready` means the box is fully warmed — Docker running, IMDS
+/// reachable, tag applied. A box where any step fails is NOT tagged, so the
+/// reconciler's reaper terminates it after `ready_timeout` and the ASG
+/// relaunches a replacement.
 ///
 /// # Errors
 ///
-/// Returns an error if instance identity cannot be read from IMDS, no launching
-/// hook is found, or the `CONTINUE` lifecycle action fails.
+/// Returns an error if Docker fails to start, instance identity cannot be read
+/// from IMDS, or the `ec2:CreateTags` call fails.
 pub(crate) async fn run() -> Result<()> {
-    ensure_docker_running();
+    ensure_docker_running()?;
 
     let imds_client = imds::client();
     let instance_id = imds::get(&imds_client, "/latest/meta-data/instance-id")
@@ -35,94 +36,56 @@ pub(crate) async fn run() -> Result<()> {
     let region = imds::get(&imds_client, "/latest/meta-data/placement/region")
         .await?
         .context("region unavailable from IMDS")?;
-    let asg_name = imds::instance_tag(&imds_client, "aws:autoscaling:groupName")
-        .await?
-        .context("instance is not part of an ASG (aws:autoscaling:groupName tag missing)")?;
 
-    let client = autoscaling_client(region).await;
-    let hook = launch_hook_name(&client, &asg_name).await?;
+    let ec2_client = ec2_client(region).await;
+    tag_ready(&ec2_client, &instance_id).await?;
 
-    match complete(&client, &asg_name, &hook, &instance_id, "CONTINUE").await {
-        Ok(()) => {
-            tracing::info!(
-                instance_id,
-                asg = asg_name,
-                hook,
-                "warm-up complete; signalled CONTINUE"
-            );
-            Ok(())
-        }
-        Err(e) => {
-            if let Err(abandon_err) =
-                complete(&client, &asg_name, &hook, &instance_id, "ABANDON").await
-            {
-                tracing::warn!(
-                    error = %abandon_err,
-                    "failed to signal ABANDON after warm-up failure"
-                );
-            }
-            Err(e)
-        }
-    }
+    tracing::info!(instance_id, "warm-up complete; tagged devbox:ready=true");
+    Ok(())
 }
 
-/// Build an Auto Scaling client bound to the instance's region, using the host
+/// Build an EC2 client bound to the instance's region, using the host
 /// instance-profile credentials.
-async fn autoscaling_client(region: String) -> aws_sdk_autoscaling::Client {
+async fn ec2_client(region: String) -> aws_sdk_ec2::Client {
     let config = aws_config::defaults(BehaviorVersion::latest())
         .region(Region::new(region))
         .load()
         .await;
-    aws_sdk_autoscaling::Client::new(&config)
+    aws_sdk_ec2::Client::new(&config)
 }
 
-/// Find the launch-transition lifecycle hook on `asg`.
-async fn launch_hook_name(client: &aws_sdk_autoscaling::Client, asg: &str) -> Result<String> {
-    let resp = client
-        .describe_lifecycle_hooks()
-        .auto_scaling_group_name(asg)
-        .send()
-        .await
-        .with_context(|| format!("describe lifecycle hooks for {asg}"))?;
+/// Set `devbox:ready=true` on this instance.
+async fn tag_ready(client: &aws_sdk_ec2::Client, instance_id: &str) -> Result<()> {
+    let tag = Tag::builder().key("devbox:ready").value("true").build();
 
-    for hook in resp.lifecycle_hooks() {
-        if hook.lifecycle_transition() == Some(LAUNCHING_TRANSITION)
-            && let Some(name) = hook.lifecycle_hook_name()
-        {
-            return Ok(name.to_string());
-        }
-    }
-    bail!("no {LAUNCHING_TRANSITION} lifecycle hook found on ASG {asg}")
-}
-
-/// Complete the lifecycle action with the given result (`CONTINUE` or `ABANDON`).
-async fn complete(
-    client: &aws_sdk_autoscaling::Client,
-    asg: &str,
-    hook: &str,
-    instance_id: &str,
-    result: &str,
-) -> Result<()> {
     client
-        .complete_lifecycle_action()
-        .auto_scaling_group_name(asg)
-        .lifecycle_hook_name(hook)
-        .instance_id(instance_id)
-        .lifecycle_action_result(result)
+        .create_tags()
+        .resources(instance_id)
+        .tags(tag)
         .send()
         .await
-        .with_context(|| format!("complete lifecycle action ({result})"))?;
+        .with_context(|| format!("ec2:CreateTags devbox:ready=true on {instance_id}"))?;
+
     Ok(())
 }
 
-/// Best-effort: make sure the Docker daemon is up before signalling readiness.
-fn ensure_docker_running() {
-    match std::process::Command::new("systemctl")
+/// Start the Docker daemon and return an error if it fails.
+///
+/// `devbox:ready` means the box is fully warmed, which includes Docker running.
+/// A box where this fails is left un-tagged and is reaped by the control plane.
+fn ensure_docker_running() -> Result<()> {
+    let status = std::process::Command::new("systemctl")
         .args(["start", "docker"])
         .status()
-    {
-        Ok(status) if status.success() => tracing::info!("docker daemon started"),
-        Ok(status) => tracing::warn!(code = ?status.code(), "`systemctl start docker` non-zero"),
-        Err(e) => tracing::warn!(error = %e, "failed to start docker daemon"),
+        .context("failed to invoke `systemctl start docker`")?;
+
+    if status.success() {
+        tracing::info!("docker daemon started");
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "`systemctl start docker` exited with code {:?}",
+            status.code()
+        )
     }
 }
