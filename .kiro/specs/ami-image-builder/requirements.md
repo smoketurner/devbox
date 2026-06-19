@@ -91,14 +91,15 @@ See [`../ssh-access/`](../ssh-access/) for the full access design.
 
 1. THE Component SHALL configure the SSH daemon to allow public key (certificate) authentication only and disable password authentication
 2. THE Component SHALL bake the **Vouch SSH CA public key** into the image (e.g. `/etc/ssh/vouch_ca.pub`) and set `TrustedUserCAKeys` to it, so the host trusts Vouch-issued user certificates without any `authorized_keys` files
-3. THE Component SHALL install a `devbox-principals` resolver script (e.g. `/usr/local/sbin/devbox-principals`) and configure `AuthorizedPrincipalsCommand` + `AuthorizedPrincipalsCommandUser nobody`, where the resolver reads the `devbox:owner` instance tag from IMDSv2 and prints the authorized principal (fail-closed: empty output when untagged)
-4. THE Component SHALL configure the SSH daemon to listen on port 22 with protocol version 2 only
-5. THE Component SHALL set SSH idle timeout to 3600 seconds (ClientAliveInterval 300, ClientAliveCountMax 12) to prevent premature disconnection during agent work
-6. THE Component SHALL configure the login user account to accept SSH connections with a login shell of /bin/bash and appropriate sudoers entry (passwordless sudo for the login user)
+3. THE Component SHALL install the **`devbox-agent`** host binary (see [`../devbox-agent/`](../devbox-agent/)) and configure `AuthorizedPrincipalsCommand /usr/local/bin/devbox-agent principals %u` + `AuthorizedPrincipalsCommandUser nobody`, where the resolver reads the `devbox:owner` instance tag from IMDSv2 and prints the authorized principal (fail-closed: empty output when untagged or mismatched)
+4. THE Component SHALL install a systemd unit (oneshot + bounded short-interval timer) running `devbox-agent provision`, which reads the `devbox:owner` tag and **pre-creates the claimant's UNIX account** (`useradd -m -s /bin/bash <owner>`) plus a passwordless-sudo sudoers template, so `ssh <owner>@box` resolves from `/etc/passwd`; no NSS module and no shared login account are baked
+5. THE Component SHALL configure the SSH daemon to listen on port 22 with protocol version 2 only
+6. THE Component SHALL set SSH idle timeout to 3600 seconds (ClientAliveInterval 300, ClientAliveCountMax 12) to prevent premature disconnection during agent work
 
-> Note: the per-claim authorization (criterion 3) also requires the Launch
+> Note: the per-claim authorization (criteria 3–4) also requires the Launch
 > Template to enable instance metadata tags (`InstanceMetadataTags=enabled`) so the
-> `devbox:owner` tag is readable via IMDS. See `../ssh-access/design.md`.
+> `devbox:owner` tag is readable via IMDS. See `../ssh-access/design.md` and
+> `../devbox-agent/`.
 
 ### Requirement 7: AMI ID Publication to SSM Parameter Store
 

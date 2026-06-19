@@ -156,6 +156,26 @@ known at launch and could be baked in by user-data or ASG tag-propagation-at-lau
 That model sacrifices the sub-second claim the warm pool exists to provide, so it is
 out of scope here.
 
+## Linux user model: host agent pre-creates the claimant account
+
+Boxes are generic until claimed, so there is no login user to bake at AMI time. The chosen model: a
+small **on-box host agent** (`devbox-agent`, see [`../devbox-agent/`](../devbox-agent/)) reads the
+`devbox:owner` tag and **pre-creates the claimant's UNIX account at claim time** (`useradd -m -s
+/bin/bash <owner>` + passwordless sudo), so `ssh <owner>@box` resolves from plain `/etc/passwd` and
+`whoami` == the identity.
+
+Why pre-create rather than create-at-login: sshd resolves the login user via `getpwnam`
+**pre-authentication** and rejects unresolved users, so a PAM `useradd` hook is too late on first
+login. The alternative that makes a not-yet-existing user resolve is an in-process **NSS module** — but
+it loads into every `getpwnam` caller (sshd, sudo, cron) and would need an IMDS network read inside
+`getpwnam`, a real hazard. Pre-creating before anyone logs in avoids NSS entirely. The cost is a
+bounded delay between claim and account readiness (the agent's poll interval), which is acceptable
+because users connect seconds after claiming.
+
+The account and the principal authorization both key off the same `devbox:owner` tag, so an unclaimed
+box has neither a login user nor an authorized principal. The `AuthorizedPrincipalsCommand` here is the
+agent's `principals` subcommand (it supersedes the standalone `devbox-principals` script).
+
 ## Alternatives considered
 
 - **User-data (or ASG tag-propagation) writing `AuthorizedPrincipalsFile` at
@@ -182,8 +202,9 @@ out of scope here.
 
 ## Open questions
 
-1. Single shared login account (`dev`) vs. per-principal accounts — start with a
-   shared account; the resolver already receives `%u` if we later differentiate.
+1. ~~Single shared login account (`dev`) vs. per-principal accounts.~~ **Resolved:**
+   per-principal accounts, pre-created at claim time by the `devbox-agent` host agent
+   (see the "Linux user model" section and [`../devbox-agent/`](../devbox-agent/)).
 2. Should the resolver also assert the instance is in `Claimed` state, or is the
    presence of the `devbox:owner` tag sufficient? (Tag presence is sufficient given
    the reconciler only tags claimed instances.)
