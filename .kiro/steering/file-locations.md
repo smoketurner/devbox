@@ -11,7 +11,7 @@
 | HTTP route handlers | `crates/devbox-server/src/routes.rs` |
 | UI (HTML dashboard) routes | `crates/devbox-server/src/ui.rs` |
 | Pool reconciliation (loop, tick, config, lock) | `crates/devbox-server/src/reconcile/` |
-| Compute trait (ASG + Launch Template ops) | `crates/devbox-server/src/compute/mod.rs` |
+| Compute trait (ASG + instance ops) | `crates/devbox-server/src/compute/mod.rs` |
 | Compute AWS impl + test mock | `crates/devbox-server/src/compute/ec2.rs`, `crates/devbox-server/src/compute/mock.rs` |
 | Leader-lock document | `crates/devbox-server/src/documents/leader_lock.rs` |
 | AWS type conversions | `crates/devbox-server/src/convert.rs` |
