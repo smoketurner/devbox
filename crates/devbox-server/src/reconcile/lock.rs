@@ -52,8 +52,11 @@ pub(super) async fn try_acquire_lock(
         None => {
             // No lock exists — create it with our server_id.
             let lock_doc = build_lock_doc(config, new_expiry);
-            store.insert_with_id(LOCK_ID, &lock_doc).await?;
-            Ok(true)
+            match store.insert_with_id(LOCK_ID, &lock_doc).await {
+                Ok(_) => Ok(true),
+                Err(e) if crate::db::pool::is_unique_violation(&e) => Ok(false),
+                Err(e) => Err(e),
+            }
         }
         Some(doc) => {
             if doc.data.expires_at < now {

@@ -78,24 +78,23 @@ async fn tick(client: &Client) -> Result<Pass> {
     Ok(Pass::Done)
 }
 
-/// Create the login account for `user` if it does not already exist.
+/// Provision the login account for `user`, re-running each step idempotently.
+///
+/// Only `useradd` is gated on existence; the sudoers file is always rewritten so
+/// a retry after a partial provisioning (account created but sudoers write
+/// failed) self-heals and the claimant keeps passwordless sudo.
 fn ensure_user(user: &str) -> Result<()> {
-    if user_exists(user) {
-        return Ok(());
+    if !user_exists(user) {
+        run_cmd("useradd", &["-m", "-s", "/bin/bash", "-G", "docker", user])
+            .with_context(|| format!("create login account for {user}"))?;
     }
-
-    run_cmd("useradd", &["-m", "-s", "/bin/bash", "-G", "docker", user])
-        .with_context(|| format!("create login account for {user}"))?;
-
     let sudoers = format!("/etc/sudoers.d/devbox-{user}");
     std::fs::write(&sudoers, format!("{user} ALL=(ALL) NOPASSWD: ALL\n"))
         .with_context(|| format!("write {sudoers}"))?;
     set_mode(&sudoers, 0o440)?;
-
     if let Err(e) = run_cmd("chown", &["-R", &format!("{user}:{user}"), WORKSPACE]) {
         tracing::warn!(user, error = %e, "failed to hand workspace to claimant");
     }
-
     tracing::info!(user, "provisioned claimant login account");
     Ok(())
 }

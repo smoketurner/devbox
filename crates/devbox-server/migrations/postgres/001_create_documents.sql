@@ -9,7 +9,3 @@ CREATE TABLE documents (
     version INTEGER NOT NULL DEFAULT 1,
     last_used_at TEXT
 );
-
-CREATE INDEX idx_documents_doc_type ON documents(doc_type);
-CREATE INDEX idx_documents_expires_at ON documents(expires_at) WHERE expires_at IS NOT NULL;
-CREATE INDEX idx_documents_doc_type_created ON documents(doc_type, created_at);

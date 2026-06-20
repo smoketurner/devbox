@@ -125,8 +125,14 @@ fn raw_to_document<T: DocumentType>(row: RawDocumentRow) -> Result<Document<T>> 
         let value: serde_json::Value =
             serde_json::from_str(&row.data).context("failed to parse document JSON")?;
         T::migrate(version, value)?
-    } else {
+    } else if version == T::CURRENT_VERSION {
         serde_json::from_str(&row.data).context("failed to deserialize document")?
+    } else {
+        anyhow::bail!(
+            "document schema version {version} is newer than supported version {} for type {}",
+            T::CURRENT_VERSION,
+            T::DOC_TYPE
+        )
     };
 
     let created_at: Timestamp = row
@@ -627,5 +633,65 @@ impl StoreTransaction<'_> {
     /// Returns an error if the commit fails.
     pub async fn commit(self) -> Result<()> {
         self.tx.commit().await
+    }
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test code: panic on assertion failure is acceptable"
+)]
+mod tests {
+    use super::*;
+    use crate::documents::devbox::DevboxDoc;
+    use devbox_common::{AmiId, DevboxState, InstanceType, SubnetId};
+
+    fn sample_devbox() -> DevboxDoc {
+        DevboxDoc {
+            instance_id: Some("i-1234567890abcdef0".to_string()),
+            state: DevboxState::Ready,
+            instance_type: InstanceType("m5.large".to_string()),
+            ami_id: AmiId("ami-12345678".to_string()),
+            subnet_id: SubnetId("subnet-12345678".to_string()),
+            ebs_volume_id: Some("vol-12345678".to_string()),
+            owner: None,
+            claimed_at: None,
+            created_at: Timestamp::now(),
+            owner_tag_applied: false,
+        }
+    }
+
+    fn row_with_schema_version(schema_version: i32) -> RawDocumentRow {
+        let data = serde_json::to_string(&sample_devbox()).unwrap();
+        RawDocumentRow {
+            id: "doc-1".to_string(),
+            doc_type: DevboxDoc::DOC_TYPE.to_string(),
+            schema_version,
+            data,
+            expires_at: None,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+            version: 1,
+            last_used_at: None,
+        }
+    }
+
+    #[test]
+    fn raw_to_document_accepts_current_version() {
+        let row = row_with_schema_version(1);
+        assert!(raw_to_document::<DevboxDoc>(row).is_ok());
+    }
+
+    #[test]
+    fn raw_to_document_migrates_older_version() {
+        let row = row_with_schema_version(0);
+        assert!(raw_to_document::<DevboxDoc>(row).is_ok());
+    }
+
+    #[test]
+    fn raw_to_document_rejects_newer_version() {
+        let row = row_with_schema_version(2);
+        let err = raw_to_document::<DevboxDoc>(row).unwrap_err();
+        assert!(err.to_string().contains("newer"));
     }
 }
