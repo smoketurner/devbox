@@ -15,6 +15,7 @@ Devbox is a Rust workspace with these crates:
 | `devbox-common` | Shared types (DevboxId, DevboxState, API request/response types, config) |
 | `devbox-server` | Axum HTTP API, database layer (SQLite/DSQL), pool reconciliation, EC2 orchestration |
 | `devbox-cli` | User-facing CLI for claiming, releasing, listing, and inspecting devboxes |
+| `devbox-agent` | On-host binary baked into the AMI: principals resolver, owner-sync, warm-up hook |
 
 ## Key Concepts
 
@@ -36,16 +37,14 @@ Launching -> Warming -> Ready -> Claimed -> Terminating
 
 Pool management is backed by an **Auto Scaling Group + Launch Template**, not
 direct `RunInstances` calls. A leader-locked background loop reconciles each tick:
-- Ensure the Launch Template and ASG exist and match the configured AMI / type /
-  security groups
+- Adopt the Terraform-provisioned ASG by name (skip the tick if absent)
 - Set `DesiredCapacity = claimed_count + target_warm_pool_size`
 - Sync `DevboxDoc` records against current ASG membership
 - Apply the `devbox:owner` tag to newly claimed instances; manage warming,
   scale-in protection, and termination of released instances
 
-The authoritative design is in `.kiro/specs/asg-pool-management/`. (The older
-`devbox-pool-manager.md`, `pool-reconciliation/`, and `ec2-integration.md` specs
-describe a superseded direct-instance approach and are kept only as history.)
+The Launch Template, ASG, and lifecycle hook are provisioned by Terraform in
+`devbox-infra`; the control plane only adopts the ASG and writes runtime state.
 
 ### Document Store
 
@@ -65,7 +64,7 @@ Two route groups:
 Devbox instances are reached over **SSH**, authenticated by **Vouch's SSH CA**
 (short-lived certificates, no `authorized_keys`). Per-claim authorization is
 dynamic via the `devbox:owner` instance tag + IMDSv2 + `AuthorizedPrincipalsCommand`.
-See `.kiro/specs/ssh-access/` and `.kiro/steering/security.md`.
+See `.kiro/steering/security.md`.
 
 Database: SQLite for local development, in-memory SQLite for tests, Aurora DSQL in production. The `Pool` enum dispatches at runtime based on `DATABASE_URL` scheme. Query building uses `sea-query`. Migrations in `crates/devbox-server/migrations/{sqlite,postgres}/`.
 
