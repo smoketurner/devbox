@@ -1,4 +1,4 @@
-//! Owner-sync service: provision the claimant's Unix login account.
+//! Owner-sync: provision the claimant's Unix login account.
 //!
 //! In a warm pool a box is generic until claimed; the `devbox:owner` tag (the
 //! claimant's Vouch principal) is applied *after* the claim. sshd authorizes

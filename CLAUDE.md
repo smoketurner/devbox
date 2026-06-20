@@ -186,10 +186,10 @@ identity. Read endpoints stay open.
 
 **Planned / not yet built** (ideas borrowed from [`.kiro/references.md`](.kiro/references.md)
 are tagged inline):
-- **Principal ↔ Unix-username alignment** — `AUTH_PRINCIPAL_CLAIM` must select the
-  Vouch claim that equals the SSH cert principal (a Unix-safe username), since
-  `owner` drives both the box tag and the login account. Verify the Vouch config
-  end-to-end (OIDC claim == cert principal == `owner-sync` account).
+- **Principal ↔ Unix-username alignment verification** — Ensure the Vouch config
+  selects a claim that equals the SSH cert principal (a Unix-safe username), since
+  `owner` drives both the box tag and the login account (`AUTH_PRINCIPAL_CLAIM`
+  defaults to `sub`). Verify end-to-end (OIDC claim == cert principal == `owner-sync` account).
 - **Snapshot-seeded EBS workspace** — attach a periodically-refreshed snapshot
   (pre-cloned repos + warm caches) at launch, with **lazy write-gating** (reads
   immediate, writes gated until a background `git` sync finishes). _(cf. Ramp Inspect)_
