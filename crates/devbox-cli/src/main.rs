@@ -40,6 +40,16 @@ fn with_auth(builder: reqwest::RequestBuilder, token: Option<&String>) -> reqwes
     }
 }
 
+/// Whether we can safely open an interactive prompt. `dialoguer` renders to and
+/// reads keys from the terminal, so every standard stream must be a TTY —
+/// otherwise (piped/redirected stdout, scripts, CI) the picker would render
+/// nowhere or fail mid-read. In that case we fall back to a listing error.
+fn is_interactive() -> bool {
+    std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && std::io::stderr().is_terminal()
+}
+
 /// Resolve the target devbox id for `ssh`/`status`/`release`.
 ///
 /// An explicit `--id` always wins. Otherwise we consult the local registry of
@@ -62,7 +72,7 @@ fn resolve_id(explicit: Option<String>, server_url: &str) -> Result<String> {
                 .context("active claim disappeared while resolving id")?;
             Ok(claim.id)
         }
-        _ if std::io::stdin().is_terminal() => {
+        _ if is_interactive() => {
             let labels: Vec<String> = claims
                 .iter()
                 .map(|c| match &c.claimed_at {
