@@ -8,26 +8,15 @@
 //! server's `extract_principal` (`crates/devbox-server/src/auth/jwt.rs`).
 
 use anyhow::{Context, Result};
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+use jsonwebtoken::dangerous::insecure_decode;
 
 /// Decode `token` and return its `sub` claim. The signature is **not** verified.
 fn principal_from_token(token: &str) -> Result<String> {
     // Signature/expiry/audience checks are the server's job; here we only want
-    // the claim value, so disable every check and decode with a dummy key.
-    // With `validate_signature` off, `jsonwebtoken` 9.x skips the header-algorithm
-    // check entirely, so any algorithm decodes. We still list the algorithms Vouch
-    // actually signs with (RS256/ES256) plus HS256 for local dev tokens, so the
-    // intent is explicit and we stay correct if that guard ever changes.
-    let mut validation = Validation::new(Algorithm::RS256);
-    validation.algorithms = vec![Algorithm::RS256, Algorithm::ES256, Algorithm::HS256];
-    validation.insecure_disable_signature_validation();
-    validation.validate_exp = false;
-    validation.validate_nbf = false;
-    validation.validate_aud = false;
-    validation.required_spec_claims.clear();
-
-    let key = DecodingKey::from_secret(&[]);
-    let data = decode::<serde_json::Value>(token, &key, &validation)
+    // the claim value, so `insecure_decode` skips every check, including the
+    // header-algorithm guard — any algorithm decodes. Production Vouch tokens are
+    // RS256/ES256; local dev tokens are HS256. All decode the same way here.
+    let data = insecure_decode::<serde_json::Value>(token)
         .context("failed to decode token; is DEVBOX_TOKEN a valid JWT?")?;
 
     let sub = data
@@ -81,9 +70,9 @@ mod tests {
 
     #[test]
     fn decodes_token_whose_header_alg_is_not_listed() {
-        // Sign with HS384 — deliberately NOT in `validation.algorithms` — to prove
-        // the header-algorithm check is bypassed. Production Vouch tokens are
-        // RS256/ES256, so a header-alg gate here would break every real claim.
+        // Sign with HS384 to prove the header-algorithm check is bypassed.
+        // Production Vouch tokens are RS256/ES256, so a header-alg gate here
+        // would break every real claim.
         let token = encode(
             &Header::new(jsonwebtoken::Algorithm::HS384),
             &json!({ "sub": "carol" }),

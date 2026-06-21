@@ -44,7 +44,7 @@ check: ## Run cargo check
 ##@ Testing
 
 test: ## Run unit tests
-	$(CARGO) test
+	$(CARGO) test --all-features
 
 ##@ Docker
 

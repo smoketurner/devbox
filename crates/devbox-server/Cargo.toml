@@ -31,7 +31,7 @@ aws-sdk-ec2 = { workspace = true, features = ["rt-tokio", "default-https-client"
 axum = { workspace = true, features = ["json", "tokio", "http1", "form"] }
 devbox-common = { path = "../devbox-common" }
 jiff = { workspace = true, features = ["std", "serde"] }
-jsonwebtoken = { workspace = true, features = ["use_pem"] }
+jsonwebtoken = { workspace = true, features = ["aws_lc_rs", "use_pem"] }
 reqwest = { workspace = true, features = ["json", "rustls"] }
 rust-embed = { workspace = true, features = ["axum-ex", "mime-guess"] }
 sea-query = { workspace = true, features = ["backend-sqlite", "backend-postgres", "derive"] }
