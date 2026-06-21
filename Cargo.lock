@@ -895,6 +895,7 @@ dependencies = [
  "aws-lc-rs",
  "aws-sdk-ec2",
  "clap",
+ "devbox-common",
  "tokio",
  "tracing",
  "tracing-subscriber",

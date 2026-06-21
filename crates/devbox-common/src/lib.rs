@@ -145,6 +145,33 @@ impl AsRef<str> for SecurityGroupId {
 }
 
 // ============================================================================
+// Principal / username validation
+// ============================================================================
+
+/// Whether `name` is a valid Linux login account name.
+///
+/// Mirrors the default `useradd` `NAME_REGEX` (`^[a-z_][a-z0-9_-]*$`, at most 32
+/// characters). A devbox `owner` doubles as the Unix login account the host
+/// provisions for the claimant, so a principal that is not a valid username
+/// (e.g. an email address or a capitalized name) can never be logged into over
+/// SSH. Claims reject such an owner up front, and the on-host `owner-sync` agent
+/// applies the same rule before creating the account.
+#[must_use]
+pub fn is_valid_unix_username(name: &str) -> bool {
+    if name.is_empty() || name.len() > 32 {
+        return false;
+    }
+    let first_ok = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c == '_');
+    first_ok
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+// ============================================================================
 // DevboxState
 // ============================================================================
 
@@ -393,6 +420,24 @@ mod tests {
         assert_eq!(json, "\"sg-abcdef0123456789\"");
         let parsed: SecurityGroupId = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, sg);
+    }
+
+    #[test]
+    fn test_is_valid_unix_username_accepts() {
+        assert!(is_valid_unix_username("jplock"));
+        assert!(is_valid_unix_username("agent-42"));
+        assert!(is_valid_unix_username("_svc"));
+        assert!(is_valid_unix_username("a"));
+    }
+
+    #[test]
+    fn test_is_valid_unix_username_rejects() {
+        assert!(!is_valid_unix_username(""));
+        assert!(!is_valid_unix_username("justin@plock.net"));
+        assert!(!is_valid_unix_username("9lives"));
+        assert!(!is_valid_unix_username("Justin"));
+        assert!(!is_valid_unix_username("a/../b"));
+        assert!(!is_valid_unix_username(&"x".repeat(33)));
     }
 
     #[test]

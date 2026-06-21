@@ -10,7 +10,7 @@ use axum::routing::{get, post};
 
 use devbox_common::{
     ClaimRequest, DevboxListResponse, DevboxResponse, DevboxState, HealthResponse,
-    PoolMetricsResponse, ReleaseRequest,
+    PoolMetricsResponse, ReleaseRequest, is_valid_unix_username,
 };
 
 use crate::auth::Authenticator;
@@ -32,23 +32,30 @@ pub struct AppState {
 }
 
 /// Resolve the caller's `owner`: the authenticated principal when auth is
-/// enabled, otherwise the (validated) body-supplied owner.
+/// enabled, otherwise the body-supplied owner.
+///
+/// The resolved owner doubles as the Unix login account the host provisions for
+/// the claimant (see [`is_valid_unix_username`]), so a non-Unix-safe owner is
+/// rejected here — at claim/release time — rather than silently breaking SSH
+/// later. When auth is enabled this surfaces a misconfigured
+/// `AUTH_PRINCIPAL_CLAIM` immediately.
 async fn resolve_owner(
     state: &AppState,
     headers: &HeaderMap,
     body_owner: &str,
 ) -> Result<String, AppError> {
-    match &state.auth {
-        Some(auth) => Ok(auth.authenticate(headers).await?.0),
-        None => {
-            if body_owner.trim().is_empty() || body_owner.len() > 256 {
-                return Err(AppError::BadRequest(
-                    "owner must be non-empty and at most 256 characters".into(),
-                ));
-            }
-            Ok(body_owner.to_string())
-        }
+    let owner = match &state.auth {
+        Some(auth) => auth.authenticate(headers).await?.0,
+        None => body_owner.trim().to_string(),
+    };
+    if !is_valid_unix_username(&owner) {
+        return Err(AppError::BadRequest(format!(
+            "owner '{owner}' is not a valid Unix login name (must match \
+             ^[a-z_][a-z0-9_-]*$, at most 32 characters); when auth is enabled, \
+             AUTH_PRINCIPAL_CLAIM must emit such a username"
+        )));
     }
+    Ok(owner)
 }
 
 /// Build the Axum router with all routes.
@@ -237,4 +244,199 @@ async fn pool_metrics(
         target_warm_pool_size: target,
         ready_delta,
     }))
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test code: panic on assertion failure is acceptable"
+)]
+mod tests {
+    use std::time::Duration;
+
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use devbox_common::{AmiId, InstanceType, SubnetId};
+    use jiff::Timestamp;
+
+    use super::*;
+    use crate::db::migrations::run_sqlite_migrations;
+    use crate::db::pool::Pool;
+
+    /// Build an `AppState` over a single-connection in-memory SQLite store
+    /// (`max_connections(1)`, so concurrent handler calls share one database)
+    /// with auth disabled.
+    async fn setup_state() -> AppState {
+        let pool = Pool::new_test();
+        if let Pool::Sqlite(ref p) = pool {
+            run_sqlite_migrations(p).await.unwrap();
+        }
+        AppState {
+            store: Arc::new(DocumentStore::new(pool)),
+            reconciler_config: Arc::new(test_config()),
+            auth: None,
+        }
+    }
+
+    fn test_config() -> ReconcilerConfig {
+        ReconcilerConfig {
+            pool_id: "test".to_string(),
+            server_id: "test-server".to_string(),
+            target_warm_pool_size: 1,
+            polling_interval: Duration::from_secs(30),
+            lock_ttl: Duration::from_secs(60),
+            ready_timeout: Duration::from_secs(60),
+        }
+    }
+
+    fn ready_devbox() -> DevboxDoc {
+        DevboxDoc {
+            instance_id: Some("i-1234567890abcdef0".to_string()),
+            state: DevboxState::Ready,
+            instance_type: InstanceType("m5.large".to_string()),
+            ami_id: AmiId("ami-12345678".to_string()),
+            subnet_id: SubnetId("subnet-12345678".to_string()),
+            ebs_volume_id: None,
+            owner: None,
+            claimed_at: None,
+            created_at: Timestamp::now(),
+            owner_tag_applied: false,
+        }
+    }
+
+    async fn insert(state: &AppState, doc: DevboxDoc) -> String {
+        state.store.insert(&doc).await.unwrap().id
+    }
+
+    /// Map a handler result to the HTTP status it would produce.
+    fn status_of<T: IntoResponse>(result: Result<T, AppError>) -> StatusCode {
+        match result {
+            Ok(ok) => ok.into_response().status(),
+            Err(err) => err.into_response().status(),
+        }
+    }
+
+    fn claim(owner: &str) -> ClaimRequest {
+        ClaimRequest {
+            owner: owner.to_string(),
+            instance_type: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_marks_box_claimed_with_owner() {
+        let state = setup_state().await;
+        insert(&state, ready_devbox()).await;
+
+        let body = claim_devbox(State(state), HeaderMap::new(), JsonBody(claim("jplock")))
+            .await
+            .ok()
+            .unwrap()
+            .0;
+
+        assert_eq!(body.state, DevboxState::Claimed);
+        assert_eq!(body.owner.as_deref(), Some("jplock"));
+    }
+
+    #[tokio::test]
+    async fn claim_empty_pool_is_conflict() {
+        let state = setup_state().await;
+        let status = status_of(
+            claim_devbox(State(state), HeaderMap::new(), JsonBody(claim("jplock"))).await,
+        );
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn claim_rejects_non_unix_owner() {
+        let state = setup_state().await;
+        insert(&state, ready_devbox()).await;
+        let status = status_of(
+            claim_devbox(
+                State(state),
+                HeaderMap::new(),
+                JsonBody(claim("justin@plock.net")),
+            )
+            .await,
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn claim_rejects_blank_owner() {
+        let state = setup_state().await;
+        insert(&state, ready_devbox()).await;
+        let status =
+            status_of(claim_devbox(State(state), HeaderMap::new(), JsonBody(claim("   "))).await);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn concurrent_claims_yield_one_winner_one_conflict() {
+        let state = setup_state().await;
+        insert(&state, ready_devbox()).await;
+
+        let (r1, r2) = tokio::join!(
+            claim_devbox(
+                State(state.clone()),
+                HeaderMap::new(),
+                JsonBody(claim("alice"))
+            ),
+            claim_devbox(
+                State(state.clone()),
+                HeaderMap::new(),
+                JsonBody(claim("bob"))
+            ),
+        );
+
+        let statuses = [status_of(r1), status_of(r2)];
+        let ok = statuses.iter().filter(|s| **s == StatusCode::OK).count();
+        let conflict = statuses
+            .iter()
+            .filter(|s| **s == StatusCode::CONFLICT)
+            .count();
+        assert_eq!(ok, 1, "exactly one claim must win");
+        assert_eq!(conflict, 1, "the loser must get 409 Conflict");
+    }
+
+    #[tokio::test]
+    async fn release_by_non_owner_is_forbidden() {
+        let state = setup_state().await;
+        let mut doc = ready_devbox();
+        doc.state = DevboxState::Claimed;
+        doc.owner = Some("alice".to_string());
+        let id = insert(&state, doc).await;
+
+        let status = status_of(
+            release_devbox(
+                State(state),
+                Path(id),
+                HeaderMap::new(),
+                JsonBody(ReleaseRequest {
+                    owner: "bob".to_string(),
+                }),
+            )
+            .await,
+        );
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn release_of_unclaimed_box_is_conflict() {
+        let state = setup_state().await;
+        let id = insert(&state, ready_devbox()).await;
+
+        let status = status_of(
+            release_devbox(
+                State(state),
+                Path(id),
+                HeaderMap::new(),
+                JsonBody(ReleaseRequest {
+                    owner: "alice".to_string(),
+                }),
+            )
+            .await,
+        );
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
 }

@@ -158,7 +158,7 @@ cargo run --bin devbox-server          # serves http://localhost:3000
 SQLite/DSQL with optimistic concurrency, **adopt-only** ASG reconciler (adopts the
 Terraform ASG by name, syncs membership, maintains desired capacity, scale-in
 protection, `devbox:owner` tagging via `apply_pending_owner_tags`), graceful
-shutdown, dashboard scaffolding, unit tests. **Tag-based readiness gate:** instances
+shutdown, Tailwind-styled HTML dashboard, unit tests. **Tag-based readiness gate:** instances
 auto-join the ASG (no launch lifecycle hook); `devbox-agent warmup` self-sets
 `devbox:ready=true` via `ec2:CreateTags`; the reconciler flips `DevboxDoc`
 `Warming → Ready` on that tag; boxes that never tag ready within `ready_timeout`
@@ -182,14 +182,19 @@ deployment circuit breaker auto-rolling-back a failed deploy. No static AWS keys
 the ALB's `x-amzn-oidc-data` (dashboard) or a `Bearer` Vouch JWT (CLI `--token` /
 `DEVBOX_TOKEN`), verifies it (ALB regional key / Vouch JWKS), and **binds `owner`
 to the verified principal** — so claim/release act only as the authenticated
-identity. Read endpoints stay open.
+identity. Read endpoints stay open. **Owner validation:** claim/release reject an
+`owner` that is not a valid Unix login name (`is_valid_unix_username` in
+`devbox-common`: `^[a-z_][a-z0-9_-]*$`, ≤32 chars) with a 400 — the same rule the
+host's `owner-sync` applies — so a misconfigured `AUTH_PRINCIPAL_CLAIM` fails at
+claim time instead of as a broken SSH login.
 
 **Planned / not yet built** (ideas borrowed from [`.kiro/references.md`](.kiro/references.md)
 are tagged inline):
-- **Principal ↔ Unix-username alignment verification** — Ensure the Vouch config
-  selects a claim that equals the SSH cert principal (a Unix-safe username), since
-  `owner` drives both the box tag and the login account (`AUTH_PRINCIPAL_CLAIM`
-  defaults to `sub`). Verify end-to-end (OIDC claim == cert principal == `owner-sync` account).
+- **Principal ↔ Unix-username alignment (operational)** — Server-side validation
+  now rejects a non-Unix-safe `owner` at claim time (see "Owner validation"
+  above), but the Vouch config must still be set so `AUTH_PRINCIPAL_CLAIM` emits a
+  Unix-safe username (not the default UUID `sub`) that equals the SSH cert
+  principal. Verify end-to-end (OIDC claim == cert principal == `owner-sync` account).
 - **Snapshot-seeded EBS workspace** — attach a periodically-refreshed snapshot
   (pre-cloned repos + warm caches) at launch, with **lazy write-gating** (reads
   immediate, writes gated until a background `git` sync finishes). _(cf. Ramp Inspect)_
@@ -205,7 +210,6 @@ are tagged inline):
 - **Predictive / multi-pool warming** — pre-claim warming and pools keyed by
   profile/repo rather than one generic pool. _(cf. Ramp Inspect)_
 - **Stop/resume long-lived claims** (persist EBS) as a cost lever. _(cf. WorkOS Horizon)_
-- **Dashboard styling** — `static/css` is a placeholder.
 
 ## Related repositories
 

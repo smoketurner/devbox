@@ -84,8 +84,14 @@ async fn main() -> Result<()> {
 
     let reconciler_config = Arc::new(reconciler_config);
 
-    // Load AWS config and create EC2 client
-    let aws_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    // Load AWS config and create EC2 client. Retries are configured here, at the
+    // SDK layer, so every compute call absorbs transient throttling/brownouts
+    // without per-call retry loops — a momentary EC2 API failure must not stall
+    // the warm pool (the reconciler simply continues on the next tick).
+    let aws_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .retry_config(aws_config::retry::RetryConfig::standard().with_max_attempts(5))
+        .load()
+        .await;
     let ec2_client = Arc::new(Ec2::new(&aws_config));
 
     // Spawn reconciliation loop with cancellation support
