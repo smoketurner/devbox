@@ -53,11 +53,11 @@ pub(crate) fn format_status(d: &DevboxResponse) -> String {
 pub(crate) fn format_claim_success(d: &DevboxResponse) -> String {
     let instance = d.instance_id.as_deref().unwrap_or("(pending)");
     format!(
-        "Claimed devbox {}\n  Instance: {}\n  Type: {}\n  Connect: devbox ssh --id {}",
+        "Claimed devbox {}\n  Instance: {}\n  Type: {}\n  Connect: devbox ssh \
+         (saved as an active claim; --id is needed only when you hold several)",
         &d.id,
         instance,
         d.instance_type.as_ref(),
-        &d.id
     )
 }
 
@@ -167,7 +167,7 @@ mod tests {
         assert!(output.contains("Claimed devbox test-id"));
         assert!(output.contains("i-abc123"));
         assert!(output.contains("m5.large"));
-        assert!(output.contains("devbox ssh --id test-id"));
+        assert!(output.contains("devbox ssh"));
     }
 
     #[test]

@@ -17,6 +17,8 @@ path = "src/main.rs"
 anyhow = { workspace = true, features = ["std"] }
 clap = { workspace = true, features = ["std", "derive", "env"] }
 devbox-common = { path = "../devbox-common" }
+dialoguer = { workspace = true }
+jsonwebtoken = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls"] }
 serde = { workspace = true, features = ["std", "derive"] }
 serde_json = { workspace = true, features = ["std"] }
