@@ -14,10 +14,21 @@ use crate::imds;
 
 /// Print the authorized principal for `login_user`, or nothing.
 pub(crate) async fn run(login_user: &str) {
-    if let Some(owner) = current_owner().await
-        && owner == login_user
-    {
-        println!("{owner}");
+    let owner = current_owner().await;
+    if let Some(principal) = authorized_principal(owner.as_deref(), login_user) {
+        println!("{principal}");
+    }
+}
+
+/// The principal authorized to log in as `login_user`, given the current
+/// `devbox:owner` tag. Fail closed: an absent owner or any mismatch authorizes
+/// no one. Pure (no I/O) so the rule can be unit-tested without IMDS.
+fn authorized_principal<'a>(owner: Option<&'a str>, login_user: &str) -> Option<&'a str> {
+    let owner = owner?;
+    if owner == login_user {
+        Some(owner)
+    } else {
+        None
     }
 }
 
@@ -30,4 +41,27 @@ async fn current_owner() -> Option<String> {
         return None;
     }
     Some(owner.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::authorized_principal;
+
+    #[test]
+    fn absent_owner_authorizes_no_one() {
+        assert_eq!(authorized_principal(None, "jplock"), None);
+    }
+
+    #[test]
+    fn mismatched_owner_authorizes_no_one() {
+        assert_eq!(authorized_principal(Some("alice"), "jplock"), None);
+    }
+
+    #[test]
+    fn matching_owner_is_authorized() {
+        assert_eq!(
+            authorized_principal(Some("jplock"), "jplock"),
+            Some("jplock")
+        );
+    }
 }

@@ -19,6 +19,7 @@ aws-config = { workspace = true, features = ["rt-tokio", "default-https-client",
 aws-lc-rs = { workspace = true }
 aws-sdk-ec2 = { workspace = true, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
 clap = { workspace = true, features = ["std", "derive"] }
+devbox-common = { path = "../devbox-common" }
 tokio = { workspace = true, features = ["rt", "macros", "net", "time", "io-util"] }
 tracing = { workspace = true, features = ["std"] }
 tracing-subscriber = { workspace = true, features = ["std", "fmt"] }

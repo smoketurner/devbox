@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use aws_config::imds::client::Client;
+use devbox_common::is_valid_unix_username;
 
 use crate::imds;
 
@@ -56,26 +57,53 @@ pub(crate) async fn run() {
     }
 }
 
-/// One provisioning pass: read the owner tag and ensure its account exists.
-async fn tick(client: &Client) -> Result<Pass> {
-    let Some(owner) = imds::instance_tag(client, "devbox:owner").await? else {
-        return Ok(Pass::Waiting); // unclaimed — nothing to provision yet
+/// What a provisioning pass should do, decided purely from the owner tag value.
+#[derive(Debug, PartialEq, Eq)]
+enum Decision {
+    /// The box is unclaimed (tag absent or empty); keep polling.
+    Wait,
+    /// The owner is a valid login name; provision the account.
+    Provision(String),
+    /// The owner appeared but is not a valid Unix account name; give up.
+    Unsafe(String),
+}
+
+/// Decide the action for the current `devbox:owner` tag value. Pure (no I/O) so
+/// the branch logic can be unit-tested without IMDS.
+fn decide(owner: Option<&str>) -> Decision {
+    let Some(owner) = owner else {
+        return Decision::Wait;
     };
     let owner = owner.trim();
     if owner.is_empty() {
-        return Ok(Pass::Waiting);
+        return Decision::Wait;
     }
-    if !is_valid_username(owner) {
-        // The owner appeared but cannot be a Unix account; polling more won't
-        // help (the owner does not change), so stop. SSH will fail, surfacing it.
-        tracing::error!(
-            owner,
-            "refusing to provision unsafe principal as a Unix account"
-        );
-        return Ok(Pass::Done);
+    if !is_valid_unix_username(owner) {
+        return Decision::Unsafe(owner.to_string());
     }
-    ensure_user(owner)?;
-    Ok(Pass::Done)
+    Decision::Provision(owner.to_string())
+}
+
+/// One provisioning pass: read the owner tag and act on it.
+async fn tick(client: &Client) -> Result<Pass> {
+    let owner = imds::instance_tag(client, "devbox:owner").await?;
+    match decide(owner.as_deref()) {
+        Decision::Wait => Ok(Pass::Waiting), // unclaimed — nothing to provision yet
+        Decision::Unsafe(owner) => {
+            // The owner appeared but cannot be a Unix account; polling more
+            // won't help (the owner does not change), so stop. SSH will fail,
+            // surfacing it.
+            tracing::error!(
+                owner,
+                "refusing to provision unsafe principal as a Unix account"
+            );
+            Ok(Pass::Done)
+        }
+        Decision::Provision(owner) => {
+            ensure_user(&owner)?;
+            Ok(Pass::Done)
+        }
+    }
 }
 
 /// Provision the login account for `user`, re-running each step idempotently.
@@ -110,23 +138,6 @@ fn user_exists(user: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// Validate that `name` is a safe Linux account name (default `useradd`
-/// `NAME_REGEX`: `^[a-z_][a-z0-9_-]*$`, at most 32 characters). Vouch principals
-/// that are not Unix-safe usernames are rejected rather than silently mangled.
-fn is_valid_username(name: &str) -> bool {
-    if name.is_empty() || name.len() > 32 {
-        return false;
-    }
-    let first_ok = name
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_lowercase() || c == '_');
-    first_ok
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
-}
-
 /// Run a command, returning an error if it cannot be spawned or exits non-zero.
 fn run_cmd(program: &str, args: &[&str]) -> Result<()> {
     let status = Command::new(program)
@@ -147,23 +158,36 @@ fn set_mode(path: &str, mode: u32) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_valid_username;
+    use super::{Decision, decide};
 
     #[test]
-    fn accepts_simple_usernames() {
-        assert!(is_valid_username("jplock"));
-        assert!(is_valid_username("agent-42"));
-        assert!(is_valid_username("_svc"));
-        assert!(is_valid_username("a"));
+    fn absent_or_empty_owner_waits() {
+        assert_eq!(decide(None), Decision::Wait);
+        assert_eq!(decide(Some("")), Decision::Wait);
+        assert_eq!(decide(Some("   ")), Decision::Wait);
     }
 
     #[test]
-    fn rejects_unsafe_usernames() {
-        assert!(!is_valid_username(""));
-        assert!(!is_valid_username("justin@plock.net"));
-        assert!(!is_valid_username("9lives"));
-        assert!(!is_valid_username("Justin"));
-        assert!(!is_valid_username("a/../b"));
-        assert!(!is_valid_username(&"x".repeat(33)));
+    fn valid_owner_provisions_trimmed() {
+        assert_eq!(
+            decide(Some("  jplock  ")),
+            Decision::Provision("jplock".to_string())
+        );
+        assert_eq!(
+            decide(Some("agent-42")),
+            Decision::Provision("agent-42".to_string())
+        );
+    }
+
+    #[test]
+    fn unsafe_owner_is_refused() {
+        assert_eq!(
+            decide(Some("justin@plock.net")),
+            Decision::Unsafe("justin@plock.net".to_string())
+        );
+        assert_eq!(
+            decide(Some("Justin")),
+            Decision::Unsafe("Justin".to_string())
+        );
     }
 }
