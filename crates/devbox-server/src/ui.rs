@@ -137,11 +137,17 @@ pub struct ClaimFormTemplate {
     pub error: Option<String>,
 }
 
+/// Confirmation page shown after logout clears the session.
+#[derive(Template)]
+#[template(path = "signed_out.html")]
+pub struct SignedOutTemplate {}
+
 impl_template_into_response!(
     DashboardTemplate,
     DevboxDetailTemplate,
     ErrorPageTemplate,
-    ClaimFormTemplate
+    ClaimFormTemplate,
+    SignedOutTemplate
 );
 
 /// A devbox entry for the dashboard template.
@@ -319,9 +325,12 @@ async fn login_error_page() -> Response {
 ///
 /// GET /logout
 async fn logout() -> Response {
+    // Clear the session and land on a "signed out" page rather than redirecting
+    // to "/", which would bounce through /login and silently re-establish the
+    // session from the still-live Vouch SSO session.
     (
         AppendHeaders([(header::SET_COOKIE, set_cookie(SESSION_COOKIE, "", 0))]),
-        Redirect::to("/"),
+        SignedOutTemplate {},
     )
         .into_response()
 }
