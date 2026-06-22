@@ -10,9 +10,9 @@ warm pool of EC2 dev boxes that callers claim over SSH. See the
 - **API + dashboard** (`routes.rs`, `ui.rs`) — `claim` / `release` / `list` /
   `status` / pool metrics, plus an HTML dashboard. Claim is exactly-once under
   optimistic concurrency.
-- **Auth** (`auth/`) — when enabled, resolves the caller from the ALB's
-  `x-amzn-oidc-data` (dashboard) or a `Bearer` Vouch JWT (CLI/agents), and binds
-  `owner` to the verified principal.
+- **Auth** (`auth/`) — when enabled, resolves the caller from a `Bearer` Vouch JWT
+  (CLI/agents) or the ALB's `x-amzn-oidc-data` (legacy), and binds `owner` to the
+  verified principal. The dashboard uses app-side OIDC login with a session cookie.
 - **Document store** (`db/`) — typed documents over SQLite (dev) or Aurora DSQL
   (prod, IAM-auth), with optimistic concurrency (`compare_and_update`) and
   queries built with `sea-query` (no raw SQL).

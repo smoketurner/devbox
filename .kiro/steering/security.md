@@ -23,7 +23,8 @@ These rules apply to all code in this repository without exception:
 - The devbox-server uses an IAM role with least-privilege permissions
 - DSQL access uses IAM-generated auth tokens (short-lived, auto-refreshed)
 - EC2 operations use the server's instance role (no static keys)
-- API authentication uses Vouch JWT bearer tokens (CLI `--token` / `DEVBOX_TOKEN`) or ALB OIDC data (`x-amzn-oidc-data`), binding `owner` to the verified principal
+- API authentication uses Vouch JWT bearer tokens (CLI `--token` / `DEVBOX_TOKEN`) or ALB OIDC data (`x-amzn-oidc-data`, legacy), binding `owner` to the verified principal
+- Dashboard authentication uses app-side OIDC login (session cookie) when behind an NLB
 
 ## SSH Access (Vouch CA)
 
