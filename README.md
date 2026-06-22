@@ -8,14 +8,14 @@
 The control plane (HTTP API + pool reconciler) and CLI that manage a warm pool of ephemeral, isolated EC2 instances, claimable on demand over SSH. The AWS foundation (VPC, IAM, networking, AMI pipeline) is provisioned separately by Terraform in [`smoketurner/devbox-infra`](https://github.com/smoketurner/devbox-infra). Inspired by [Stripe's Minions architecture](https://www.tryprompt.ai/blog/how-stripe-built-an-ai-coding-assistant).
 
 ```bash
-# Claim a ready devbox instantly
-$ devbox claim --owner agent-42
+# Claim a ready devbox instantly (owner derived from your token)
+$ devbox claim
 Claimed devbox 01914a6b-... (i-0abc123def456)
 Instance type: m5.large
 Access: ssh dev@i-0abc123def456   # via your Vouch-issued SSH certificate
 
-# When done, release it
-$ devbox release 01914a6b-...
+# When done, release it (ID defaults to your active claim)
+$ devbox release
 Released. Instance terminating.
 ```
 
@@ -112,14 +112,14 @@ make docker-run
 # List all devboxes
 devbox list --server-url http://localhost:3000
 
-# Claim a devbox
-devbox claim --server-url http://localhost:3000 --owner my-agent
+# Claim a devbox (owner derived from token)
+devbox claim --server-url http://localhost:3000
 
-# Check status
-devbox status --server-url http://localhost:3000 01914a6b-...
+# Check status (ID defaults to your active claim)
+devbox status --server-url http://localhost:3000
 
-# Release when done
-devbox release --server-url http://localhost:3000 01914a6b-...
+# Release when done (ID defaults to your active claim)
+devbox release --server-url http://localhost:3000
 ```
 
 ## Crates
