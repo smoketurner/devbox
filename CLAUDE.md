@@ -172,17 +172,20 @@ config. **AMI rotation:** the Launch Template resolves
 Automation rolls unclaimed warm hosts onto a new AMI via an ASG instance refresh
 (`ScaleInProtectedInstances = Ignore`, so Claimed hosts are skipped). **Deployment:**
 the `control-plane` module provisions Aurora DSQL (IAM-auth, no static password),
-an ECR repo, and the server on ECS/Fargate (arm64) behind an internal ALB whose
-**dashboard is gated by Vouch OIDC**. **CI/CD is keyless and immutable:**
+an ECR repo, and the server on ECS/Fargate (arm64) behind an internal NLB. The
+dashboard is gated by app-side OIDC login (session cookie; see `auth/jwt.rs`
+`OidcConfig`), while the API uses bearer-token auth. **CI/CD is keyless and immutable:**
 `.github/workflows/deploy.yml` assumes a GitHub-OIDC-federated role (from the
 `control-plane` module) to push a commit-SHA-tagged image to ECR, register a new
 ECS task-definition revision pinned to it, and roll the service — with the ECS
 deployment circuit breaker auto-rolling-back a failed deploy. No static AWS keys.
 **API auth** (`AUTH_ENABLED`): the server (`src/auth/`) resolves the caller from
-the ALB's `x-amzn-oidc-data` (dashboard) or a `Bearer` Vouch JWT (CLI `--token` /
-`DEVBOX_TOKEN`), verifies it (ALB regional key / Vouch JWKS), and **binds `owner`
-to the verified principal** — so claim/release act only as the authenticated
-identity. Read endpoints stay open. **Owner validation:** claim/release reject an
+a `Bearer` Vouch JWT (CLI `--token` / `DEVBOX_TOKEN`) or an ALB's `x-amzn-oidc-data`
+(legacy path when fronted by an ALB), verifies it (ALB regional key / Vouch JWKS),
+and **binds `owner` to the verified principal** — so claim/release act only as the
+authenticated identity. The dashboard uses app-side OIDC login (`AUTH_OIDC_CLIENT_ID`,
+`AUTH_OIDC_CLIENT_SECRET`, `AUTH_OIDC_REDIRECT_URI`) with a session cookie.
+Read endpoints stay open. **Owner validation:** claim/release reject an
 `owner` that is not a valid Unix login name (`is_valid_unix_username` in
 `devbox-common`: `^[a-z_][a-z0-9_-]*$`, ≤32 chars) with a 400 — the same rule the
 host's `owner-sync` applies — so a misconfigured `AUTH_PRINCIPAL_CLAIM` fails at
