@@ -133,8 +133,7 @@ impl Authenticator {
         let kid = key_id(token)?;
         let key = self.bearer_key(&kid).await?;
 
-        let mut validation = Validation::new(Algorithm::RS256);
-        validation.algorithms = vec![Algorithm::RS256, Algorithm::ES256];
+        let mut validation = Validation::new(token_algorithm(token)?);
         validation.set_issuer(&[self.config.issuer.as_str()]);
         match self.config.audience.as_deref() {
             Some(aud) => validation.set_audience(&[aud]),
@@ -310,8 +309,7 @@ impl Authenticator {
         let kid = key_id(token)?;
         let key = self.bearer_key(&kid).await?;
 
-        let mut validation = Validation::new(Algorithm::RS256);
-        validation.algorithms = vec![Algorithm::RS256, Algorithm::ES256];
+        let mut validation = Validation::new(token_algorithm(token)?);
         validation.set_issuer(&[self.config.issuer.as_str()]);
         validation.set_audience(&[oidc.client_id.as_str()]);
 
@@ -352,6 +350,27 @@ fn key_id(token: &str) -> Result<String, AuthError> {
         .map_err(|e| AuthError::Invalid(format!("bad token header: {e}")))?
         .kid
         .ok_or_else(|| AuthError::Invalid("token header missing kid".to_string()))
+}
+
+/// Read a token's signing algorithm, restricted to the asymmetric algorithms
+/// Vouch issues (`RS256`, `ES256`).
+///
+/// Validation must use the token's own algorithm rather than a fixed list:
+/// `jsonwebtoken` rejects a decoding key whose family differs from *any*
+/// algorithm in `Validation::algorithms`, so a mixed `[RS256, ES256]` list fails
+/// an `ES256` (EC-key) token with `InvalidAlgorithm`. Restricting to the
+/// allow-listed header algorithm — with the key looked up by `kid` from the
+/// trusted JWKS — keeps a single family and blocks algorithm-confusion.
+fn token_algorithm(token: &str) -> Result<Algorithm, AuthError> {
+    let alg = decode_header(token)
+        .map_err(|e| AuthError::Invalid(format!("bad token header: {e}")))?
+        .alg;
+    match alg {
+        Algorithm::RS256 | Algorithm::ES256 => Ok(alg),
+        unsupported => Err(AuthError::Invalid(format!(
+            "unsupported token algorithm {unsupported:?}"
+        ))),
+    }
 }
 
 /// Verify `token` with `key`/`validation` and pull the principal claim.
@@ -513,6 +532,14 @@ mod tests {
             !rendered.contains("s3cr3t-do-not-leak"),
             "client_secret must not leak: {rendered}"
         );
+    }
+
+    #[test]
+    fn token_algorithm_rejects_non_allowlisted() {
+        // The test helper signs with HS256, which is not an accepted asymmetric
+        // algorithm — token_algorithm must reject it.
+        let token = sign(json!({ "sub": "jplock", "iss": ISSUER, "exp": 9_999_999_999_u64 }));
+        assert!(token_algorithm(&token).is_err());
     }
 
     #[test]
