@@ -998,6 +998,7 @@ dependencies = [
  "rust-embed",
  "sea-query",
  "sea-query-sqlx",
+ "secrecy",
  "serde",
  "serde_json",
  "sqlx",
@@ -2487,6 +2488,15 @@ checksum = "4eaa419cdb9157da1361186b1959983eb2ea0dcb9a3c69dc45c449ecb2af8fef"
 dependencies = [
  "sea-query",
  "sqlx",
+]
+
+[[package]]
+name = "secrecy"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
+dependencies = [
+ "zeroize",
 ]
 
 [[package]]

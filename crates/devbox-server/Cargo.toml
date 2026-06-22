@@ -28,7 +28,7 @@ aws-lc-rs = { workspace = true }
 aws-sdk-autoscaling = { workspace = true, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
 aws-sdk-dsql = { workspace = true, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
 aws-sdk-ec2 = { workspace = true, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
-axum = { workspace = true, features = ["json", "tokio", "http1", "form"] }
+axum = { workspace = true, features = ["json", "tokio", "http1", "form", "query"] }
 devbox-common = { path = "../devbox-common" }
 jiff = { workspace = true, features = ["std", "serde"] }
 jsonwebtoken = { workspace = true, features = ["aws_lc_rs", "use_pem"] }
@@ -36,6 +36,7 @@ reqwest = { workspace = true, features = ["json", "rustls"] }
 rust-embed = { workspace = true, features = ["axum-ex", "mime-guess"] }
 sea-query = { workspace = true, features = ["backend-sqlite", "backend-postgres", "derive"] }
 sea-query-sqlx = { workspace = true, features = ["sqlx-sqlite", "sqlx-postgres", "runtime-tokio"] }
+secrecy = { workspace = true }
 serde = { workspace = true, features = ["std", "derive"] }
 serde_json = { workspace = true, features = ["std"] }
 sqlx = { workspace = true, features = ["runtime-tokio", "migrate", "derive", "macros", "sqlite", "postgres", "tls-rustls-aws-lc-rs"] }

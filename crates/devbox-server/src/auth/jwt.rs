@@ -8,6 +8,7 @@ use axum::http::HeaderMap;
 use axum::http::header::AUTHORIZATION;
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+use secrecy::{ExposeSecret, SecretString};
 
 /// Header the ALB injects with a signed JWT for OIDC-authenticated requests.
 const ALB_OIDC_DATA_HEADER: &str = "x-amzn-oidc-data";
@@ -26,6 +27,33 @@ pub struct AuthConfig {
     pub principal_claim: String,
     /// Region whose ALB public keys verify `x-amzn-oidc-data` (e.g. `us-east-1`).
     pub alb_region: Option<String>,
+    /// OIDC Authorization Code settings for the browser dashboard login. `None`
+    /// leaves the dashboard ungated (the API bearer path is unaffected).
+    pub oidc: Option<OidcConfig>,
+}
+
+/// OIDC Authorization Code parameters for the dashboard login flow.
+#[derive(Clone, Debug)]
+pub struct OidcConfig {
+    /// Confidential client id of the Vouch dashboard app.
+    pub client_id: String,
+    /// Client secret for the dashboard app (used only in the token exchange).
+    /// `SecretString` redacts it in `Debug` output and zeroizes it on drop.
+    pub client_secret: SecretString,
+    /// Authorization endpoint (e.g. `https://us.vouch.sh/oauth/authorize`).
+    pub authorize_endpoint: String,
+    /// Token endpoint (e.g. `https://us.vouch.sh/oauth/token`).
+    pub token_endpoint: String,
+    /// Redirect URI registered with the IdP (e.g. `https://<host>/oauth2/idpresponse`).
+    pub redirect_uri: String,
+    /// Scopes to request (e.g. `openid email`).
+    pub scope: String,
+}
+
+/// The subset of an OAuth token response we use (the OIDC ID token).
+#[derive(serde::Deserialize)]
+struct TokenResponse {
+    id_token: String,
 }
 
 /// An authenticated principal (the `owner` a caller may act as).
@@ -194,6 +222,123 @@ impl Authenticator {
         }
         Ok(key)
     }
+
+    /// OIDC dashboard-login settings, when configured.
+    #[must_use]
+    pub fn oidc(&self) -> Option<&OidcConfig> {
+        self.config.oidc.as_ref()
+    }
+
+    /// Build the IdP authorization URL for the dashboard login redirect.
+    ///
+    /// `state` is the opaque CSRF token echoed back to the callback. Returns
+    /// `None` when OIDC login is not configured or the endpoint is unparseable.
+    #[must_use]
+    pub fn authorize_url(&self, state: &str) -> Option<String> {
+        let oidc = self.config.oidc.as_ref()?;
+        let mut url = url::Url::parse(&oidc.authorize_endpoint).ok()?;
+        url.query_pairs_mut()
+            .append_pair("response_type", "code")
+            .append_pair("client_id", &oidc.client_id)
+            .append_pair("redirect_uri", &oidc.redirect_uri)
+            .append_pair("scope", &oidc.scope)
+            .append_pair("state", state);
+        Some(url.to_string())
+    }
+
+    /// Exchange an authorization `code` for the IdP's OIDC ID token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Invalid`] when OIDC is unconfigured, the token
+    /// request fails, or the response lacks an `id_token`.
+    pub async fn exchange_code(&self, code: &str) -> Result<String, AuthError> {
+        let oidc = self
+            .config
+            .oidc
+            .as_ref()
+            .ok_or_else(|| AuthError::Invalid("OIDC login not configured".to_string()))?;
+
+        let body = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("grant_type", "authorization_code")
+            .append_pair("code", code)
+            .append_pair("redirect_uri", &oidc.redirect_uri)
+            .append_pair("client_id", &oidc.client_id)
+            .append_pair("client_secret", oidc.client_secret.expose_secret())
+            .finish();
+
+        let resp = self
+            .http
+            .post(&oidc.token_endpoint)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| AuthError::Invalid(format!("token exchange request failed: {e}")))?;
+
+        if !resp.status().is_success() {
+            return Err(AuthError::Invalid(format!(
+                "token endpoint returned {}",
+                resp.status()
+            )));
+        }
+
+        let token: TokenResponse = resp
+            .json()
+            .await
+            .map_err(|e| AuthError::Invalid(format!("parse token response: {e}")))?;
+        Ok(token.id_token)
+    }
+
+    /// Verify an OIDC ID token (the dashboard session cookie) against Vouch's
+    /// JWKS, the configured issuer, and the dashboard client id as audience.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Invalid`] when OIDC is unconfigured or the token
+    /// fails verification.
+    pub async fn verify_id_token(&self, token: &str) -> Result<Principal, AuthError> {
+        let oidc = self
+            .config
+            .oidc
+            .as_ref()
+            .ok_or_else(|| AuthError::Invalid("OIDC login not configured".to_string()))?;
+
+        let kid = key_id(token)?;
+        let key = self.bearer_key(&kid).await?;
+
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.algorithms = vec![Algorithm::RS256, Algorithm::ES256];
+        validation.set_issuer(&[self.config.issuer.as_str()]);
+        validation.set_audience(&[oidc.client_id.as_str()]);
+
+        extract_principal(token, &key, &validation, &self.config.principal_claim)
+    }
+}
+
+/// Generate an unguessable token (256 bits, hex-encoded) for the OIDC `state`
+/// CSRF parameter.
+///
+/// # Errors
+///
+/// Returns [`AuthError::Invalid`] if the system RNG fails.
+pub(crate) fn random_token() -> Result<String, AuthError> {
+    let mut buf = [0u8; 32];
+    aws_lc_rs::rand::fill(&mut buf).map_err(|_| AuthError::Invalid("RNG failure".to_string()))?;
+    let mut out = String::with_capacity(64);
+    for byte in buf {
+        if let (Some(hi), Some(lo)) = (
+            char::from_digit(u32::from(byte >> 4), 16),
+            char::from_digit(u32::from(byte & 0x0f), 16),
+        ) {
+            out.push(hi);
+            out.push(lo);
+        }
+    }
+    Ok(out)
 }
 
 /// Clone a cached key out of `cache` without holding the lock across `.await`.
@@ -314,5 +459,67 @@ mod tests {
         let principal =
             extract_principal(&token, &key, &validation(), "preferred_username").unwrap();
         assert_eq!(principal, Principal("agent-42".to_string()));
+    }
+
+    fn base_config(oidc: Option<OidcConfig>) -> AuthConfig {
+        AuthConfig {
+            issuer: ISSUER.to_string(),
+            jwks_uri: "https://us.vouch.sh/oauth/jwks".to_string(),
+            audience: None,
+            principal_claim: "sub".to_string(),
+            alb_region: None,
+            oidc,
+        }
+    }
+
+    fn test_oidc() -> OidcConfig {
+        OidcConfig {
+            client_id: "client-123".to_string(),
+            client_secret: SecretString::from("s3cr3t-do-not-leak".to_string()),
+            authorize_endpoint: "https://us.vouch.sh/oauth/authorize".to_string(),
+            token_endpoint: "https://us.vouch.sh/oauth/token".to_string(),
+            redirect_uri: "https://cp.example/oauth2/idpresponse".to_string(),
+            scope: "openid email".to_string(),
+        }
+    }
+
+    #[test]
+    fn authorize_url_includes_required_params() {
+        let auth = Authenticator::new(base_config(Some(test_oidc())));
+        let url = auth.authorize_url("abc123").unwrap();
+        assert!(url.starts_with("https://us.vouch.sh/oauth/authorize?"));
+        assert!(url.contains("response_type=code"));
+        assert!(url.contains("client_id=client-123"));
+        assert!(url.contains("state=abc123"));
+        assert!(url.contains("scope=openid+email"));
+        assert!(url.contains("redirect_uri=https%3A%2F%2Fcp.example%2Foauth2%2Fidpresponse"));
+    }
+
+    #[test]
+    fn authorize_url_none_without_oidc() {
+        let auth = Authenticator::new(base_config(None));
+        assert!(auth.authorize_url("abc123").is_none());
+        assert!(auth.oidc().is_none());
+    }
+
+    #[test]
+    fn oidc_debug_redacts_secret() {
+        let rendered = format!("{:?}", test_oidc());
+        assert!(
+            rendered.contains("REDACTED"),
+            "expected a redaction marker: {rendered}"
+        );
+        assert!(
+            !rendered.contains("s3cr3t-do-not-leak"),
+            "client_secret must not leak: {rendered}"
+        );
+    }
+
+    #[test]
+    fn random_token_is_64_unique_hex_chars() {
+        let token = random_token().unwrap();
+        assert_eq!(token.len(), 64);
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(random_token().unwrap(), token);
     }
 }

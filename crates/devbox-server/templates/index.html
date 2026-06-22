@@ -10,7 +10,13 @@
     <div class="max-w-6xl mx-auto px-6 py-8">
         <div class="flex items-center justify-between mb-6">
             <h1 class="text-2xl font-bold text-white">Devbox Dashboard</h1>
-            <a href="/devboxes/claim" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded transition-colors">Claim Devbox</a>
+            <div class="flex items-center gap-4">
+                {% if let Some(user) = principal %}
+                <span class="text-sm text-gray-400">Signed in as <span class="text-gray-200">{{ user }}</span></span>
+                <a href="/logout" class="text-sm text-gray-400 hover:text-white transition-colors">Logout</a>
+                {% endif %}
+                <a href="/devboxes/claim" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded transition-colors">Claim Devbox</a>
+            </div>
         </div>
         {% if let Some(err) = error %}
         <div class="bg-red-900/50 border border-red-700 text-red-200 px-4 py-3 rounded mb-4">
