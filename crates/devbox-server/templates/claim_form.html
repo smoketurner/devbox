@@ -18,11 +18,6 @@
         <div class="card p-6">
             <form method="post" action="/devboxes/claim" class="space-y-4">
                 <div>
-                    <label for="owner" class="block text-sm text-gray-400 mb-1">Owner (required)</label>
-                    <input type="text" id="owner" name="owner" required
-                           class="w-full bg-devbox-bg border border-gray-600 rounded px-3 py-2 text-white focus:outline-none focus:border-blue-500">
-                </div>
-                <div>
                     <label for="instance_type" class="block text-sm text-gray-400 mb-1">Instance Type (optional)</label>
                     <input type="text" id="instance_type" name="instance_type"
                            value="{{ instance_type.as_deref().unwrap_or_default() }}"

@@ -19,4 +19,4 @@
 mod jwt;
 
 pub(crate) use jwt::random_token;
-pub use jwt::{AuthConfig, AuthError, Authenticator, OidcConfig, Principal};
+pub use jwt::{AuthConfig, AuthError, Authenticator, OidcConfig, Principal, SessionUser};

@@ -60,6 +60,17 @@ struct TokenResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal(pub String);
 
+/// A signed-in dashboard user: the `principal` (also the `owner`/Unix login, so
+/// it must stay Unix-safe) plus a human-friendly `display` label (the `email`
+/// claim when present, else the principal) shown in the UI.
+#[derive(Debug, Clone)]
+pub struct SessionUser {
+    /// The principal claim — the identity used as `owner` for claim/release.
+    pub principal: String,
+    /// A friendly label for the UI (email if present, otherwise the principal).
+    pub display: String,
+}
+
 /// Authentication failure.
 #[derive(Debug)]
 pub enum AuthError {
@@ -299,7 +310,7 @@ impl Authenticator {
     ///
     /// Returns [`AuthError::Invalid`] when OIDC is unconfigured or the token
     /// fails verification.
-    pub async fn verify_id_token(&self, token: &str) -> Result<Principal, AuthError> {
+    pub async fn verify_id_token(&self, token: &str) -> Result<SessionUser, AuthError> {
         let oidc = self
             .config
             .oidc
@@ -313,7 +324,7 @@ impl Authenticator {
         validation.set_issuer(&[self.config.issuer.as_str()]);
         validation.set_audience(&[oidc.client_id.as_str()]);
 
-        extract_principal(token, &key, &validation, &self.config.principal_claim)
+        extract_session_user(token, &key, &validation, &self.config.principal_claim)
     }
 }
 
@@ -393,6 +404,36 @@ fn extract_principal(
         return Err(AuthError::Invalid(format!("empty '{claim}' claim")));
     }
     Ok(Principal(principal.to_string()))
+}
+
+/// Verify `token` and pull the principal plus a display label (the `email` claim
+/// when present and non-empty, otherwise the principal).
+fn extract_session_user(
+    token: &str,
+    key: &DecodingKey,
+    validation: &Validation,
+    claim: &str,
+) -> Result<SessionUser, AuthError> {
+    let data = decode::<serde_json::Value>(token, key, validation)
+        .map_err(|e| AuthError::Invalid(format!("token validation failed: {e}")))?;
+
+    let principal = data
+        .claims
+        .get(claim)
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AuthError::Invalid(format!("token missing '{claim}' claim")))?
+        .to_string();
+
+    let display = data
+        .claims
+        .get("email")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(principal.as_str())
+        .to_string();
+
+    Ok(SessionUser { principal, display })
 }
 
 #[cfg(test)]
@@ -532,6 +573,28 @@ mod tests {
             !rendered.contains("s3cr3t-do-not-leak"),
             "client_secret must not leak: {rendered}"
         );
+    }
+
+    #[test]
+    fn session_user_prefers_email_for_display() {
+        let token = sign(json!({
+            "sub": "019e3868-bf55-7ac0-a29e-0fd53df7b2d2",
+            "email": "jane@example.com",
+            "iss": ISSUER,
+            "exp": 9_999_999_999_u64
+        }));
+        let key = DecodingKey::from_secret(SECRET);
+        let user = extract_session_user(&token, &key, &validation(), "sub").unwrap();
+        assert_eq!(user.principal, "019e3868-bf55-7ac0-a29e-0fd53df7b2d2");
+        assert_eq!(user.display, "jane@example.com");
+    }
+
+    #[test]
+    fn session_user_falls_back_to_principal_without_email() {
+        let token = sign(json!({ "sub": "agent-42", "iss": ISSUER, "exp": 9_999_999_999_u64 }));
+        let key = DecodingKey::from_secret(SECRET);
+        let user = extract_session_user(&token, &key, &validation(), "sub").unwrap();
+        assert_eq!(user.display, "agent-42");
     }
 
     #[test]
