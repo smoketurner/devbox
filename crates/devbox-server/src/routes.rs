@@ -31,14 +31,13 @@ pub struct AppState {
     pub auth: Option<Arc<Authenticator>>,
 }
 
-/// Resolve the caller's `owner`: the authenticated principal when auth is
-/// enabled, otherwise the body-supplied owner.
+/// Resolve the caller's `owner`: when auth is enabled, the Unix login derived
+/// from the token's `email` claim; otherwise the body-supplied owner (local dev).
 ///
-/// The resolved owner doubles as the Unix login account the host provisions for
-/// the claimant (see [`is_valid_unix_username`]), so a non-Unix-safe owner is
-/// rejected here — at claim/release time — rather than silently breaking SSH
-/// later. When auth is enabled this surfaces a misconfigured
-/// `AUTH_PRINCIPAL_CLAIM` immediately.
+/// The owner doubles as the Unix login account the host provisions for the
+/// claimant (see [`is_valid_unix_username`]). The authenticated path already
+/// derives a valid login from the email; this guard catches a non-Unix-safe
+/// body-supplied owner in the no-auth path rather than silently breaking SSH.
 async fn resolve_owner(
     state: &AppState,
     headers: &HeaderMap,
@@ -51,8 +50,7 @@ async fn resolve_owner(
     if !is_valid_unix_username(&owner) {
         return Err(AppError::BadRequest(format!(
             "owner '{owner}' is not a valid Unix login name (must match \
-             ^[a-z_][a-z0-9_-]*$, at most 32 characters); when auth is enabled, \
-             AUTH_PRINCIPAL_CLAIM must emit such a username"
+             ^[a-z_][a-z0-9_.-]*$, at most 32 characters)"
         )));
     }
     Ok(owner)
@@ -328,22 +326,21 @@ mod tests {
         let state = setup_state().await;
         insert(&state, ready_devbox()).await;
 
-        let body = claim_devbox(State(state), HeaderMap::new(), JsonBody(claim("jplock")))
+        let body = claim_devbox(State(state), HeaderMap::new(), JsonBody(claim("jdoe")))
             .await
             .ok()
             .unwrap()
             .0;
 
         assert_eq!(body.state, DevboxState::Claimed);
-        assert_eq!(body.owner.as_deref(), Some("jplock"));
+        assert_eq!(body.owner.as_deref(), Some("jdoe"));
     }
 
     #[tokio::test]
     async fn claim_empty_pool_is_conflict() {
         let state = setup_state().await;
-        let status = status_of(
-            claim_devbox(State(state), HeaderMap::new(), JsonBody(claim("jplock"))).await,
-        );
+        let status =
+            status_of(claim_devbox(State(state), HeaderMap::new(), JsonBody(claim("jdoe"))).await);
         assert_eq!(status, StatusCode::CONFLICT);
     }
 
@@ -355,7 +352,7 @@ mod tests {
             claim_devbox(
                 State(state),
                 HeaderMap::new(),
-                JsonBody(claim("justin@plock.net")),
+                JsonBody(claim("jane@example.com")),
             )
             .await,
         );

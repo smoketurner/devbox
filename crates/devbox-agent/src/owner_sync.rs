@@ -113,8 +113,15 @@ async fn tick(client: &Client) -> Result<Pass> {
 /// failed) self-heals and the claimant keeps passwordless sudo.
 fn ensure_user(user: &str) -> Result<()> {
     if !user_exists(user) {
-        run_cmd("useradd", &["-m", "-s", "/bin/bash", "-G", "docker", user])
-            .with_context(|| format!("create login account for {user}"))?;
+        // useradd's stock NAME_REGEX rejects dots; pass --badname for the
+        // email-derived `first.last` logins we allow (omitted for plain names so
+        // their behavior is unchanged).
+        let mut args: Vec<&str> = Vec::new();
+        if user.contains('.') {
+            args.push("--badname");
+        }
+        args.extend(["-m", "-s", "/bin/bash", "-G", "docker", user]);
+        run_cmd("useradd", &args).with_context(|| format!("create login account for {user}"))?;
     }
     let sudoers = format!("/etc/sudoers.d/devbox-{user}");
     std::fs::write(&sudoers, format!("{user} ALL=(ALL) NOPASSWD: ALL\n"))
@@ -170,8 +177,8 @@ mod tests {
     #[test]
     fn valid_owner_provisions_trimmed() {
         assert_eq!(
-            decide(Some("  jplock  ")),
-            Decision::Provision("jplock".to_string())
+            decide(Some("  jdoe  ")),
+            Decision::Provision("jdoe".to_string())
         );
         assert_eq!(
             decide(Some("agent-42")),
@@ -182,8 +189,8 @@ mod tests {
     #[test]
     fn unsafe_owner_is_refused() {
         assert_eq!(
-            decide(Some("justin@plock.net")),
-            Decision::Unsafe("justin@plock.net".to_string())
+            decide(Some("jane@example.com")),
+            Decision::Unsafe("jane@example.com".to_string())
         );
         assert_eq!(
             decide(Some("Justin")),

@@ -13,7 +13,7 @@ use axum::response::{AppendHeaders, Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use rust_embed::Embed;
 
-use crate::auth::random_token;
+use crate::auth::{SessionUser, random_token};
 use crate::db::document_type::Document;
 use crate::documents::devbox::DevboxDoc;
 use crate::routes::AppState;
@@ -73,9 +73,8 @@ macro_rules! impl_template_into_response {
 #[template(path = "index.html")]
 pub struct DashboardTemplate {
     pub devboxes: Vec<DashboardDevbox>,
-    /// The signed-in principal, shown in the header. `None` when dashboard login
-    /// is not enabled.
-    pub principal: Option<String>,
+    /// The signed-in user's display label (email), shown in the header.
+    pub display_name: String,
     pub error: Option<String>,
 }
 
@@ -159,10 +158,10 @@ pub struct DashboardDevbox {
 // Form Data
 // ============================================================================
 
-/// Form data for claiming a devbox.
+/// Form data for claiming a devbox. The owner is always the signed-in user, so
+/// the form only carries the optional instance type.
 #[derive(serde::Deserialize)]
 struct ClaimFormData {
-    owner: String,
     instance_type: Option<String>,
 }
 
@@ -176,14 +175,6 @@ struct CallbackQuery {
     code: Option<String>,
     state: Option<String>,
     error: Option<String>,
-}
-
-/// Whether app-side OIDC dashboard login is enabled.
-fn dashboard_login_enabled(state: &AppState) -> bool {
-    state
-        .auth
-        .as_ref()
-        .is_some_and(|auth| auth.oidc().is_some())
 }
 
 /// Read a cookie value from the request `Cookie` header.
@@ -200,27 +191,20 @@ fn set_cookie(name: &str, value: &str, max_age: i64) -> String {
     format!("{name}={value}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={max_age}")
 }
 
-/// Resolve the signed-in principal from the session cookie, if valid.
-async fn current_session(state: &AppState, headers: &HeaderMap) -> Option<String> {
+/// Resolve the signed-in user from the session cookie, if valid.
+async fn current_session(state: &AppState, headers: &HeaderMap) -> Option<SessionUser> {
     let auth = state.auth.as_ref()?;
     auth.oidc()?;
     let token = cookie_value(headers, SESSION_COOKIE)?;
-    auth.verify_id_token(&token).await.ok().map(|p| p.0)
+    auth.verify_id_token(&token).await.ok()
 }
 
-/// Gate a dashboard page on a valid session.
-///
-/// - `Ok(None)` — login is not enabled; the page is open.
-/// - `Ok(Some(principal))` — a valid session is present.
-/// - `Err(redirect)` — login is enabled but no valid session; redirect to `/login`.
-async fn require_login(state: &AppState, headers: &HeaderMap) -> Result<Option<String>, Response> {
-    if !dashboard_login_enabled(state) {
-        return Ok(None);
-    }
-    match current_session(state, headers).await {
-        Some(principal) => Ok(Some(principal)),
-        None => Err(Redirect::to("/login").into_response()),
-    }
+/// Gate a dashboard page: every UI route requires a valid login session.
+/// Returns the signed-in user, or a redirect to `/login` when unauthenticated.
+async fn require_login(state: &AppState, headers: &HeaderMap) -> Result<SessionUser, Response> {
+    current_session(state, headers)
+        .await
+        .ok_or_else(|| Redirect::to("/login").into_response())
 }
 
 /// Start the OIDC Authorization Code flow: set a CSRF `state` cookie and
@@ -229,8 +213,13 @@ async fn require_login(state: &AppState, headers: &HeaderMap) -> Result<Option<S
 /// GET /login
 async fn login(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let Some(auth) = state.auth.as_ref().filter(|a| a.oidc().is_some()) else {
-        // Nothing to log into; already-valid sessions just go home.
-        return Redirect::to("/").into_response();
+        // Login is required but not configured — surface it rather than looping
+        // back to the gated dashboard.
+        return ErrorPageTemplate {
+            title: "Login unavailable".to_string(),
+            message: "Dashboard login is not configured on this server.".to_string(),
+        }
+        .into_response();
     };
     if current_session(&state, &headers).await.is_some() {
         return Redirect::to("/").into_response();
@@ -359,8 +348,8 @@ pub fn build_ui_router() -> Router<AppState> {
 ///
 /// GET /
 async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let principal = match require_login(&state, &headers).await {
-        Ok(principal) => principal,
+    let display_name = match require_login(&state, &headers).await {
+        Ok(user) => user.display,
         Err(redirect) => return redirect,
     };
     match state.store.list_all::<DevboxDoc>().await {
@@ -378,14 +367,14 @@ async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Respons
                 .collect();
             DashboardTemplate {
                 devboxes,
-                principal,
+                display_name,
                 error: None,
             }
             .into_response()
         }
         Err(e) => DashboardTemplate {
             devboxes: Vec::new(),
-            principal,
+            display_name,
             error: Some(format!("Failed to load devboxes: {e}")),
         }
         .into_response(),
@@ -436,35 +425,6 @@ async fn claim_form(State(state): State<AppState>, headers: HeaderMap) -> Respon
     .into_response()
 }
 
-/// Resolve the submitter's owner: the dashboard-login session principal (or the
-/// legacy ALB/bearer principal) when auth is enabled, otherwise the form-supplied
-/// owner. `Err` carries a user-facing message.
-async fn ui_owner(
-    state: &AppState,
-    headers: &HeaderMap,
-    form_owner: &str,
-) -> Result<String, String> {
-    if dashboard_login_enabled(state) {
-        return current_session(state, headers)
-            .await
-            .ok_or_else(|| "Your session has expired. Please sign in again.".to_string());
-    }
-    match &state.auth {
-        Some(auth) => auth
-            .authenticate(headers)
-            .await
-            .map(|principal| principal.0)
-            .map_err(|e| format!("Authentication failed: {e}")),
-        None => {
-            if form_owner.trim().is_empty() {
-                Err("Owner field is required.".to_string())
-            } else {
-                Ok(form_owner.to_string())
-            }
-        }
-    }
-}
-
 /// Process the claim form submission.
 ///
 /// POST /devboxes/claim
@@ -473,21 +433,10 @@ async fn submit_claim(
     headers: HeaderMap,
     Form(form): Form<ClaimFormData>,
 ) -> Response {
-    // Gate on a valid session when dashboard login is enabled — redirect to
-    // /login (consistent with the GET claim form and submit_release) instead of
-    // rendering the form with an error.
-    if let Err(redirect) = require_login(&state, &headers).await {
-        return redirect;
-    }
-    let owner = match ui_owner(&state, &headers, &form.owner).await {
-        Ok(owner) => owner,
-        Err(message) => {
-            return ClaimFormTemplate {
-                instance_type: form.instance_type,
-                error: Some(message),
-            }
-            .into_response();
-        }
+    // The owner is always the signed-in user.
+    let owner = match require_login(&state, &headers).await {
+        Ok(user) => user.principal,
+        Err(redirect) => return redirect,
     };
 
     let ready_docs = match state.store.find_all::<DevboxDoc>("state", "ready").await {
@@ -560,11 +509,12 @@ async fn submit_release(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    // Gate before loading the devbox so anonymous POSTs can't probe its
+    // Gate before loading the devbox so unauthenticated POSTs can't probe its
     // existence/metadata (consistent with the GET routes and submit_claim).
-    if let Err(redirect) = require_login(&state, &headers).await {
-        return redirect;
-    }
+    let user = match require_login(&state, &headers).await {
+        Ok(user) => user,
+        Err(redirect) => return redirect,
+    };
     let doc = match state.store.get::<DevboxDoc>(&id).await {
         Ok(Some(doc)) => doc,
         Ok(None) => {
@@ -591,38 +541,14 @@ async fn submit_release(
         .into_response();
     }
 
-    // When auth is enabled, only the claimant may release.
+    // Only the claimant may release.
     let owner = doc.data.owner.clone().unwrap_or_default();
-    if dashboard_login_enabled(&state) {
-        match current_session(&state, &headers).await {
-            Some(principal) if principal == owner => {}
-            Some(_) => {
-                return DevboxDetailTemplate {
-                    devbox: doc.into(),
-                    error: Some("You can only release a devbox you claimed.".to_string()),
-                }
-                .into_response();
-            }
-            None => return Redirect::to("/login").into_response(),
+    if user.principal != owner {
+        return DevboxDetailTemplate {
+            devbox: doc.into(),
+            error: Some("You can only release a devbox you claimed.".to_string()),
         }
-    } else if let Some(auth) = &state.auth {
-        match auth.authenticate(&headers).await {
-            Ok(principal) if principal.0 == owner => {}
-            Ok(_) => {
-                return DevboxDetailTemplate {
-                    devbox: doc.into(),
-                    error: Some("You can only release a devbox you claimed.".to_string()),
-                }
-                .into_response();
-            }
-            Err(e) => {
-                return DevboxDetailTemplate {
-                    devbox: doc.into(),
-                    error: Some(format!("Authentication failed: {e}")),
-                }
-                .into_response();
-            }
-        }
+        .into_response();
     }
 
     let mut updated = doc.data.clone();

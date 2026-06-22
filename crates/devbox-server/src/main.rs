@@ -152,16 +152,13 @@ fn build_authenticator() -> Option<Arc<Authenticator>> {
         audience: std::env::var("AUTH_OIDC_AUDIENCE")
             .ok()
             .filter(|s| !s.is_empty()),
-        principal_claim: std::env::var("AUTH_PRINCIPAL_CLAIM")
-            .unwrap_or_else(|_| "sub".to_string()),
         alb_region: std::env::var("AWS_REGION").ok().filter(|s| !s.is_empty()),
         oidc,
     };
     tracing::info!(
         issuer = %config.issuer,
-        principal_claim = %config.principal_claim,
         dashboard_login = config.oidc.is_some(),
-        "API authentication enabled"
+        "API authentication enabled (owner = email local part)"
     );
     Some(Arc::new(Authenticator::new(config)))
 }

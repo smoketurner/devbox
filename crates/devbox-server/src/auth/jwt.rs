@@ -10,6 +10,8 @@ use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use secrecy::{ExposeSecret, SecretString};
 
+use devbox_common::is_valid_unix_username;
+
 /// Header the ALB injects with a signed JWT for OIDC-authenticated requests.
 const ALB_OIDC_DATA_HEADER: &str = "x-amzn-oidc-data";
 
@@ -22,9 +24,6 @@ pub struct AuthConfig {
     pub jwks_uri: String,
     /// Expected audience (the OIDC client id). `None` skips audience validation.
     pub audience: Option<String>,
-    /// Claim that carries the principal — MUST match the Vouch SSH cert principal
-    /// (a Unix-safe username), since `owner` drives both the box tag and login.
-    pub principal_claim: String,
     /// Region whose ALB public keys verify `x-amzn-oidc-data` (e.g. `us-east-1`).
     pub alb_region: Option<String>,
     /// OIDC Authorization Code settings for the browser dashboard login. `None`
@@ -59,6 +58,16 @@ struct TokenResponse {
 /// An authenticated principal (the `owner` a caller may act as).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal(pub String);
+
+/// A signed-in dashboard user: the `principal` (the Unix-safe `owner`/login,
+/// derived from the email local part) plus the full `email` shown in the UI.
+#[derive(Debug, Clone)]
+pub struct SessionUser {
+    /// The owner/login used for claim/release — the email local part.
+    pub principal: String,
+    /// The full email address, shown in the dashboard header.
+    pub display: String,
+}
 
 /// Authentication failure.
 #[derive(Debug)]
@@ -140,7 +149,8 @@ impl Authenticator {
             None => validation.validate_aud = false,
         }
 
-        extract_principal(token, &key, &validation, &self.config.principal_claim)
+        let (owner, _email) = decode_owner(token, &key, &validation)?;
+        Ok(Principal(owner))
     }
 
     /// Verify an ALB `x-amzn-oidc-data` JWT against the ALB's regional key.
@@ -151,7 +161,8 @@ impl Authenticator {
         let mut validation = Validation::new(Algorithm::ES256);
         validation.validate_aud = false;
 
-        extract_principal(token, &key, &validation, &self.config.principal_claim)
+        let (owner, _email) = decode_owner(token, &key, &validation)?;
+        Ok(Principal(owner))
     }
 
     /// Look up a bearer signing key by `kid`, refreshing the JWKS on a miss.
@@ -299,7 +310,7 @@ impl Authenticator {
     ///
     /// Returns [`AuthError::Invalid`] when OIDC is unconfigured or the token
     /// fails verification.
-    pub async fn verify_id_token(&self, token: &str) -> Result<Principal, AuthError> {
+    pub async fn verify_id_token(&self, token: &str) -> Result<SessionUser, AuthError> {
         let oidc = self
             .config
             .oidc
@@ -313,7 +324,11 @@ impl Authenticator {
         validation.set_issuer(&[self.config.issuer.as_str()]);
         validation.set_audience(&[oidc.client_id.as_str()]);
 
-        extract_principal(token, &key, &validation, &self.config.principal_claim)
+        let (owner, email) = decode_owner(token, &key, &validation)?;
+        Ok(SessionUser {
+            principal: owner,
+            display: email,
+        })
     }
 }
 
@@ -373,26 +388,44 @@ fn token_algorithm(token: &str) -> Result<Algorithm, AuthError> {
     }
 }
 
-/// Verify `token` with `key`/`validation` and pull the principal claim.
-fn extract_principal(
+/// Verify `token` with `key`/`validation`, then return `(owner, email)`: the
+/// `email` claim and the Unix-safe owner derived from its local part.
+///
+/// Vouch has no username concept — its `sub` is an opaque UUID — so the `owner`
+/// (Unix login / claim identity / SSH cert principal) is derived from the email.
+fn decode_owner(
     token: &str,
     key: &DecodingKey,
     validation: &Validation,
-    claim: &str,
-) -> Result<Principal, AuthError> {
+) -> Result<(String, String), AuthError> {
     let data = decode::<serde_json::Value>(token, key, validation)
         .map_err(|e| AuthError::Invalid(format!("token validation failed: {e}")))?;
 
-    let principal = data
+    let email = data
         .claims
-        .get(claim)
+        .get("email")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| AuthError::Invalid(format!("token missing '{claim}' claim")))?;
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AuthError::Invalid("token missing 'email' claim".to_string()))?;
 
-    if principal.is_empty() {
-        return Err(AuthError::Invalid(format!("empty '{claim}' claim")));
-    }
-    Ok(Principal(principal.to_string()))
+    let owner = username_from_email(email).ok_or_else(|| {
+        AuthError::Invalid(format!("cannot derive a Unix login from email '{email}'"))
+    })?;
+
+    Ok((owner, email.to_string()))
+}
+
+/// Derive a Unix login from an email: the local part (before `@`), surrounding
+/// whitespace trimmed and lowercased. Returns `None` unless that is already a
+/// valid Unix username.
+///
+/// Only surrounding whitespace is trimmed; internal characters are never
+/// stripped and the result is never truncated — a non-conforming local part is
+/// rejected, not mangled — so distinct local parts can never collide on the same
+/// `owner` (which would let one user act on another's devboxes).
+fn username_from_email(email: &str) -> Option<String> {
+    let local = email.trim().split('@').next()?.trim().to_ascii_lowercase();
+    is_valid_unix_username(&local).then_some(local)
 }
 
 #[cfg(test)]
@@ -425,59 +458,81 @@ mod tests {
     }
 
     #[test]
-    fn valid_token_yields_principal() {
-        let token = sign(json!({ "sub": "jplock", "iss": ISSUER, "exp": 9_999_999_999_u64 }));
+    fn decode_owner_derives_login_from_email() {
+        let token =
+            sign(json!({ "email": "jane@example.com", "iss": ISSUER, "exp": 9_999_999_999_u64 }));
         let key = DecodingKey::from_secret(SECRET);
-        let principal = extract_principal(&token, &key, &validation(), "sub").unwrap();
-        assert_eq!(principal, Principal("jplock".to_string()));
+        let (owner, email) = decode_owner(&token, &key, &validation()).unwrap();
+        assert_eq!(owner, "jane");
+        assert_eq!(email, "jane@example.com");
+    }
+
+    #[test]
+    fn decode_owner_rejects_missing_email() {
+        let token = sign(json!({ "sub": "uuid-only", "iss": ISSUER, "exp": 9_999_999_999_u64 }));
+        let key = DecodingKey::from_secret(SECRET);
+        assert!(decode_owner(&token, &key, &validation()).is_err());
     }
 
     #[test]
     fn expired_token_rejected() {
-        let token = sign(json!({ "sub": "jplock", "iss": ISSUER, "exp": 1_u64 }));
+        let token = sign(json!({ "email": "jane@example.com", "iss": ISSUER, "exp": 1_u64 }));
         let key = DecodingKey::from_secret(SECRET);
-        assert!(extract_principal(&token, &key, &validation(), "sub").is_err());
+        assert!(decode_owner(&token, &key, &validation()).is_err());
     }
 
     #[test]
     fn wrong_issuer_rejected() {
-        let token = sign(
-            json!({ "sub": "jplock", "iss": "https://evil.example", "exp": 9_999_999_999_u64 }),
-        );
+        let token = sign(json!({
+            "email": "jane@example.com", "iss": "https://evil.example", "exp": 9_999_999_999_u64
+        }));
         let key = DecodingKey::from_secret(SECRET);
-        assert!(extract_principal(&token, &key, &validation(), "sub").is_err());
+        assert!(decode_owner(&token, &key, &validation()).is_err());
     }
 
     #[test]
     fn wrong_key_rejected() {
-        let token = sign(json!({ "sub": "jplock", "iss": ISSUER, "exp": 9_999_999_999_u64 }));
+        let token =
+            sign(json!({ "email": "jane@example.com", "iss": ISSUER, "exp": 9_999_999_999_u64 }));
         let key = DecodingKey::from_secret(b"a-different-secret");
-        assert!(extract_principal(&token, &key, &validation(), "sub").is_err());
+        assert!(decode_owner(&token, &key, &validation()).is_err());
     }
 
     #[test]
-    fn missing_claim_rejected() {
-        let token = sign(json!({ "iss": ISSUER, "exp": 9_999_999_999_u64 }));
-        let key = DecodingKey::from_secret(SECRET);
-        assert!(extract_principal(&token, &key, &validation(), "sub").is_err());
-    }
-
-    #[test]
-    fn empty_principal_rejected() {
-        let token = sign(json!({ "sub": "", "iss": ISSUER, "exp": 9_999_999_999_u64 }));
-        let key = DecodingKey::from_secret(SECRET);
-        assert!(extract_principal(&token, &key, &validation(), "sub").is_err());
-    }
-
-    #[test]
-    fn configurable_claim() {
-        let token = sign(
-            json!({ "preferred_username": "agent-42", "iss": ISSUER, "exp": 9_999_999_999_u64 }),
+    fn username_from_email_takes_local_part() {
+        assert_eq!(
+            username_from_email("jdoe@example.com").as_deref(),
+            Some("jdoe")
         );
-        let key = DecodingKey::from_secret(SECRET);
-        let principal =
-            extract_principal(&token, &key, &validation(), "preferred_username").unwrap();
-        assert_eq!(principal, Principal("agent-42".to_string()));
+    }
+
+    #[test]
+    fn username_from_email_lowercases_and_trims() {
+        assert_eq!(
+            username_from_email("  JDoe@example.com  ").as_deref(),
+            Some("jdoe")
+        );
+    }
+
+    #[test]
+    fn username_from_email_allows_dots_without_collision() {
+        // Dots are kept (first.last logins), never stripped — so distinct local
+        // parts can't fold onto the same owner (a.b stays distinct from ab).
+        assert_eq!(
+            username_from_email("first.last@example.com").as_deref(),
+            Some("first.last")
+        );
+        assert_eq!(username_from_email("a.b@corp.com").as_deref(), Some("a.b"));
+        assert_eq!(username_from_email("ab@corp.com").as_deref(), Some("ab"));
+    }
+
+    #[test]
+    fn username_from_email_rejects_underiverable() {
+        assert!(username_from_email("123@example.com").is_none()); // leading digit
+        assert!(username_from_email("@example.com").is_none()); // empty local part
+        assert!(username_from_email("a+b@example.com").is_none()); // '+' not allowed
+        let long = format!("{}@example.com", "a".repeat(33));
+        assert!(username_from_email(&long).is_none()); // >32 chars, never truncated
     }
 
     fn base_config(oidc: Option<OidcConfig>) -> AuthConfig {
@@ -485,7 +540,6 @@ mod tests {
             issuer: ISSUER.to_string(),
             jwks_uri: "https://us.vouch.sh/oauth/jwks".to_string(),
             audience: None,
-            principal_claim: "sub".to_string(),
             alb_region: None,
             oidc,
         }
@@ -538,7 +592,7 @@ mod tests {
     fn token_algorithm_rejects_non_allowlisted() {
         // The test helper signs with HS256, which is not an accepted asymmetric
         // algorithm — token_algorithm must reject it.
-        let token = sign(json!({ "sub": "jplock", "iss": ISSUER, "exp": 9_999_999_999_u64 }));
+        let token = sign(json!({ "sub": "jdoe", "iss": ISSUER, "exp": 9_999_999_999_u64 }));
         assert!(token_algorithm(&token).is_err());
     }
 

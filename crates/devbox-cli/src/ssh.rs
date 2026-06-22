@@ -160,10 +160,10 @@ mod tests {
 
     #[test]
     fn builds_ssm_proxy_command_with_owner_as_login() {
-        let devbox = claimed(Some("i-0abc"), Some("jplock"));
+        let devbox = claimed(Some("i-0abc"), Some("jdoe"));
         let args = build_args(&devbox, &opts()).expect("args");
         assert_eq!(args.first().map(String::as_str), Some("-o"));
-        assert!(args.iter().any(|a| a == "jplock@i-0abc"));
+        assert!(args.iter().any(|a| a == "jdoe@i-0abc"));
         assert!(
             args.iter()
                 .any(|a| a.contains("aws ssm start-session --target i-0abc")
@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn user_override_takes_precedence() {
-        let devbox = claimed(Some("i-0abc"), Some("jplock"));
+        let devbox = claimed(Some("i-0abc"), Some("jdoe"));
         let mut o = opts();
         o.user = Some("root".to_string());
         let args = build_args(&devbox, &o).expect("args");
@@ -182,7 +182,7 @@ mod tests {
 
     #[test]
     fn region_and_profile_are_forwarded() {
-        let devbox = claimed(Some("i-0abc"), Some("jplock"));
+        let devbox = claimed(Some("i-0abc"), Some("jdoe"));
         let mut o = opts();
         o.region = Some("us-east-1".to_string());
         o.profile = Some("dev".to_string());
@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn extra_args_are_appended() {
-        let devbox = claimed(Some("i-0abc"), Some("jplock"));
+        let devbox = claimed(Some("i-0abc"), Some("jdoe"));
         let mut o = opts();
         o.extra = vec!["uptime".to_string()];
         let args = build_args(&devbox, &o).expect("args");
@@ -206,7 +206,7 @@ mod tests {
 
     #[test]
     fn errors_without_instance() {
-        let devbox = claimed(None, Some("jplock"));
+        let devbox = claimed(None, Some("jdoe"));
         assert!(build_args(&devbox, &opts()).is_err());
     }
 
@@ -224,8 +224,8 @@ mod tests {
 
     #[test]
     fn shell_join_passes_safe_arg_unquoted() {
-        let args = vec!["jplock@i-0abc".to_string()];
-        assert_eq!(shell_join(&args), "jplock@i-0abc");
+        let args = vec!["jdoe@i-0abc".to_string()];
+        assert_eq!(shell_join(&args), "jdoe@i-0abc");
     }
 
     #[test]
