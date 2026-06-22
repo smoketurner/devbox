@@ -178,6 +178,13 @@ struct CallbackQuery {
     error: Option<String>,
 }
 
+/// Query parameters on the login page. `error` is set when the callback redirects
+/// here after a failed sign-in (a clean URL with no authorization code).
+#[derive(serde::Deserialize)]
+struct LoginQuery {
+    error: Option<String>,
+}
+
 /// Whether app-side OIDC dashboard login is enabled.
 fn dashboard_login_enabled(state: &AppState) -> bool {
     state
@@ -227,13 +234,27 @@ async fn require_login(state: &AppState, headers: &HeaderMap) -> Result<Option<S
 /// redirect to the IdP.
 ///
 /// GET /login
-async fn login(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<LoginQuery>,
+) -> Response {
     let Some(auth) = state.auth.as_ref().filter(|a| a.oidc().is_some()) else {
         // Nothing to log into; already-valid sessions just go home.
         return Redirect::to("/").into_response();
     };
     if current_session(&state, &headers).await.is_some() {
         return Redirect::to("/").into_response();
+    }
+    // The callback redirects here with ?error after a failed sign-in. Show an
+    // error page instead of bouncing straight back to the IdP (which would loop
+    // on a persistent failure).
+    if query.error.is_some() {
+        return ErrorPageTemplate {
+            title: "Sign-in failed".to_string(),
+            message: "Sign-in did not complete. Please try again.".to_string(),
+        }
+        .into_response();
     }
     let csrf = match random_token() {
         Ok(token) => token,
@@ -268,32 +289,36 @@ async fn oauth_callback(
         return Redirect::to("/").into_response();
     };
 
-    let login_error = |message: String| {
-        ErrorPageTemplate {
-            title: "Sign-in failed".to_string(),
-            message,
-        }
-        .into_response()
+    // On any failure, redirect to a clean URL (no authorization code left in the
+    // address bar, where it could leak via history/bookmarks/Referer) and clear
+    // the single-use state cookie; the specific reason is logged server-side.
+    let fail = |reason: &str| -> Response {
+        tracing::warn!("dashboard sign-in failed: {reason}");
+        (
+            AppendHeaders([(header::SET_COOKIE, set_cookie(STATE_COOKIE, "", 0))]),
+            Redirect::to("/login?error=1"),
+        )
+            .into_response()
     };
 
     if let Some(err) = query.error {
-        return login_error(format!("The identity provider returned an error: {err}"));
+        return fail(&format!("identity provider returned an error: {err}"));
     }
     let (Some(code), Some(returned_state)) = (query.code, query.state) else {
-        return login_error("Missing code or state on the callback.".to_string());
+        return fail("missing code or state on the callback");
     };
     // CSRF: the state echoed back must match the one we set at /login.
     match cookie_value(&headers, STATE_COOKIE) {
         Some(expected) if expected == returned_state => {}
-        _ => return login_error("Invalid or missing login state. Please try again.".to_string()),
+        _ => return fail("invalid or missing login state"),
     }
 
     let id_token = match auth.exchange_code(&code).await {
         Ok(token) => token,
-        Err(e) => return login_error(format!("Could not complete sign-in: {e}")),
+        Err(e) => return fail(&format!("token exchange failed: {e}")),
     };
     if let Err(e) = auth.verify_id_token(&id_token).await {
-        return login_error(format!("The identity provider's token was rejected: {e}"));
+        return fail(&format!("id_token rejected: {e}"));
     }
 
     (
@@ -455,6 +480,12 @@ async fn submit_claim(
     headers: HeaderMap,
     Form(form): Form<ClaimFormData>,
 ) -> Response {
+    // Gate on a valid session when dashboard login is enabled — redirect to
+    // /login (consistent with the GET claim form and submit_release) instead of
+    // rendering the form with an error.
+    if let Err(redirect) = require_login(&state, &headers).await {
+        return redirect;
+    }
     let owner = match ui_owner(&state, &headers, &form.owner).await {
         Ok(owner) => owner,
         Err(message) => {
