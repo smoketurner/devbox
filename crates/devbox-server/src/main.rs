@@ -8,11 +8,11 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use devbox_server::auth::{AuthConfig, Authenticator, OidcConfig};
-use secrecy::SecretString;
 use devbox_server::compute::ec2::Ec2;
 use devbox_server::db::{DocumentStore, Pool, PoolConfig};
 use devbox_server::reconcile::{ReconcilerConfig, spawn_reconciliation_loop};
 use devbox_server::routes::{AppState, build_router};
+use secrecy::SecretString;
 
 #[tokio::main]
 async fn main() -> Result<()> {
