@@ -49,19 +49,16 @@ mod tests {
 
     #[test]
     fn absent_owner_authorizes_no_one() {
-        assert_eq!(authorized_principal(None, "jplock"), None);
+        assert_eq!(authorized_principal(None, "jdoe"), None);
     }
 
     #[test]
     fn mismatched_owner_authorizes_no_one() {
-        assert_eq!(authorized_principal(Some("alice"), "jplock"), None);
+        assert_eq!(authorized_principal(Some("alice"), "jdoe"), None);
     }
 
     #[test]
     fn matching_owner_is_authorized() {
-        assert_eq!(
-            authorized_principal(Some("jplock"), "jplock"),
-            Some("jplock")
-        );
+        assert_eq!(authorized_principal(Some("jdoe"), "jdoe"), Some("jdoe"));
     }
 }

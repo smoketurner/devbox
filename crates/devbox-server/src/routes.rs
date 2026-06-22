@@ -50,7 +50,7 @@ async fn resolve_owner(
     if !is_valid_unix_username(&owner) {
         return Err(AppError::BadRequest(format!(
             "owner '{owner}' is not a valid Unix login name (must match \
-             ^[a-z_][a-z0-9_-]*$, at most 32 characters)"
+             ^[a-z_][a-z0-9_.-]*$, at most 32 characters)"
         )));
     }
     Ok(owner)
@@ -326,22 +326,21 @@ mod tests {
         let state = setup_state().await;
         insert(&state, ready_devbox()).await;
 
-        let body = claim_devbox(State(state), HeaderMap::new(), JsonBody(claim("jplock")))
+        let body = claim_devbox(State(state), HeaderMap::new(), JsonBody(claim("jdoe")))
             .await
             .ok()
             .unwrap()
             .0;
 
         assert_eq!(body.state, DevboxState::Claimed);
-        assert_eq!(body.owner.as_deref(), Some("jplock"));
+        assert_eq!(body.owner.as_deref(), Some("jdoe"));
     }
 
     #[tokio::test]
     async fn claim_empty_pool_is_conflict() {
         let state = setup_state().await;
-        let status = status_of(
-            claim_devbox(State(state), HeaderMap::new(), JsonBody(claim("jplock"))).await,
-        );
+        let status =
+            status_of(claim_devbox(State(state), HeaderMap::new(), JsonBody(claim("jdoe"))).await);
         assert_eq!(status, StatusCode::CONFLICT);
     }
 
@@ -353,7 +352,7 @@ mod tests {
             claim_devbox(
                 State(state),
                 HeaderMap::new(),
-                JsonBody(claim("justin@plock.net")),
+                JsonBody(claim("jane@example.com")),
             )
             .await,
         );

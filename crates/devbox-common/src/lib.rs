@@ -150,12 +150,14 @@ impl AsRef<str> for SecurityGroupId {
 
 /// Whether `name` is a valid Linux login account name.
 ///
-/// Mirrors the default `useradd` `NAME_REGEX` (`^[a-z_][a-z0-9_-]*$`, at most 32
-/// characters). A devbox `owner` doubles as the Unix login account the host
-/// provisions for the claimant, so a principal that is not a valid username
-/// (e.g. an email address or a capitalized name) can never be logged into over
-/// SSH. Claims reject such an owner up front, and the on-host `owner-sync` agent
-/// applies the same rule before creating the account.
+/// Allows `^[a-z_][a-z0-9_.-]*$`, at most 32 characters — a superset of
+/// `useradd`'s stock `NAME_REGEX` that also permits dots, so email-derived
+/// `first.last` logins work. A devbox `owner` doubles as the Unix login account
+/// the host provisions for the claimant, so a principal that is not a valid
+/// username (e.g. a full email address) can never be logged into over SSH.
+/// Claims reject such an owner up front, and the on-host `owner-sync` agent
+/// applies the same rule (passing `useradd --badname` for dotted names, which
+/// fall outside useradd's stock regex).
 #[must_use]
 pub fn is_valid_unix_username(name: &str) -> bool {
     if name.is_empty() || name.len() > 32 {
@@ -166,9 +168,9 @@ pub fn is_valid_unix_username(name: &str) -> bool {
         .next()
         .is_some_and(|c| c.is_ascii_lowercase() || c == '_');
     first_ok
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+        && name.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-' || c == '.'
+        })
 }
 
 // ============================================================================
@@ -424,18 +426,20 @@ mod tests {
 
     #[test]
     fn test_is_valid_unix_username_accepts() {
-        assert!(is_valid_unix_username("jplock"));
+        assert!(is_valid_unix_username("jdoe"));
         assert!(is_valid_unix_username("agent-42"));
         assert!(is_valid_unix_username("_svc"));
         assert!(is_valid_unix_username("a"));
+        assert!(is_valid_unix_username("first.last")); // dotted (first.last) logins
     }
 
     #[test]
     fn test_is_valid_unix_username_rejects() {
         assert!(!is_valid_unix_username(""));
-        assert!(!is_valid_unix_username("justin@plock.net"));
+        assert!(!is_valid_unix_username("jane@example.com"));
         assert!(!is_valid_unix_username("9lives"));
         assert!(!is_valid_unix_username("Justin"));
+        assert!(!is_valid_unix_username(".hidden")); // leading dot
         assert!(!is_valid_unix_username("a/../b"));
         assert!(!is_valid_unix_username(&"x".repeat(33)));
     }

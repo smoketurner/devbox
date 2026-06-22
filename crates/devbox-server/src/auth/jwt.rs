@@ -501,24 +501,28 @@ mod tests {
     #[test]
     fn username_from_email_takes_local_part() {
         assert_eq!(
-            username_from_email("justin@plock.net").as_deref(),
-            Some("justin")
+            username_from_email("jdoe@example.com").as_deref(),
+            Some("jdoe")
         );
     }
 
     #[test]
     fn username_from_email_lowercases_and_trims() {
         assert_eq!(
-            username_from_email("  Justin@example.com  ").as_deref(),
-            Some("justin")
+            username_from_email("  JDoe@example.com  ").as_deref(),
+            Some("jdoe")
         );
     }
 
     #[test]
-    fn username_from_email_rejects_non_conforming_local_part_without_collision() {
-        // Punctuation is never stripped, so `a.b` is rejected rather than mangled
-        // into `ab` (which would collide with a distinct `ab@` address).
-        assert_eq!(username_from_email("a.b@corp.com"), None);
+    fn username_from_email_allows_dots_without_collision() {
+        // Dots are kept (first.last logins), never stripped — so distinct local
+        // parts can't fold onto the same owner (a.b stays distinct from ab).
+        assert_eq!(
+            username_from_email("first.last@example.com").as_deref(),
+            Some("first.last")
+        );
+        assert_eq!(username_from_email("a.b@corp.com").as_deref(), Some("a.b"));
         assert_eq!(username_from_email("ab@corp.com").as_deref(), Some("ab"));
     }
 
@@ -526,6 +530,7 @@ mod tests {
     fn username_from_email_rejects_underiverable() {
         assert!(username_from_email("123@example.com").is_none()); // leading digit
         assert!(username_from_email("@example.com").is_none()); // empty local part
+        assert!(username_from_email("a+b@example.com").is_none()); // '+' not allowed
         let long = format!("{}@example.com", "a".repeat(33));
         assert!(username_from_email(&long).is_none()); // >32 chars, never truncated
     }
@@ -587,7 +592,7 @@ mod tests {
     fn token_algorithm_rejects_non_allowlisted() {
         // The test helper signs with HS256, which is not an accepted asymmetric
         // algorithm — token_algorithm must reject it.
-        let token = sign(json!({ "sub": "jplock", "iss": ISSUER, "exp": 9_999_999_999_u64 }));
+        let token = sign(json!({ "sub": "jdoe", "iss": ISSUER, "exp": 9_999_999_999_u64 }));
         assert!(token_algorithm(&token).is_err());
     }
 
