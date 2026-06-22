@@ -560,6 +560,11 @@ async fn submit_release(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
+    // Gate before loading the devbox so anonymous POSTs can't probe its
+    // existence/metadata (consistent with the GET routes and submit_claim).
+    if let Err(redirect) = require_login(&state, &headers).await {
+        return redirect;
+    }
     let doc = match state.store.get::<DevboxDoc>(&id).await {
         Ok(Some(doc)) => doc,
         Ok(None) => {
