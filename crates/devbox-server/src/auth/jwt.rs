@@ -8,6 +8,7 @@ use axum::http::HeaderMap;
 use axum::http::header::AUTHORIZATION;
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+use secrecy::{ExposeSecret, SecretString};
 
 /// Header the ALB injects with a signed JWT for OIDC-authenticated requests.
 const ALB_OIDC_DATA_HEADER: &str = "x-amzn-oidc-data";
@@ -32,12 +33,13 @@ pub struct AuthConfig {
 }
 
 /// OIDC Authorization Code parameters for the dashboard login flow.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct OidcConfig {
     /// Confidential client id of the Vouch dashboard app.
     pub client_id: String,
     /// Client secret for the dashboard app (used only in the token exchange).
-    pub client_secret: String,
+    /// `SecretString` redacts it in `Debug` output and zeroizes it on drop.
+    pub client_secret: SecretString,
     /// Authorization endpoint (e.g. `https://us.vouch.sh/oauth/authorize`).
     pub authorize_endpoint: String,
     /// Token endpoint (e.g. `https://us.vouch.sh/oauth/token`).
@@ -46,19 +48,6 @@ pub struct OidcConfig {
     pub redirect_uri: String,
     /// Scopes to request (e.g. `openid email`).
     pub scope: String,
-}
-
-impl fmt::Debug for OidcConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OidcConfig")
-            .field("client_id", &self.client_id)
-            .field("client_secret", &"<redacted>")
-            .field("authorize_endpoint", &self.authorize_endpoint)
-            .field("token_endpoint", &self.token_endpoint)
-            .field("redirect_uri", &self.redirect_uri)
-            .field("scope", &self.scope)
-            .finish()
-    }
 }
 
 /// The subset of an OAuth token response we use (the OIDC ID token).
@@ -275,7 +264,7 @@ impl Authenticator {
             .append_pair("code", code)
             .append_pair("redirect_uri", &oidc.redirect_uri)
             .append_pair("client_id", &oidc.client_id)
-            .append_pair("client_secret", &oidc.client_secret)
+            .append_pair("client_secret", oidc.client_secret.expose_secret())
             .finish();
 
         let resp = self
@@ -486,7 +475,7 @@ mod tests {
     fn test_oidc() -> OidcConfig {
         OidcConfig {
             client_id: "client-123".to_string(),
-            client_secret: "s3cr3t-do-not-leak".to_string(),
+            client_secret: SecretString::from("s3cr3t-do-not-leak".to_string()),
             authorize_endpoint: "https://us.vouch.sh/oauth/authorize".to_string(),
             token_endpoint: "https://us.vouch.sh/oauth/token".to_string(),
             redirect_uri: "https://cp.example/oauth2/idpresponse".to_string(),
@@ -516,7 +505,10 @@ mod tests {
     #[test]
     fn oidc_debug_redacts_secret() {
         let rendered = format!("{:?}", test_oidc());
-        assert!(rendered.contains("<redacted>"));
+        assert!(
+            rendered.contains("REDACTED"),
+            "expected a redaction marker: {rendered}"
+        );
         assert!(
             !rendered.contains("s3cr3t-do-not-leak"),
             "client_secret must not leak: {rendered}"

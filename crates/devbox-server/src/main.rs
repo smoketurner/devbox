@@ -8,6 +8,7 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use devbox_server::auth::{AuthConfig, Authenticator, OidcConfig};
+use secrecy::SecretString;
 use devbox_server::compute::ec2::Ec2;
 use devbox_server::db::{DocumentStore, Pool, PoolConfig};
 use devbox_server::reconcile::{ReconcilerConfig, spawn_reconciliation_loop};
@@ -180,7 +181,7 @@ fn build_oidc_config() -> Option<OidcConfig> {
 
     Some(OidcConfig {
         client_id,
-        client_secret,
+        client_secret: SecretString::from(client_secret),
         redirect_uri,
         authorize_endpoint: nonempty("AUTH_OIDC_AUTHORIZATION_ENDPOINT")
             .unwrap_or_else(|| "https://us.vouch.sh/oauth/authorize".to_string()),
