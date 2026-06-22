@@ -6,16 +6,21 @@ control-plane HTTP API to claim, release, inspect, and SSH into remote dev boxes
 ## Commands
 
 ```
-devbox claim   --owner <id> [--instance-type <t>]    # claim a Ready devbox
-devbox release --id <id> --owner <id>                # release a claimed devbox
+devbox claim   [--instance-type <t>]                 # claim a Ready devbox (owner from token)
+devbox release [--id <id>]                           # release a claimed devbox
 devbox list                                          # list all devboxes (table)
-devbox status  --id <id>                             # one devbox, key/value
-devbox ssh     --id <id> [--user <u>] [-- <cmd...>]  # SSH in over an SSM tunnel
+devbox status  [--id <id>]                           # one devbox, key/value
+devbox ssh     [--id <id>] [--user <u>] [-- <cmd...>] # SSH in over an SSM tunnel
 ```
 
 Global flags: `--server-url` (default `http://localhost:3000`) and `--token`
 (env `DEVBOX_TOKEN`) — a Vouch OIDC bearer token sent on API calls when the
-server has authentication enabled.
+server has authentication enabled. The token's `sub` claim determines the owner
+for `claim` and `release`; there is no `--owner` flag.
+
+The `--id` flag is optional for `release`, `status`, and `ssh`. The CLI remembers
+active claims locally; if you hold exactly one, it is used by default. With
+multiple active claims, you'll be prompted to select one (or pass `--id` explicitly).
 
 ## `devbox ssh`
 
