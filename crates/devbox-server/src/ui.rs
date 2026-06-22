@@ -178,13 +178,6 @@ struct CallbackQuery {
     error: Option<String>,
 }
 
-/// Query parameters on the login page. `error` is set when the callback redirects
-/// here after a failed sign-in (a clean URL with no authorization code).
-#[derive(serde::Deserialize)]
-struct LoginQuery {
-    error: Option<String>,
-}
-
 /// Whether app-side OIDC dashboard login is enabled.
 fn dashboard_login_enabled(state: &AppState) -> bool {
     state
@@ -234,27 +227,13 @@ async fn require_login(state: &AppState, headers: &HeaderMap) -> Result<Option<S
 /// redirect to the IdP.
 ///
 /// GET /login
-async fn login(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<LoginQuery>,
-) -> Response {
+async fn login(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let Some(auth) = state.auth.as_ref().filter(|a| a.oidc().is_some()) else {
         // Nothing to log into; already-valid sessions just go home.
         return Redirect::to("/").into_response();
     };
     if current_session(&state, &headers).await.is_some() {
         return Redirect::to("/").into_response();
-    }
-    // The callback redirects here with ?error after a failed sign-in. Show an
-    // error page instead of bouncing straight back to the IdP (which would loop
-    // on a persistent failure).
-    if query.error.is_some() {
-        return ErrorPageTemplate {
-            title: "Sign-in failed".to_string(),
-            message: "Sign-in did not complete. Please try again.".to_string(),
-        }
-        .into_response();
     }
     let csrf = match random_token() {
         Ok(token) => token,
@@ -296,7 +275,7 @@ async fn oauth_callback(
         tracing::warn!("dashboard sign-in failed: {reason}");
         (
             AppendHeaders([(header::SET_COOKIE, set_cookie(STATE_COOKIE, "", 0))]),
-            Redirect::to("/login?error=1"),
+            Redirect::to("/login/error"),
         )
             .into_response()
     };
@@ -334,6 +313,19 @@ async fn oauth_callback(
         .into_response()
 }
 
+/// Render the sign-in error page. The callback redirects here on failure so the
+/// one-time authorization code never lingers in the address bar; the page links
+/// back to the dashboard, which restarts the flow.
+///
+/// GET /login/error
+async fn login_error_page() -> Response {
+    ErrorPageTemplate {
+        title: "Sign-in failed".to_string(),
+        message: "Sign-in did not complete. Please try again.".to_string(),
+    }
+    .into_response()
+}
+
 /// Clear the session cookie.
 ///
 /// GET /logout
@@ -354,6 +346,7 @@ pub fn build_ui_router() -> Router<AppState> {
     Router::new()
         .route("/", get(dashboard))
         .route("/login", get(login))
+        .route("/login/error", get(login_error_page))
         .route("/oauth2/idpresponse", get(oauth_callback))
         .route("/logout", get(logout))
         .route("/devboxes/claim", get(claim_form).post(submit_claim))
