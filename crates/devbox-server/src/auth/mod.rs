@@ -1,12 +1,16 @@
-//! Request authentication for the control-plane API.
+//! Request authentication for the control-plane API and dashboard.
 //!
-//! The control plane sits behind an internal ALB that gates the dashboard with
-//! Vouch OIDC. Two identity sources are accepted, in order:
+//! Identity sources, in order:
 //!
-//! 1. `x-amzn-oidc-data` — the signed JWT the ALB injects on OIDC-authenticated
-//!    (dashboard) requests, verified against the ALB's regional public key.
+//! 1. `x-amzn-oidc-data` — the signed JWT an ALB injects on OIDC-authenticated
+//!    requests, verified against the ALB's regional public key (legacy / when
+//!    fronted by an ALB).
 //! 2. `Authorization: Bearer <jwt>` — a Vouch-issued token (the CLI / agents),
 //!    verified against Vouch's JWKS.
+//! 3. A `devbox_session` cookie holding a Vouch OIDC **ID token**, set by the
+//!    app-side Authorization Code login ([`Authenticator::authorize_url`],
+//!    [`Authenticator::exchange_code`], [`Authenticator::verify_id_token`]) and
+//!    used to gate the HTML dashboard when no ALB is in front of it.
 //!
 //! Either way we extract a single **principal** claim. Claim/release then bind
 //! `owner` to that principal, so a caller can only act as the identity they
@@ -14,4 +18,5 @@
 
 mod jwt;
 
-pub use jwt::{AuthConfig, AuthError, Authenticator, Principal};
+pub(crate) use jwt::random_token;
+pub use jwt::{AuthConfig, AuthError, Authenticator, OidcConfig, Principal};

@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
-use devbox_server::auth::{AuthConfig, Authenticator};
+use devbox_server::auth::{AuthConfig, Authenticator, OidcConfig};
 use devbox_server::compute::ec2::Ec2;
 use devbox_server::db::{DocumentStore, Pool, PoolConfig};
 use devbox_server::reconcile::{ReconcilerConfig, spawn_reconciliation_loop};
@@ -142,6 +142,7 @@ fn build_authenticator() -> Option<Arc<Authenticator>> {
         return None;
     }
 
+    let oidc = build_oidc_config();
     let config = AuthConfig {
         issuer: std::env::var("AUTH_OIDC_ISSUER")
             .unwrap_or_else(|_| "https://us.vouch.sh".to_string()),
@@ -153,13 +154,40 @@ fn build_authenticator() -> Option<Arc<Authenticator>> {
         principal_claim: std::env::var("AUTH_PRINCIPAL_CLAIM")
             .unwrap_or_else(|_| "sub".to_string()),
         alb_region: std::env::var("AWS_REGION").ok().filter(|s| !s.is_empty()),
+        oidc,
     };
     tracing::info!(
         issuer = %config.issuer,
         principal_claim = %config.principal_claim,
+        dashboard_login = config.oidc.is_some(),
         "API authentication enabled"
     );
     Some(Arc::new(Authenticator::new(config)))
+}
+
+/// Build the dashboard OIDC login config from the environment.
+///
+/// Returns `Some` only when `AUTH_OIDC_CLIENT_ID`, `AUTH_OIDC_CLIENT_SECRET`,
+/// and `AUTH_OIDC_REDIRECT_URI` are all set; otherwise the dashboard is left
+/// ungated (e.g. local dev, or when an ALB does the OIDC gating). Endpoints and
+/// scope default to Vouch.
+fn build_oidc_config() -> Option<OidcConfig> {
+    let nonempty = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
+
+    let client_id = nonempty("AUTH_OIDC_CLIENT_ID")?;
+    let client_secret = nonempty("AUTH_OIDC_CLIENT_SECRET")?;
+    let redirect_uri = nonempty("AUTH_OIDC_REDIRECT_URI")?;
+
+    Some(OidcConfig {
+        client_id,
+        client_secret,
+        redirect_uri,
+        authorize_endpoint: nonempty("AUTH_OIDC_AUTHORIZATION_ENDPOINT")
+            .unwrap_or_else(|| "https://us.vouch.sh/oauth/authorize".to_string()),
+        token_endpoint: nonempty("AUTH_OIDC_TOKEN_ENDPOINT")
+            .unwrap_or_else(|| "https://us.vouch.sh/oauth/token".to_string()),
+        scope: nonempty("AUTH_OIDC_SCOPE").unwrap_or_else(|| "openid email".to_string()),
+    })
 }
 
 /// Wait for shutdown signal (Ctrl+C).
