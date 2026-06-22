@@ -415,18 +415,17 @@ fn decode_owner(
     Ok((owner, email.to_string()))
 }
 
-/// Derive a Unix-safe login from an email: the local part (before `@`),
-/// lowercased, with characters outside `[a-z0-9_-]` dropped, truncated to 32.
-/// Returns `None` if the result isn't a valid Unix username.
+/// Derive a Unix login from an email: the local part (before `@`), surrounding
+/// whitespace trimmed and lowercased. Returns `None` unless that is already a
+/// valid Unix username.
+///
+/// Only surrounding whitespace is trimmed; internal characters are never
+/// stripped and the result is never truncated — a non-conforming local part is
+/// rejected, not mangled — so distinct local parts can never collide on the same
+/// `owner` (which would let one user act on another's devboxes).
 fn username_from_email(email: &str) -> Option<String> {
-    let local = email.split('@').next()?;
-    let mut name: String = local
-        .to_ascii_lowercase()
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .collect();
-    name.truncate(32);
-    is_valid_unix_username(&name).then_some(name)
+    let local = email.trim().split('@').next()?.trim().to_ascii_lowercase();
+    is_valid_unix_username(&local).then_some(local)
 }
 
 #[cfg(test)]
@@ -508,17 +507,27 @@ mod tests {
     }
 
     #[test]
-    fn username_from_email_sanitizes_and_lowercases() {
+    fn username_from_email_lowercases_and_trims() {
         assert_eq!(
-            username_from_email("Justin.Plock@example.com").as_deref(),
-            Some("justinplock")
+            username_from_email("  Justin@example.com  ").as_deref(),
+            Some("justin")
         );
     }
 
     #[test]
+    fn username_from_email_rejects_non_conforming_local_part_without_collision() {
+        // Punctuation is never stripped, so `a.b` is rejected rather than mangled
+        // into `ab` (which would collide with a distinct `ab@` address).
+        assert_eq!(username_from_email("a.b@corp.com"), None);
+        assert_eq!(username_from_email("ab@corp.com").as_deref(), Some("ab"));
+    }
+
+    #[test]
     fn username_from_email_rejects_underiverable() {
-        assert!(username_from_email("123@example.com").is_none());
-        assert!(username_from_email("@example.com").is_none());
+        assert!(username_from_email("123@example.com").is_none()); // leading digit
+        assert!(username_from_email("@example.com").is_none()); // empty local part
+        let long = format!("{}@example.com", "a".repeat(33));
+        assert!(username_from_email(&long).is_none()); // >32 chars, never truncated
     }
 
     fn base_config(oidc: Option<OidcConfig>) -> AuthConfig {
