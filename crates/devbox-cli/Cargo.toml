@@ -19,6 +19,7 @@ clap = { workspace = true, features = ["std", "help", "usage", "error-context", 
 devbox-common = { path = "../devbox-common" }
 dialoguer = { workspace = true }
 jsonwebtoken = { workspace = true, features = ["aws_lc_rs"] }
+open = { workspace = true }
 reqwest = { workspace = true, features = ["json", "form", "rustls"] }
 serde = { workspace = true, features = ["std", "derive"] }
 serde_json = { workspace = true, features = ["std"] }

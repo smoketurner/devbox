@@ -15,21 +15,33 @@ use dialoguer::Select;
 
 use devbox_common::{ClaimRequest, DevboxListResponse, DevboxResponse, DevboxState, InstanceType};
 
+/// Default server used before the first `devbox login` (and when no
+/// `--server`/`$DEVBOX_SERVER` is given and none has been remembered).
+const DEFAULT_SERVER: &str = "http://localhost:3000";
+
 /// Devbox CLI - manage remote development environments.
 #[derive(Parser)]
 #[command(name = "devbox", version, about)]
 struct Cli {
-    /// Server URL to connect to.
-    #[arg(
-        long,
-        default_value = "http://localhost:3000",
-        global = true,
-        env = "DEVBOX_SERVER"
-    )]
-    server: String,
+    /// Server URL to connect to. Defaults to the server from your last
+    /// `devbox login`, then to http://localhost:3000.
+    #[arg(long, global = true, env = "DEVBOX_SERVER")]
+    server: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
+}
+
+/// Resolve the server to talk to: an explicit `--server`/`$DEVBOX_SERVER`, else
+/// the server remembered from the last `devbox login`, else [`DEFAULT_SERVER`].
+fn resolve_server(explicit: Option<String>) -> Result<String> {
+    if let Some(server) = explicit {
+        return Ok(server);
+    }
+    if let Some(server) = session::current_server()? {
+        return Ok(server);
+    }
+    Ok(DEFAULT_SERVER.to_string())
 }
 
 /// Attach a Bearer token to a request when one is present.
@@ -103,11 +115,11 @@ fn resolve_id(explicit: Option<String>, server: &str) -> Result<String> {
 ///
 /// Authentication is mandatory: the server binds `owner` to the authenticated
 /// principal, so claim/release always need a valid token.
-fn require_token() -> Result<String> {
-    let Some(session) = session::current()? else {
-        bail!("not logged in; run `devbox login`")
+fn require_token(server: &str) -> Result<String> {
+    let Some(session) = session::current(server)? else {
+        bail!("not logged in to {server}; run `devbox login`")
     };
-    Ok(session.id_token)
+    Ok(session.token)
 }
 
 /// Record a freshly claimed devbox in the local registry. Best-effort: the box is
@@ -207,21 +219,22 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let http = reqwest::Client::new();
+    let server = resolve_server(cli.server)?;
 
     match cli.command {
         Commands::Login => {
-            let s = auth::login(&http, &cli.server).await?;
-            println!("logged in as {} ({})", s.owner, s.email);
+            let s = auth::login(&http, &server).await?;
+            println!("logged in as {} ({}) on {server}", s.owner, s.email);
         }
 
         Commands::Logout => {
-            session::logout()?;
-            println!("logged out");
+            session::logout(&server)?;
+            println!("logged out of {server}");
         }
 
         Commands::Claim { instance_type } => {
-            let token = require_token()?;
-            let url = format!("{}/api/v1/devboxes/claim", cli.server);
+            let token = require_token(&server)?;
+            let url = format!("{server}/api/v1/devboxes/claim");
             let req = ClaimRequest {
                 instance_type: instance_type.map(InstanceType),
             };
@@ -233,7 +246,7 @@ async fn main() -> Result<()> {
             if resp.status().is_success() {
                 let devbox: DevboxResponse =
                     resp.json().await.context("failed to parse response")?;
-                remember_claim(&devbox, &cli.server);
+                remember_claim(&devbox, &server);
                 println!("{}", format::format_claim_success(&devbox));
             } else {
                 let status = resp.status();
@@ -244,9 +257,9 @@ async fn main() -> Result<()> {
         }
 
         Commands::Release { id } => {
-            let token = require_token()?;
-            let id = resolve_id(id, &cli.server)?;
-            let url = format!("{}/api/v1/devboxes/{}/release", cli.server, id);
+            let token = require_token(&server)?;
+            let id = resolve_id(id, &server)?;
+            let url = format!("{server}/api/v1/devboxes/{id}/release");
             let resp = with_auth(http.post(&url), Some(&token))
                 .send()
                 .await
@@ -255,7 +268,7 @@ async fn main() -> Result<()> {
             if resp.status().is_success() {
                 let devbox: DevboxResponse =
                     resp.json().await.context("failed to parse response")?;
-                forget_claim(&id, &cli.server);
+                forget_claim(&id, &server);
                 println!("{}", format::format_release_success(&devbox));
             } else {
                 let status = resp.status();
@@ -269,9 +282,9 @@ async fn main() -> Result<()> {
             // Reads are open; a missing or unreadable session must not block them,
             // so attach a token only if one is cleanly available (best-effort). The
             // same session's owner gates reconcile so we never prune ownership-blind.
-            let session = session::current().ok().flatten();
-            let token = session.as_ref().map(|s| s.id_token.clone());
-            let url = format!("{}/api/v1/devboxes", cli.server);
+            let session = session::current(&server).ok().flatten();
+            let token = session.as_ref().map(|s| s.token.clone());
+            let url = format!("{server}/api/v1/devboxes");
             let resp = with_auth(http.get(&url), token.as_deref())
                 .send()
                 .await
@@ -281,7 +294,7 @@ async fn main() -> Result<()> {
                 let list: DevboxListResponse =
                     resp.json().await.context("failed to parse response")?;
                 if let Some(session) = &session {
-                    reconcile_claims(&list, &cli.server, &session.owner);
+                    reconcile_claims(&list, &server, &session.owner);
                 }
                 if list.devboxes.is_empty() {
                     println!("No devboxes found.");
@@ -299,9 +312,9 @@ async fn main() -> Result<()> {
         Commands::Status { id } => {
             // Reads are open; a missing or unreadable session must not block them,
             // so attach a token only if one is cleanly available (best-effort).
-            let token = session::current().ok().flatten().map(|s| s.id_token);
-            let id = resolve_id(id, &cli.server)?;
-            let url = format!("{}/api/v1/devboxes/{}", cli.server, id);
+            let token = session::current(&server).ok().flatten().map(|s| s.token);
+            let id = resolve_id(id, &server)?;
+            let url = format!("{server}/api/v1/devboxes/{id}");
             let resp = with_auth(http.get(&url), token.as_deref())
                 .send()
                 .await
@@ -329,9 +342,9 @@ async fn main() -> Result<()> {
         } => {
             // Reads are open; a missing or unreadable session must not block them,
             // so attach a token only if one is cleanly available (best-effort).
-            let token = session::current().ok().flatten().map(|s| s.id_token);
-            let id = resolve_id(id, &cli.server)?;
-            let url = format!("{}/api/v1/devboxes/{}", cli.server, id);
+            let token = session::current(&server).ok().flatten().map(|s| s.token);
+            let id = resolve_id(id, &server)?;
+            let url = format!("{server}/api/v1/devboxes/{id}");
             let resp = with_auth(http.get(&url), token.as_deref())
                 .send()
                 .await

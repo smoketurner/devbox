@@ -187,12 +187,21 @@ mutating call maps to an identity. The CLI authenticates via **device-code OAuth
 (RFC 8628) + anonymous Dynamic Client Registration (RFC 7591)**: `devbox login`
 discovers the authorization server from `GET
 /.well-known/oauth-protected-resource` (RFC 9728), self-registers a public
-client with Vouch, and caches the resulting `id_token` under
-`~/.config/devbox/session.json`. Subsequent `claim`/`release` send it as a
+client with Vouch, and caches the resulting **`access_token`** in
+`~/.config/devbox/config.json`, **scoped per server** (keyed by hostname, like
+the Vouch CLI) so several servers stay logged in at once; that login also
+records the server as `current_server`, so subsequent commands default to it and
+`--server` only needs to be passed to target a different one (precedence:
+`--server`/`$DEVBOX_SERVER` → remembered `current_server` →
+`http://localhost:3000`). The device-code grant returns a standard OAuth
+2.0 token response (RFC 8628 §3.5), whose token is an `access_token` — not an
+OIDC `id_token`; Vouch issues a JWKS-verifiable RFC 9068 access token carrying
+the `email` claim (the same token type the Vouch CLI's FIDO2 grant uses).
+Subsequent `claim`/`release` send it as a
 `Bearer` token (no token → the CLI errors "run `devbox login`"). The server also
 accepts an ALB's `x-amzn-oidc-data` header (legacy path when fronted by an ALB).
 Both paths are verified against the Vouch JWKS (issuer + signature + `email`
-claim). **Security boundary:** any valid, unexpired Vouch `id_token` with an
+claim). **Security boundary:** any valid, unexpired Vouch token with an
 `email` claim is accepted; **audience is intentionally not validated** because
 each DCR-registered CLI install gets its own `aud` value (= its own `client_id`),
 so there is no single audience to pin — there is no audience config knob (a

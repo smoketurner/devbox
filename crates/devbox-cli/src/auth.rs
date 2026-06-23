@@ -16,6 +16,7 @@
 //! The server is a pure OAuth *resource server*; all OAuth interactions (steps
 //! 2–5) are between the CLI and Vouch directly.
 
+use std::io::IsTerminal;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -73,7 +74,7 @@ pub(crate) async fn login(client: &reqwest::Client, server: &str) -> Result<Sess
     // re-register step (forget → register → cache the new client_id) is injected
     // so it stays out of the pure device-flow loop and never touches disk in
     // tests.
-    let id_token = device_flow_with_retry(client, &disco, &client_id, &scope, async || {
+    let token = device_flow_with_retry(client, &disco, &client_id, &scope, async || {
         session::forget_client()?;
         let new_id = register_client(client, &disco).await?;
         session::save_client(&Client {
@@ -84,7 +85,7 @@ pub(crate) async fn login(client: &reqwest::Client, server: &str) -> Result<Sess
     })
     .await?;
 
-    let session = Session::from_id_token(id_token)?;
+    let session = Session::from_token(token)?;
     // A freshly minted token that is already expired means a badly skewed clock;
     // fail loudly rather than write a session that `current()` immediately treats
     // as logged-out (so "logged in as ..." can never contradict the next command).
@@ -94,7 +95,7 @@ pub(crate) async fn login(client: &reqwest::Client, server: &str) -> Result<Sess
              check this machine's clock and try again"
         );
     }
-    session::save_session(&session)?;
+    session::save_session(server, &session)?;
     Ok(session)
 }
 
@@ -107,7 +108,7 @@ pub(crate) async fn login(client: &reqwest::Client, server: &str) -> Result<Sess
 /// `poll_for_token`'s own loop and never surfaced to the caller.
 #[derive(Debug)]
 enum PollOutcome {
-    /// User approved; contains the `id_token`.
+    /// User approved; contains the bearer `access_token`.
     Approved(String),
     /// User denied.
     Denied,
@@ -267,7 +268,8 @@ async fn request_device_code(
         .with_context(|| format!("parse device authorization response from {url}"))
 }
 
-/// Print the user prompt (to stderr so stdout stays scriptable).
+/// Print the user prompt (to stderr so stdout stays scriptable) and, in an
+/// interactive terminal, open the verification page in the user's browser.
 fn print_user_prompt(device: &DeviceAuthResponse) {
     eprintln!();
     eprintln!("Open the following URL and enter the code to authorize devbox:");
@@ -280,6 +282,22 @@ fn print_user_prompt(device: &DeviceAuthResponse) {
         eprintln!("  {complete}");
     }
     eprintln!();
+
+    // Best-effort browser launch, only when stderr is a TTY (skipped in scripts,
+    // CI, headless hosts, and tests). Prefer the one-step link — it carries the
+    // code so Vouch can pre-fill it — and fall back to the plain page. Any
+    // failure is silent: the URL and code are already printed above.
+    if std::io::stderr().is_terminal() {
+        let target = device
+            .verification_uri_complete
+            .as_deref()
+            .unwrap_or(&device.verification_uri);
+        if open::that_detached(target).is_ok() {
+            eprintln!("Opening your browser...");
+            eprintln!();
+        }
+    }
+
     eprintln!("Approving the code runs Vouch SSO + your FIDO2/YubiKey.");
     eprintln!();
 }
@@ -340,15 +358,15 @@ async fn poll_for_token(
             .with_context(|| format!("parse token endpoint response from {url}"))?;
 
         if status.is_success() {
-            let id_token = body
-                .get("id_token")
+            let access_token = body
+                .get("access_token")
                 .and_then(serde_json::Value::as_str)
                 .context(
-                    "Vouch returned no id_token for the device grant; \
-                     ensure the 'openid' scope is requested and the authorization \
-                     server issues id_tokens for device-code grants",
+                    "the token endpoint returned no access_token for the device grant; \
+                     the device-code grant must return a bearer access token carrying \
+                     an 'email' claim",
                 )?;
-            return Ok(PollOutcome::Approved(id_token.to_string()));
+            return Ok(PollOutcome::Approved(access_token.to_string()));
         }
 
         // Non-2xx: read the `error` field (critic item 3 — must not panic or
@@ -495,7 +513,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 1: authorization_pending → continue, eventually returns id_token
+    // Test 1: authorization_pending → continue, eventually returns access_token
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -517,7 +535,7 @@ mod tests {
                         )
                             .into_response()
                     } else {
-                        Json(json!({"id_token": "tok.abc.def"})).into_response()
+                        Json(json!({"access_token": "tok.abc.def"})).into_response()
                     }
                 }
             }),
@@ -540,7 +558,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 2: slow_down → interval +5, continue, eventually returns id_token
+    // Test 2: slow_down → interval +5, continue, eventually returns access_token
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -561,7 +579,7 @@ mod tests {
                         )
                             .into_response()
                     } else {
-                        Json(json!({"id_token": "tok.slow.ok"})).into_response()
+                        Json(json!({"access_token": "tok.slow.ok"})).into_response()
                     }
                 }
             }),
@@ -756,16 +774,16 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 8: missing id_token on 200 → clear error mentioning "id_token"
+    // Test 8: missing access_token on 200 → clear error mentioning "access_token"
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn poll_missing_id_token_returns_error() {
+    async fn poll_missing_access_token_returns_error() {
         let router = axum::Router::new().route(
             "/token",
             post(|| async {
-                // 200 OK but body has no id_token field.
-                Json(json!({"access_token": "at123", "token_type": "Bearer"})).into_response()
+                // 200 OK but body has no access_token field.
+                Json(json!({"token_type": "Bearer", "expires_in": 3600})).into_response()
             }),
         );
 
@@ -774,11 +792,14 @@ mod tests {
         let device = dev(&base, 0, 30);
 
         let result = poll_for_token(&http(), &d, "client1", &device).await;
-        assert!(result.is_err(), "expected error when id_token is missing");
+        assert!(
+            result.is_err(),
+            "expected error when access_token is missing"
+        );
         let msg = format!("{:#}", result.unwrap_err());
         assert!(
-            msg.contains("id_token"),
-            "error should mention id_token, got: {msg}"
+            msg.contains("access_token"),
+            "error should mention access_token, got: {msg}"
         );
     }
 
