@@ -65,9 +65,19 @@ impl From<anyhow::Error> for AppError {
 }
 
 /// Authentication failures map to 401.
+///
+/// `AuthError::Invalid` wraps third-party error text (JWKS/ALB fetch failures,
+/// `jsonwebtoken` internals) that must not reach API clients. Log the detail for
+/// operators and return a static, generic message — the same split
+/// `AppError::Internal` uses.
 impl From<crate::auth::AuthError> for AppError {
     fn from(err: crate::auth::AuthError) -> Self {
-        Self::Unauthorized(err.to_string())
+        tracing::warn!("auth error: {err}");
+        let msg = match err {
+            crate::auth::AuthError::Missing => "no authentication credential",
+            crate::auth::AuthError::Invalid(_) => "invalid authentication credential",
+        };
+        Self::Unauthorized(msg.to_string())
     }
 }
 
@@ -87,5 +97,50 @@ where
             Ok(axum::Json(value)) => Ok(JsonBody(value)),
             Err(rejection) => Err(AppError::BadRequest(rejection.body_text())),
         }
+    }
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test code: panic on assertion failure is acceptable"
+)]
+mod tests {
+    use super::*;
+    use crate::auth::AuthError;
+
+    async fn body_error(err: AppError) -> (StatusCode, String) {
+        let response = err.into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let error = parsed
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .to_string();
+        (status, error)
+    }
+
+    #[tokio::test]
+    async fn invalid_auth_error_is_sanitized() {
+        let leaky = AuthError::Invalid(
+            "fetch JWKS: error sending request for url (https://us.vouch.sh/oauth/jwks)"
+                .to_string(),
+        );
+        let (status, body) = body_error(AppError::from(leaky)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, "invalid authentication credential");
+        assert!(!body.contains("vouch.sh"));
+        assert!(!body.contains("JWKS"));
+    }
+
+    #[tokio::test]
+    async fn missing_auth_error_is_generic() {
+        let (status, body) = body_error(AppError::from(AuthError::Missing)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, "no authentication credential");
     }
 }
