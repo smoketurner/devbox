@@ -24,6 +24,11 @@ pub struct AuthConfig {
     pub jwks_uri: String,
     /// Region whose ALB public keys verify `x-amzn-oidc-data` (e.g. `us-east-1`).
     pub alb_region: Option<String>,
+    /// Expected `signer` (the ALB's ARN) on `x-amzn-oidc-data` tokens. The ALB
+    /// public-key endpoint serves every ALB in the region, so without pinning the
+    /// signer any ALB in the account/region could mint an accepted token. When an
+    /// ALB header is present but this is unset, verification fails closed.
+    pub alb_arn: Option<String>,
     /// OIDC Authorization Code settings for the browser dashboard login. `None`
     /// leaves the dashboard ungated (the API bearer path is unaffected).
     pub oidc: Option<OidcConfig>,
@@ -125,6 +130,7 @@ impl Authenticator {
             issuer: "https://us.vouch.sh".to_string(),
             jwks_uri: "https://us.vouch.sh/oauth/jwks".to_string(),
             alb_region: None,
+            alb_arn: None,
             oidc: None,
         });
         auth.test_owner = Some(owner.to_string());
@@ -181,7 +187,22 @@ impl Authenticator {
     }
 
     /// Verify an ALB `x-amzn-oidc-data` JWT against the ALB's regional key.
+    ///
+    /// Pins the token's `signer` (the issuing ALB's ARN) to the configured
+    /// `alb_arn` before trusting it: the regional public-key endpoint serves every
+    /// ALB in the region, so the signature alone does not prove *which* ALB signed
+    /// the token. Fails closed when `alb_arn` is unconfigured.
     async fn verify_alb(&self, token: &str) -> Result<Principal, AuthError> {
+        let expected_arn = self
+            .config
+            .alb_arn
+            .as_deref()
+            .ok_or_else(|| AuthError::Invalid("ALB signer not configured".to_string()))?;
+        let signer = alb_signer(token)?;
+        if signer != expected_arn {
+            return Err(AuthError::Invalid("unexpected ALB signer".to_string()));
+        }
+
         let kid = key_id(token)?;
         let key = self.alb_key(&kid).await?;
 
@@ -400,6 +421,31 @@ fn key_id(token: &str) -> Result<String, AuthError> {
         .ok_or_else(|| AuthError::Invalid("token header missing kid".to_string()))
 }
 
+/// Read the `signer` (issuing ALB ARN) from an `x-amzn-oidc-data` token header.
+///
+/// `signer` is an ALB-specific header field that `jsonwebtoken`'s `Header` type
+/// drops, so decode the header segment directly: base64url-decode the first
+/// dot-separated part and read its `signer` string.
+fn alb_signer(token: &str) -> Result<String, AuthError> {
+    use base64::Engine as _;
+
+    let header_b64 = token
+        .split('.')
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AuthError::Invalid("malformed ALB token".to_string()))?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(header_b64)
+        .map_err(|e| AuthError::Invalid(format!("bad ALB token header: {e}")))?;
+    let header: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| AuthError::Invalid(format!("bad ALB token header: {e}")))?;
+    header
+        .get("signer")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| AuthError::Invalid("ALB token header missing signer".to_string()))
+}
+
 /// Read a token's signing algorithm, restricted to the asymmetric algorithms
 /// Vouch issues (`RS256`, `ES256`).
 ///
@@ -523,8 +569,53 @@ mod tests {
             issuer: ISSUER.to_string(),
             jwks_uri: "https://us.vouch.sh/oauth/jwks".to_string(),
             alb_region: None,
+            alb_arn: None,
             oidc,
         }
+    }
+
+    fn alb_config(alb_arn: Option<&str>) -> AuthConfig {
+        let mut config = base_config(None);
+        config.alb_arn = alb_arn.map(str::to_string);
+        config
+    }
+
+    /// Mint a token whose header carries `signer`. Payload and signature are
+    /// placeholders — `alb_signer`/`verify_alb`'s signer check reads only the
+    /// header and runs before any payload decode or network key fetch.
+    fn alb_token_with_signer(signer: &str) -> String {
+        use base64::Engine as _;
+        let header = json!({ "alg": "ES256", "kid": "kid-1", "signer": signer, "typ": "JWT" });
+        let header_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&header).unwrap());
+        format!("{header_b64}.eyJlbWFpbCI6Impkb2VAZXhhbXBsZS5jb20ifQ.sig")
+    }
+
+    const ALB_ARN: &str =
+        "arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/app/cp/abc123";
+
+    #[test]
+    fn alb_signer_reads_header_field() {
+        let token = alb_token_with_signer(ALB_ARN);
+        assert_eq!(alb_signer(&token).unwrap(), ALB_ARN);
+    }
+
+    #[tokio::test]
+    async fn verify_alb_rejects_unexpected_signer() {
+        let auth = Authenticator::new(alb_config(Some(ALB_ARN)));
+        let token = alb_token_with_signer(
+            "arn:aws:elasticloadbalancing:us-east-1:999:loadbalancer/app/evil/x",
+        );
+        let err = auth.verify_alb(&token).await.unwrap_err();
+        assert!(matches!(err, AuthError::Invalid(msg) if msg == "unexpected ALB signer"));
+    }
+
+    #[tokio::test]
+    async fn verify_alb_fails_closed_without_configured_arn() {
+        let auth = Authenticator::new(alb_config(None));
+        let token = alb_token_with_signer(ALB_ARN);
+        let err = auth.verify_alb(&token).await.unwrap_err();
+        assert!(matches!(err, AuthError::Invalid(msg) if msg == "ALB signer not configured"));
     }
 
     fn test_oidc() -> OidcConfig {

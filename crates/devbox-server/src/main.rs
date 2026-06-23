@@ -144,6 +144,7 @@ fn build_authenticator() -> Arc<Authenticator> {
         jwks_uri: std::env::var("AUTH_OIDC_JWKS_URI")
             .unwrap_or_else(|_| "https://us.vouch.sh/oauth/jwks".to_string()),
         alb_region: std::env::var("AWS_REGION").ok().filter(|s| !s.is_empty()),
+        alb_arn: std::env::var("AUTH_ALB_ARN").ok().filter(|s| !s.is_empty()),
         oidc,
     };
     tracing::info!(
