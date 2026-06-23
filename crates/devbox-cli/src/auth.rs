@@ -69,10 +69,31 @@ pub(crate) async fn login(client: &reqwest::Client, server: &str) -> Result<Sess
         prm.scopes_supported.join(" ")
     };
 
-    // Steps 4 + 5, with one bounded retry on invalid_client.
-    let id_token = device_flow_with_retry(client, &disco, &issuer, &client_id, &scope).await?;
+    // Steps 4 + 5, with one bounded retry on invalid_client. On rejection the
+    // re-register step (forget → register → cache the new client_id) is injected
+    // so it stays out of the pure device-flow loop and never touches disk in
+    // tests.
+    let id_token = device_flow_with_retry(client, &disco, &client_id, &scope, async || {
+        session::forget_client()?;
+        let new_id = register_client(client, &disco).await?;
+        session::save_client(&Client {
+            issuer: issuer.clone(),
+            client_id: new_id.clone(),
+        })?;
+        Ok(new_id)
+    })
+    .await?;
 
     let session = Session::from_id_token(id_token)?;
+    // A freshly minted token that is already expired means a badly skewed clock;
+    // fail loudly rather than write a session that `current()` immediately treats
+    // as logged-out (so "logged in as ..." can never contradict the next command).
+    if session.is_expired() {
+        bail!(
+            "the authorization server returned an already-expired token; \
+             check this machine's clock and try again"
+        );
+    }
     session::save_session(&session)?;
     Ok(session)
 }
@@ -368,9 +389,9 @@ async fn poll_for_token(
 async fn device_flow_with_retry(
     http: &reqwest::Client,
     disco: &OidcDiscovery,
-    issuer: &str,
     initial_client_id: &str,
     scope: &str,
+    mut reregister: impl AsyncFnMut() -> Result<String>,
 ) -> Result<String> {
     // Use a bounded loop (max 2 iterations) to prevent an infinite re-register
     // cycle (critic item 4).
@@ -393,13 +414,7 @@ async fn device_flow_with_retry(
                 }
                 already_reregistered = true;
                 eprintln!("The registered client was rejected; re-registering...");
-                session::forget_client()?;
-                let new_id = register_client(http, disco).await?;
-                session::save_client(&Client {
-                    issuer: issuer.to_string(),
-                    client_id: new_id.clone(),
-                })?;
-                client_id = new_id;
+                client_id = reregister().await?;
                 // Loop: request a NEW device_code with the new client_id.
             }
 
@@ -638,11 +653,8 @@ mod tests {
                         .into_response()
                 }),
             )
-            // /register and /device are needed by device_flow_with_retry.
-            .route(
-                "/register",
-                post(|| async { Json(json!({"client_id": "new-client"})).into_response() }),
-            )
+            // /device supplies a fresh code each loop; re-registration is injected,
+            // so no /register route is needed.
             .route(
                 "/device",
                 post(|| async {
@@ -660,10 +672,23 @@ mod tests {
         let base = serve(router).await;
         let d = disco(&base);
 
-        // Two invalid_client responses → device_flow_with_retry should bail on the second.
+        // Two invalid_client responses → device_flow_with_retry should bail on the
+        // second. The re-register step is injected (returns a canned id) so the
+        // test never touches the real ~/.config/devbox/client.json.
+        let reregisters = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&reregisters);
         let result =
-            device_flow_with_retry(&http(), &d, "test-issuer", "old-client", "openid email").await;
+            device_flow_with_retry(&http(), &d, "old-client", "openid email", async move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok("new-client".to_string())
+            })
+            .await;
         assert!(result.is_err(), "expected error on second invalid_client");
+        assert_eq!(
+            reregisters.load(Ordering::SeqCst),
+            1,
+            "re-register must run exactly once (bounded retry)"
+        );
         let msg = format!("{:#}", result.unwrap_err());
         assert!(
             msg.contains("rejected")

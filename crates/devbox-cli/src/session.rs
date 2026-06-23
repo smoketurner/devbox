@@ -231,7 +231,7 @@ impl Session {
     }
 
     /// Whether this session has expired.
-    fn is_expired(&self) -> bool {
+    pub(crate) fn is_expired(&self) -> bool {
         // Mirror state.rs:155-158 — use SystemTime/UNIX_EPOCH, no new dep.
         // A clock-before-epoch Err is treated as expired (fail-safe).
         let now_secs = SystemTime::now()
@@ -351,6 +351,21 @@ mod tests {
         assert_eq!(session.owner, "jane");
         assert_eq!(session.email, "jane@example.com");
         assert_eq!(session.expires_at, exp);
+    }
+
+    #[test]
+    fn is_expired_reflects_exp_claim() {
+        // A past `exp` is expired; a far-future one is not. This is the property
+        // `login` checks before persisting a freshly minted session.
+        let past =
+            Session::from_id_token(sign(json!({ "email": "j@x.com", "exp": 1_i64 }))).unwrap();
+        assert!(past.is_expired(), "a token with exp=1 must be expired");
+
+        let future = Session::from_id_token(sign(
+            json!({ "email": "j@x.com", "exp": 9_999_999_999_i64 }),
+        ))
+        .unwrap();
+        assert!(!future.is_expired(), "a far-future exp must not be expired");
     }
 
     #[test]

@@ -256,7 +256,9 @@ async fn main() -> Result<()> {
         }
 
         Commands::List => {
-            let token = session::current()?.map(|s| s.id_token);
+            // Reads are open; a missing or unreadable session must not block them,
+            // so attach a token only if one is cleanly available (best-effort).
+            let token = session::current().ok().flatten().map(|s| s.id_token);
             let url = format!("{}/api/v1/devboxes", cli.server);
             let resp = with_auth(http.get(&url), token.as_deref())
                 .send()
@@ -281,7 +283,9 @@ async fn main() -> Result<()> {
         }
 
         Commands::Status { id } => {
-            let token = session::current()?.map(|s| s.id_token);
+            // Reads are open; a missing or unreadable session must not block them,
+            // so attach a token only if one is cleanly available (best-effort).
+            let token = session::current().ok().flatten().map(|s| s.id_token);
             let id = resolve_id(id, &cli.server)?;
             let url = format!("{}/api/v1/devboxes/{}", cli.server, id);
             let resp = with_auth(http.get(&url), token.as_deref())
@@ -309,7 +313,9 @@ async fn main() -> Result<()> {
             print,
             args,
         } => {
-            let token = session::current()?.map(|s| s.id_token);
+            // Reads are open; a missing or unreadable session must not block them,
+            // so attach a token only if one is cleanly available (best-effort).
+            let token = session::current().ok().flatten().map(|s| s.id_token);
             let id = resolve_id(id, &cli.server)?;
             let url = format!("{}/api/v1/devboxes/{}", cli.server, id);
             let resp = with_auth(http.get(&url), token.as_deref())
