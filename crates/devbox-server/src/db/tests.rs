@@ -25,7 +25,7 @@ mod store_tests {
 
     fn sample_devbox() -> DevboxDoc {
         DevboxDoc {
-            instance_id: Some("i-1234567890abcdef0".to_string()),
+            instance_id: "i-1234567890abcdef0".to_string(),
             state: DevboxState::Ready,
             instance_type: InstanceType("m5.large".to_string()),
             ami_id: AmiId("ami-12345678".to_string()),
@@ -91,7 +91,7 @@ mod store_tests {
         // Insert two ready devboxes
         let doc1 = sample_devbox();
         let mut doc2 = sample_devbox();
-        doc2.instance_id = Some("i-different".to_string());
+        doc2.instance_id = "i-different".to_string();
 
         store.insert(&doc1).await.unwrap();
         store.insert(&doc2).await.unwrap();
@@ -191,7 +191,7 @@ mod store_tests {
 
         let doc1 = sample_devbox();
         let mut doc2 = sample_devbox();
-        doc2.instance_id = Some("i-second".to_string());
+        doc2.instance_id = "i-second".to_string();
 
         store.insert(&doc1).await.unwrap();
         store.insert(&doc2).await.unwrap();

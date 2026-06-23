@@ -9,8 +9,9 @@ use devbox_common::{AmiId, DevboxState, InstanceType, SubnetId};
 /// A devbox instance document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DevboxDoc {
-    /// EC2 instance ID (set after launch).
-    pub instance_id: Option<String>,
+    /// EC2 instance ID. The reconciler is adopt-only — a doc is created only from
+    /// an instance that already exists in the ASG — so this is always present.
+    pub instance_id: String,
     /// Current state in the lifecycle.
     pub state: DevboxState,
     /// EC2 instance type (e.g., "m5.large").
@@ -55,12 +56,10 @@ impl DocumentType for DevboxDoc {
             });
         }
 
-        if let Some(ref instance_id) = self.instance_id {
-            entries.push(IndexEntry {
-                field: "instance_id",
-                value: instance_id.clone(),
-            });
-        }
+        entries.push(IndexEntry {
+            field: "instance_id",
+            value: self.instance_id.clone(),
+        });
 
         entries
     }
@@ -77,7 +76,7 @@ mod tests {
 
     fn sample_devbox() -> DevboxDoc {
         DevboxDoc {
-            instance_id: Some("i-1234567890abcdef0".to_string()),
+            instance_id: "i-1234567890abcdef0".to_string(),
             state: DevboxState::Ready,
             instance_type: InstanceType("m5.large".to_string()),
             ami_id: AmiId("ami-12345678".to_string()),

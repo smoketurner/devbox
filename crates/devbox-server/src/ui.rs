@@ -17,7 +17,7 @@ use crate::auth::{SessionUser, random_token};
 use crate::db::document_type::Document;
 use crate::documents::devbox::DevboxDoc;
 use crate::routes::{AppState, SharedState};
-use devbox_common::DevboxState;
+use devbox_common::{DevboxState, format_timestamp};
 
 /// Cookie holding the Vouch OIDC ID token after a successful dashboard login.
 const SESSION_COOKIE: &str = "devbox_session";
@@ -80,9 +80,12 @@ pub struct DashboardTemplate {
 
 /// Detail view for a single devbox.
 pub struct DevboxDetail {
+    /// Internal UUID, used only for routing (links, release form action). The
+    /// instance ID is the user-facing identifier shown in the title and grid.
     pub id: String,
     pub state: String,
     pub instance_type: String,
+    pub region: String,
     pub ami_id: String,
     pub subnet_id: String,
     pub instance_id: String,
@@ -98,17 +101,18 @@ impl From<Document<DevboxDoc>> for DevboxDetail {
             id: doc.id,
             state: doc.data.state.to_string(),
             instance_type: doc.data.instance_type.to_string(),
+            region: doc.data.region,
             ami_id: doc.data.ami_id.to_string(),
             subnet_id: doc.data.subnet_id.to_string(),
-            instance_id: doc.data.instance_id.unwrap_or_default(),
+            instance_id: doc.data.instance_id,
             ebs_volume_id: doc.data.ebs_volume_id.unwrap_or_default(),
             owner: doc.data.owner.unwrap_or_default(),
             claimed_at: doc
                 .data
                 .claimed_at
-                .map(|ts| ts.to_string())
+                .map(format_timestamp)
                 .unwrap_or_default(),
-            created_at: doc.created_at.to_string(),
+            created_at: format_timestamp(doc.created_at),
         }
     }
 }
@@ -371,9 +375,9 @@ async fn dashboard(State(state): State<SharedState>, headers: HeaderMap) -> Resp
                     id: doc.id.clone(),
                     state: doc.data.state.to_string(),
                     instance_type: doc.data.instance_type.to_string(),
-                    instance_id: doc.data.instance_id.clone().unwrap_or_default(),
+                    instance_id: doc.data.instance_id.clone(),
                     owner: doc.data.owner.clone().unwrap_or_default(),
-                    created_at: doc.created_at.to_string(),
+                    created_at: format_timestamp(doc.created_at),
                 })
                 .collect();
             DashboardTemplate {

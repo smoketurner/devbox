@@ -116,8 +116,8 @@ mod reconcile_tests {
             "Pending instance must produce a Warming doc (instance_id={instance_id})"
         );
         assert_eq!(
-            doc.data.instance_id.as_deref(),
-            Some(instance_id.as_str()),
+            doc.data.instance_id.as_str(),
+            instance_id.as_str(),
             "doc must reference the correct instance"
         );
     }
@@ -267,7 +267,7 @@ mod reconcile_tests {
         let past = Timestamp::from_second(0).unwrap();
 
         let ready_doc = DevboxDoc {
-            instance_id: Some(ready_id.clone()),
+            instance_id: ready_id.clone(),
             state: DevboxState::Ready,
             instance_type: InstanceType("m7g.large".to_string()),
             ami_id: AmiId("ami-mock".to_string()),
@@ -280,7 +280,7 @@ mod reconcile_tests {
             owner_tag_applied: false,
         };
         let claimed_doc = DevboxDoc {
-            instance_id: Some(claimed_id.clone()),
+            instance_id: claimed_id.clone(),
             state: DevboxState::Claimed,
             instance_type: InstanceType("m7g.large".to_string()),
             ami_id: AmiId("ami-mock".to_string()),
@@ -331,7 +331,7 @@ mod reconcile_tests {
 
         // A claimed box awaiting its owner tag (describe-independent step 9).
         let claimed_doc = DevboxDoc {
-            instance_id: Some(claimed_id.clone()),
+            instance_id: claimed_id.clone(),
             state: DevboxState::Claimed,
             instance_type: InstanceType("m7g.large".to_string()),
             ami_id: AmiId("ami-mock".to_string()),
@@ -346,7 +346,7 @@ mod reconcile_tests {
         // A timed-out, unready Warming box the reaper would normally reap.
         let past = Timestamp::from_second(0).unwrap();
         let warming_doc = DevboxDoc {
-            instance_id: Some(warming_id.clone()),
+            instance_id: warming_id.clone(),
             state: DevboxState::Warming,
             instance_type: InstanceType("m7g.large".to_string()),
             ami_id: AmiId("ami-mock".to_string()),
@@ -381,8 +381,8 @@ mod reconcile_tests {
         // The timed-out Warming doc was NOT reaped (reaper skipped on describe fail).
         let warming = find_doc_by_state(&store, DevboxState::Warming).await;
         assert_eq!(
-            warming.data.instance_id.as_deref(),
-            Some(warming_id.as_str()),
+            warming.data.instance_id.as_str(),
+            warming_id.as_str(),
             "Warming doc must survive: reaper must not run without fresh tag data"
         );
     }
@@ -410,7 +410,7 @@ mod reconcile_tests {
         // A timed-out Warming doc that a stale snapshot would reap.
         let past = Timestamp::from_second(0).unwrap();
         let warming_doc = DevboxDoc {
-            instance_id: Some(instance_id.clone()),
+            instance_id: instance_id.clone(),
             state: DevboxState::Warming,
             instance_type: InstanceType("m7g.large".to_string()),
             ami_id: AmiId("ami-mock".to_string()),

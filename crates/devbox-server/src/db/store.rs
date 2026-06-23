@@ -648,7 +648,7 @@ mod tests {
 
     fn sample_devbox() -> DevboxDoc {
         DevboxDoc {
-            instance_id: Some("i-1234567890abcdef0".to_string()),
+            instance_id: "i-1234567890abcdef0".to_string(),
             state: DevboxState::Ready,
             instance_type: InstanceType("m5.large".to_string()),
             ami_id: AmiId("ami-12345678".to_string()),

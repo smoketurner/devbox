@@ -181,24 +181,21 @@ async fn sync_docs_with_asg(
 
     // Delete docs whose instance_id is not in ASG (stale cleanup)
     for doc in &docs {
-        if let Some(ref instance_id) = doc.data.instance_id
-            && !asg_instance_ids.contains(instance_id.as_str())
+        if !asg_instance_ids.contains(doc.data.instance_id.as_str())
             && let Err(e) = store.delete(&doc.id).await
         {
             tracing::error!(
                 error = %e,
                 doc_id = %doc.id,
-                instance_id = %instance_id,
+                instance_id = %doc.data.instance_id,
                 "failed to delete stale doc"
             );
         }
     }
 
     // Build set of instance_ids that already have docs
-    let doc_instance_ids: HashSet<String> = docs
-        .iter()
-        .filter_map(|d| d.data.instance_id.clone())
-        .collect();
+    let doc_instance_ids: HashSet<String> =
+        docs.iter().map(|d| d.data.instance_id.clone()).collect();
 
     // ASG instances that need a new doc (only adoptable lifecycle states).
     // With no lifecycle hook, instances go Pending → InService directly; we
@@ -228,7 +225,7 @@ async fn sync_docs_with_asg(
         // on lifecycle state alone. handle_warming_instances will flip to Ready
         // on the next tick once the tag is seen.
         let new_doc = DevboxDoc {
-            instance_id: Some(inst.instance_id.clone()),
+            instance_id: inst.instance_id.clone(),
             state: DevboxState::Warming,
             instance_type: InstanceType(info.instance_type.clone()),
             ami_id: AmiId(info.ami_id.clone()),
@@ -267,10 +264,7 @@ async fn handle_warming_instances(
             continue;
         }
 
-        let instance_id = match doc.data.instance_id {
-            Some(ref id) => id.as_str(),
-            None => continue,
-        };
+        let instance_id = doc.data.instance_id.as_str();
 
         let is_ready = info_by_id.get(instance_id).is_some_and(|info| info.ready);
 
@@ -355,10 +349,7 @@ pub(super) async fn reap_unready_instances(
             continue;
         }
 
-        let instance_id = match doc.data.instance_id {
-            Some(ref id) => id.as_str(),
-            None => continue,
-        };
+        let instance_id = doc.data.instance_id.as_str();
 
         // Skip instances that have already set the ready tag.
         let is_ready = info_by_id.get(instance_id).is_some_and(|info| info.ready);
@@ -478,19 +469,20 @@ async fn handle_terminating_instances(
             continue;
         }
 
-        if let Some(ref instance_id) = doc.data.instance_id
-            && let Err(e) = compute.terminate_instance_in_asg(instance_id, false).await
+        if let Err(e) = compute
+            .terminate_instance_in_asg(&doc.data.instance_id, false)
+            .await
         {
             tracing::warn!(
                 error = %e,
-                instance_id = %instance_id,
+                instance_id = %doc.data.instance_id,
                 doc_id = %doc.id,
                 "failed to terminate instance in ASG; will retry next tick"
             );
             continue; // leave Terminating doc; stale-cleanup deletes once instance leaves ASG
         }
 
-        // Terminate succeeded (or no instance_id) — safe to delete now.
+        // Terminate succeeded — safe to delete now.
         if let Err(e) = store.delete(&doc.id).await {
             tracing::error!(
                 error = %e,
@@ -572,7 +564,7 @@ async fn update_scale_in_protection(
     // Build map of instance_id -> doc state
     let doc_states: HashMap<&str, DevboxState> = docs
         .iter()
-        .filter_map(|d| d.data.instance_id.as_deref().map(|id| (id, d.data.state)))
+        .map(|d| (d.data.instance_id.as_str(), d.data.state))
         .collect();
 
     // Build map of instance_id -> currently protected
@@ -641,10 +633,7 @@ async fn apply_pending_owner_tags(
             continue;
         }
 
-        let instance_id = match doc.data.instance_id {
-            Some(ref id) => id.as_str(),
-            None => continue,
-        };
+        let instance_id = doc.data.instance_id.as_str();
 
         let owner = match doc.data.owner {
             Some(ref o) => o.as_str(),

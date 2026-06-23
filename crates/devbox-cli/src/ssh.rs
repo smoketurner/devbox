@@ -50,10 +50,7 @@ pub(crate) fn connect(devbox: &DevboxResponse, opts: &SshOptions) -> Result<()> 
 
 /// Build the ssh argument vector for reaching `devbox` over an SSM tunnel.
 fn build_args(devbox: &DevboxResponse, opts: &SshOptions) -> Result<Vec<String>> {
-    let instance_id = devbox
-        .instance_id
-        .as_deref()
-        .with_context(|| format!("devbox {} has no instance yet", devbox.id))?;
+    let instance_id = devbox.instance_id.as_str();
 
     let user = match opts.user.as_deref() {
         Some(user) => user.to_string(),
@@ -139,10 +136,10 @@ mod tests {
     use super::*;
     use devbox_common::{AmiId, DevboxState, InstanceType};
 
-    fn claimed(instance_id: Option<&str>, owner: Option<&str>) -> DevboxResponse {
+    fn claimed(instance_id: &str, owner: Option<&str>) -> DevboxResponse {
         DevboxResponse {
             id: "abc123".to_string(),
-            instance_id: instance_id.map(str::to_string),
+            instance_id: instance_id.to_string(),
             state: DevboxState::Claimed,
             instance_type: InstanceType("m5.large".to_string()),
             ami_id: AmiId("ami-123".to_string()),
@@ -165,7 +162,7 @@ mod tests {
 
     #[test]
     fn builds_ssm_proxy_command_with_owner_as_login() {
-        let devbox = claimed(Some("i-0abc"), Some("jdoe"));
+        let devbox = claimed("i-0abc", Some("jdoe"));
         let args = build_args(&devbox, &opts()).expect("args");
         assert_eq!(args.first().map(String::as_str), Some("-o"));
         assert!(args.iter().any(|a| a == "jdoe@i-0abc"));
@@ -178,7 +175,7 @@ mod tests {
 
     #[test]
     fn user_override_takes_precedence() {
-        let devbox = claimed(Some("i-0abc"), Some("jdoe"));
+        let devbox = claimed("i-0abc", Some("jdoe"));
         let mut o = opts();
         o.user = Some("root".to_string());
         let args = build_args(&devbox, &o).expect("args");
@@ -187,7 +184,7 @@ mod tests {
 
     #[test]
     fn region_and_profile_are_forwarded() {
-        let devbox = claimed(Some("i-0abc"), Some("jdoe"));
+        let devbox = claimed("i-0abc", Some("jdoe"));
         let mut o = opts();
         o.region = Some("us-east-1".to_string());
         o.profile = Some("dev".to_string());
@@ -205,7 +202,7 @@ mod tests {
     fn region_defaults_to_devbox_region() {
         // With no --region flag, the ProxyCommand is still fully specified from
         // the devbox's own region, so ssh never needs ambient AWS region config.
-        let devbox = claimed(Some("i-0abc"), Some("jdoe"));
+        let devbox = claimed("i-0abc", Some("jdoe"));
         let args = build_args(&devbox, &opts()).expect("args");
         let proxy = args
             .iter()
@@ -216,7 +213,7 @@ mod tests {
 
     #[test]
     fn extra_args_are_appended() {
-        let devbox = claimed(Some("i-0abc"), Some("jdoe"));
+        let devbox = claimed("i-0abc", Some("jdoe"));
         let mut o = opts();
         o.extra = vec!["uptime".to_string()];
         let args = build_args(&devbox, &o).expect("args");
@@ -224,14 +221,8 @@ mod tests {
     }
 
     #[test]
-    fn errors_without_instance() {
-        let devbox = claimed(None, Some("jdoe"));
-        assert!(build_args(&devbox, &opts()).is_err());
-    }
-
-    #[test]
     fn errors_without_owner_or_user() {
-        let devbox = claimed(Some("i-0abc"), None);
+        let devbox = claimed("i-0abc", None);
         assert!(build_args(&devbox, &opts()).is_err());
     }
 

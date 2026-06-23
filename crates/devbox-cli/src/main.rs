@@ -387,7 +387,7 @@ mod tests {
     fn devbox(id: &str, state: DevboxState, owner: Option<&str>) -> DevboxResponse {
         DevboxResponse {
             id: id.to_string(),
-            instance_id: None,
+            instance_id: "i-1234567890abcdef0".to_string(),
             state,
             instance_type: InstanceType("m5.large".to_string()),
             ami_id: AmiId("ami-12345678".to_string()),

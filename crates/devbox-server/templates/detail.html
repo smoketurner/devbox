@@ -3,13 +3,13 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Devbox {{ devbox.id }}</title>
+    <title>Devbox {{ devbox.instance_id }}</title>
     <link rel="stylesheet" href="/static/css/output.css">
 </head>
 <body class="bg-devbox-bg text-gray-200 min-h-screen">
     <div class="max-w-4xl mx-auto px-6 py-8">
         <a href="/" class="text-blue-400 hover:text-blue-300 transition-colors mb-6 inline-block">&larr; Back to Dashboard</a>
-        <h1 class="text-2xl font-bold text-white mb-6">Devbox {{ devbox.id }}</h1>
+        <h1 class="text-2xl font-bold text-white mb-6">Devbox {{ devbox.instance_id }}</h1>
         {% if let Some(err) = error %}
         <div class="bg-red-900/50 border border-red-700 text-red-200 px-4 py-3 rounded mb-4">
             {{ err }}
@@ -18,16 +18,16 @@
         <div class="card p-6">
             <dl class="grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-4">
                 <div>
-                    <dt class="text-gray-400 text-sm">ID</dt>
-                    <dd class="font-mono text-xs text-white mt-1">{{ devbox.id }}</dd>
-                </div>
-                <div>
                     <dt class="text-gray-400 text-sm">State</dt>
                     <dd class="mt-1"><span class="status-{{ devbox.state }}">{{ devbox.state }}</span></dd>
                 </div>
                 <div>
                     <dt class="text-gray-400 text-sm">Instance Type</dt>
                     <dd class="text-white mt-1">{{ devbox.instance_type }}</dd>
+                </div>
+                <div>
+                    <dt class="text-gray-400 text-sm">Region</dt>
+                    <dd class="text-white mt-1">{{ devbox.region }}</dd>
                 </div>
                 <div>
                     <dt class="text-gray-400 text-sm">AMI ID</dt>

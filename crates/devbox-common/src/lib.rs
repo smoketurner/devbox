@@ -1,5 +1,6 @@
 //! Shared types for the devbox orchestration service.
 
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -234,6 +235,35 @@ pub fn username_from_email(email: &str) -> Option<String> {
 }
 
 // ============================================================================
+// Display helpers
+// ============================================================================
+
+/// Display format for timestamps: "Jun 23, 2026, 23:33 UTC" (24-hour, UTC).
+const TIMESTAMP_FORMAT: &str = "%b %-d, %Y, %H:%M UTC";
+
+/// Format a timestamp for display, e.g. "Jun 23, 2026, 23:33 UTC".
+///
+/// `jiff` renders timestamps with nanosecond precision (e.g.
+/// `2026-06-23T23:33:39.964772703Z`), which is noisy in dashboards and CLI
+/// output; this trims to minute precision in UTC.
+#[must_use]
+pub fn format_timestamp(ts: Timestamp) -> String {
+    ts.strftime(TIMESTAMP_FORMAT).to_string()
+}
+
+/// Format an RFC 3339 timestamp string for display (see [`format_timestamp`]).
+///
+/// For callers that hold the serialized string rather than a [`Timestamp`].
+/// Returns the input unchanged if it is not a parseable timestamp (empty
+/// strings, placeholders like `-`), so optional values pass straight through.
+#[must_use]
+pub fn format_timestamp_str(rfc3339: &str) -> String {
+    rfc3339
+        .parse::<Timestamp>()
+        .map_or_else(|_| rfc3339.to_string(), format_timestamp)
+}
+
+// ============================================================================
 // RFC 9728 — OAuth 2.0 Protected Resource Metadata
 // ============================================================================
 
@@ -311,7 +341,7 @@ pub struct ClaimRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DevboxResponse {
     pub id: String,
-    pub instance_id: Option<String>,
+    pub instance_id: String,
     pub state: DevboxState,
     pub instance_type: InstanceType,
     pub ami_id: AmiId,
@@ -598,6 +628,22 @@ mod tests {
         // of a misconfigured OIDC claim mapping.
         assert!(username_from_email("jdoe").is_none());
         assert!(username_from_email("first.last").is_none());
+    }
+
+    #[test]
+    fn format_timestamp_str_renders_human_readable() {
+        assert_eq!(
+            format_timestamp_str("2026-06-23T23:33:39.964772703Z"),
+            "Jun 23, 2026, 23:33 UTC"
+        );
+    }
+
+    #[test]
+    fn format_timestamp_str_passes_through_non_timestamps() {
+        // Placeholders and empty strings are returned unchanged.
+        assert_eq!(format_timestamp_str("-"), "-");
+        assert_eq!(format_timestamp_str(""), "");
+        assert_eq!(format_timestamp_str("not-a-timestamp"), "not-a-timestamp");
     }
 
     #[test]
