@@ -157,9 +157,9 @@ fn build_authenticator() -> Arc<Authenticator> {
 /// Build the dashboard OIDC login config from the environment.
 ///
 /// Returns `Some` only when `AUTH_OIDC_CLIENT_ID`, `AUTH_OIDC_CLIENT_SECRET`,
-/// and `AUTH_OIDC_REDIRECT_URI` are all set; otherwise the dashboard is left
-/// ungated (e.g. local dev, or when an ALB does the OIDC gating). Endpoints and
-/// scope default to Vouch.
+/// and `AUTH_OIDC_REDIRECT_URI` are all set; otherwise the login page shows an
+/// error (all dashboard routes require a valid session). Endpoints and scope
+/// default to Vouch.
 fn build_oidc_config() -> Option<OidcConfig> {
     let nonempty = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
 
