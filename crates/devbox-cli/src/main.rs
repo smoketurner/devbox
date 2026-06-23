@@ -130,18 +130,28 @@ fn forget_claim(id: &str, server: &str) {
     }
 }
 
-/// Prune local entries this server no longer reports as `Claimed`. Best-effort —
-/// never fails `list`.
-fn reconcile_claims(list: &DevboxListResponse, server: &str) {
-    let claimed: BTreeSet<String> = list
-        .devboxes
-        .iter()
-        .filter(|d| d.state == DevboxState::Claimed)
-        .map(|d| d.id.clone())
-        .collect();
+/// Prune local entries this server no longer reports as `Claimed` **by the
+/// current owner**. Best-effort — never fails `list`.
+///
+/// Filtering by owner matters: a box re-claimed by a different user is still
+/// `Claimed`, so an owner-blind reconcile would keep our stale local entry and
+/// later drive `ssh <other-owner>@…` into a `Permission denied`. The caller skips
+/// reconcile entirely when no owner is available, rather than pruning blind.
+fn reconcile_claims(list: &DevboxListResponse, server: &str, owner: &str) {
+    let claimed = live_claimed_ids(list, owner);
     if let Err(e) = state::reconcile(server, &claimed) {
         eprintln!("warning: could not reconcile local claim registry: {e:#}");
     }
+}
+
+/// The ids the server reports as `Claimed` by `owner` — the set the local
+/// registry should be reconciled against.
+fn live_claimed_ids(list: &DevboxListResponse, owner: &str) -> BTreeSet<String> {
+    list.devboxes
+        .iter()
+        .filter(|d| d.state == DevboxState::Claimed && d.owner.as_deref() == Some(owner))
+        .map(|d| d.id.clone())
+        .collect()
 }
 
 #[derive(Subcommand)]
@@ -257,8 +267,10 @@ async fn main() -> Result<()> {
 
         Commands::List => {
             // Reads are open; a missing or unreadable session must not block them,
-            // so attach a token only if one is cleanly available (best-effort).
-            let token = session::current().ok().flatten().map(|s| s.id_token);
+            // so attach a token only if one is cleanly available (best-effort). The
+            // same session's owner gates reconcile so we never prune ownership-blind.
+            let session = session::current().ok().flatten();
+            let token = session.as_ref().map(|s| s.id_token.clone());
             let url = format!("{}/api/v1/devboxes", cli.server);
             let resp = with_auth(http.get(&url), token.as_deref())
                 .send()
@@ -268,7 +280,9 @@ async fn main() -> Result<()> {
             if resp.status().is_success() {
                 let list: DevboxListResponse =
                     resp.json().await.context("failed to parse response")?;
-                reconcile_claims(&list, &cli.server);
+                if let Some(session) = &session {
+                    reconcile_claims(&list, &cli.server, &session.owner);
+                }
                 if list.devboxes.is_empty() {
                     println!("No devboxes found.");
                 } else {
@@ -349,10 +363,40 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+    use devbox_common::AmiId;
 
     #[test]
     fn test_cli_parses() {
         // Verify the CLI definition is valid (includes new Login/Logout subcommands).
         Cli::command().debug_assert();
+    }
+
+    fn devbox(id: &str, state: DevboxState, owner: Option<&str>) -> DevboxResponse {
+        DevboxResponse {
+            id: id.to_string(),
+            instance_id: None,
+            state,
+            instance_type: InstanceType("m5.large".to_string()),
+            ami_id: AmiId("ami-12345678".to_string()),
+            owner: owner.map(str::to_string),
+            created_at: "2026-06-23T00:00:00Z".to_string(),
+            claimed_at: None,
+        }
+    }
+
+    #[test]
+    fn live_claimed_ids_keeps_only_current_owner() {
+        let list = DevboxListResponse {
+            devboxes: vec![
+                devbox("mine", DevboxState::Claimed, Some("jdoe")),
+                devbox("theirs", DevboxState::Claimed, Some("asmith")),
+                devbox("ready", DevboxState::Ready, None),
+            ],
+        };
+        let ids = live_claimed_ids(&list, "jdoe");
+        assert_eq!(ids.len(), 1);
+        assert!(ids.contains("mine"));
+        // A box re-claimed by another user must not be retained as ours.
+        assert!(!ids.contains("theirs"));
     }
 }
