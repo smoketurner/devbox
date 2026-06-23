@@ -12,7 +12,7 @@ DOCKER ?= docker
 IMAGE_NAME ?= devbox
 IMAGE_TAG ?= latest
 
-.PHONY: all build test run-server clean help docker-build docker-run css-dev css-build fmt lint check bake-cli bake-server bake-agent bake-all
+.PHONY: all build test run run-agent run-server clean help docker-build docker-run css-dev css-build fmt lint check bake-cli bake-server bake-agent bake-all
 
 all: build
 
@@ -31,6 +31,14 @@ css-build: ## Build minified CSS for production
 
 run-server: css-build ## Run the devbox server locally (loads .env if present)
 	RUST_LOG=info,devbox_server=debug $(CARGO) run --bin devbox-server -- ${ARGS}
+
+run: ARGS = --help
+run: ## Run the devbox CLI (pass args via ARGS, e.g. make run ARGS="list")
+	$(CARGO) run --bin devbox -- ${ARGS}
+
+run-agent: ARGS = --help
+run-agent: ## Run the devbox agent (pass args via ARGS, e.g. make run-agent ARGS="principals dev")
+	$(CARGO) run --bin devbox-agent -- ${ARGS}
 
 fmt: ## Format code
 	$(CARGO) fmt --all

@@ -18,7 +18,7 @@ anyhow = { workspace = true, features = ["std"] }
 aws-config = { workspace = true, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
 aws-lc-rs = { workspace = true }
 aws-sdk-ec2 = { workspace = true, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
-clap = { workspace = true, features = ["std", "derive"] }
+clap = { workspace = true, features = ["std", "help", "usage", "error-context", "suggestions", "derive"] }
 devbox-common = { path = "../devbox-common" }
 tokio = { workspace = true, features = ["rt", "macros", "net", "time", "io-util"] }
 tracing = { workspace = true, features = ["std"] }
