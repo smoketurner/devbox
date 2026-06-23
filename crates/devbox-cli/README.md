@@ -17,9 +17,9 @@ devbox ssh     [--id <id>] [--user <u>] [-- <cmd...>] # SSH in over an SSM tunne
 
 Global flag: `--server` (env `DEVBOX_SERVER`, default `http://localhost:3000`) —
 the devbox control-plane URL. Run `devbox login` once; the CLI caches your session
-under `~/.config/devbox/` and sends it automatically on API calls. The owner for
-`claim` and `release` is derived from your Vouch OIDC email; with auth disabled
-the `$USER` environment variable is used instead.
+under `~/.config/devbox/` and sends it automatically on API calls. `claim` and
+`release` require a login — the owner is always the authenticated principal
+(derived from your Vouch OIDC email), never supplied by the client.
 
 The `--id` flag is optional for `release`, `status`, and `ssh`. The CLI remembers
 active claims locally; if you hold exactly one, it is used by default. With

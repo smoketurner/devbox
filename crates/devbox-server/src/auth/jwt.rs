@@ -95,6 +95,12 @@ pub struct Authenticator {
     jwks: RwLock<HashMap<String, DecodingKey>>,
     /// Cached ALB signing keys, keyed by `kid`.
     alb_keys: RwLock<HashMap<String, DecodingKey>>,
+    /// Test-only: when set, [`authenticate`](Self::authenticate) resolves every
+    /// request to this owner without touching the network (mocks the JWKS
+    /// boundary so sibling-module handler tests need not mint real tokens).
+    /// Always `None` in production builds.
+    #[cfg(test)]
+    test_owner: Option<String>,
 }
 
 impl Authenticator {
@@ -106,7 +112,26 @@ impl Authenticator {
             http: reqwest::Client::new(),
             jwks: RwLock::new(HashMap::new()),
             alb_keys: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            test_owner: None,
         }
+    }
+
+    /// Test-only constructor: an authenticator that resolves every authenticated
+    /// request to `owner`, bypassing network JWKS verification. Lets handler
+    /// tests exercise claim/release logic without minting real Vouch tokens; the
+    /// JWT verification path itself is covered by the `decode_owner` unit tests.
+    #[cfg(test)]
+    pub(crate) fn with_test_owner(owner: &str) -> Self {
+        let mut auth = Self::new(AuthConfig {
+            issuer: "https://us.vouch.sh".to_string(),
+            jwks_uri: "https://us.vouch.sh/oauth/jwks".to_string(),
+            audience: None,
+            alb_region: None,
+            oidc: None,
+        });
+        auth.test_owner = Some(owner.to_string());
+        auth
     }
 
     /// Resolve the caller's principal from request headers.
@@ -116,6 +141,11 @@ impl Authenticator {
     /// Returns [`AuthError::Missing`] when no credential is present, or
     /// [`AuthError::Invalid`] when one is present but fails verification.
     pub async fn authenticate(&self, headers: &HeaderMap) -> Result<Principal, AuthError> {
+        #[cfg(test)]
+        if let Some(owner) = &self.test_owner {
+            return Ok(Principal(owner.clone()));
+        }
+
         if let Some(value) = headers.get(ALB_OIDC_DATA_HEADER) {
             let token = value
                 .to_str()

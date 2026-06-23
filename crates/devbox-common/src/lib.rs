@@ -257,19 +257,14 @@ impl std::fmt::Display for DevboxState {
 // ============================================================================
 
 /// Request to claim a devbox.
+///
+/// The owner is never supplied by the client — the server binds it to the
+/// authenticated principal (the Unix login derived from the token's `email`
+/// claim). Only the optional instance-type preference travels in the body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimRequest {
-    /// The user/owner requesting a devbox.
-    pub owner: String,
     /// Optional preferred instance type.
     pub instance_type: Option<InstanceType>,
-}
-
-/// Request to release a claimed devbox.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReleaseRequest {
-    /// The user/owner releasing the devbox.
-    pub owner: String,
 }
 
 // ============================================================================
@@ -409,16 +404,20 @@ mod tests {
     #[test]
     fn test_claim_request_serde() {
         let req = ClaimRequest {
-            owner: "user@example.com".to_string(),
             instance_type: Some(InstanceType("m5.large".to_string())),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ClaimRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.owner, "user@example.com");
         assert_eq!(
             parsed.instance_type,
             Some(InstanceType("m5.large".to_string()))
         );
+    }
+
+    #[test]
+    fn test_claim_request_omits_instance_type() {
+        let parsed: ClaimRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.instance_type, None);
     }
 
     #[test]

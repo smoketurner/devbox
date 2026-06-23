@@ -13,10 +13,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use dialoguer::Select;
 
-use devbox_common::{
-    ClaimRequest, DevboxListResponse, DevboxResponse, DevboxState, InstanceType, ReleaseRequest,
-    is_valid_unix_username,
-};
+use devbox_common::{ClaimRequest, DevboxListResponse, DevboxResponse, DevboxState, InstanceType};
 
 /// Devbox CLI - manage remote development environments.
 #[derive(Parser)]
@@ -102,23 +99,15 @@ fn resolve_id(explicit: Option<String>, server: &str) -> Result<String> {
     }
 }
 
-/// Resolve the owner for `claim`/`release`.
+/// The cached session's bearer token, or an error directing the user to log in.
 ///
-/// Precedence: cached session (email-derived login) → `$USER` fallback
-/// (gated by [`is_valid_unix_username`]). The `$USER` path serves the local-dev
-/// case where auth is disabled on the server.
-fn resolve_owner() -> Result<String> {
-    if let Some(s) = session::current()? {
-        return Ok(s.owner);
-    }
-    let user = std::env::var("USER").ok().filter(|u| !u.is_empty());
-    let Some(user) = user else {
+/// Authentication is mandatory: the server binds `owner` to the authenticated
+/// principal, so claim/release always need a valid token.
+fn require_token() -> Result<String> {
+    let Some(session) = session::current()? else {
         bail!("not logged in; run `devbox login`")
     };
-    if !is_valid_unix_username(&user) {
-        bail!("$USER '{user}' is not a valid devbox owner; run `devbox login`");
-    }
-    Ok(user)
+    Ok(session.id_token)
 }
 
 /// Record a freshly claimed devbox in the local registry. Best-effort: the box is
@@ -210,14 +199,10 @@ async fn main() -> Result<()> {
     let http = reqwest::Client::new();
 
     match cli.command {
-        Commands::Login => match auth::login(&http, &cli.server).await? {
-            auth::LoginOutcome::LoggedIn(s) => {
-                println!("logged in as {} ({})", s.owner, s.email);
-            }
-            auth::LoginOutcome::AuthDisabled => {
-                println!("auth not enabled on this server");
-            }
-        },
+        Commands::Login => {
+            let s = auth::login(&http, &cli.server).await?;
+            println!("logged in as {} ({})", s.owner, s.email);
+        }
 
         Commands::Logout => {
             session::logout()?;
@@ -225,14 +210,12 @@ async fn main() -> Result<()> {
         }
 
         Commands::Claim { instance_type } => {
-            let owner = resolve_owner()?;
-            let token = session::current()?.map(|s| s.id_token);
+            let token = require_token()?;
             let url = format!("{}/api/v1/devboxes/claim", cli.server);
             let req = ClaimRequest {
-                owner,
                 instance_type: instance_type.map(InstanceType),
             };
-            let resp = with_auth(http.post(&url).json(&req), token.as_deref())
+            let resp = with_auth(http.post(&url).json(&req), Some(&token))
                 .send()
                 .await
                 .context("failed to send claim request")?;
@@ -251,12 +234,10 @@ async fn main() -> Result<()> {
         }
 
         Commands::Release { id } => {
-            let owner = resolve_owner()?;
-            let token = session::current()?.map(|s| s.id_token);
+            let token = require_token()?;
             let id = resolve_id(id, &cli.server)?;
             let url = format!("{}/api/v1/devboxes/{}/release", cli.server, id);
-            let req = ReleaseRequest { owner };
-            let resp = with_auth(http.post(&url).json(&req), token.as_deref())
+            let resp = with_auth(http.post(&url), Some(&token))
                 .send()
                 .await
                 .context("failed to send release request")?;

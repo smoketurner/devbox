@@ -199,7 +199,7 @@ fn set_cookie(name: &str, value: &str, max_age: i64) -> String {
 
 /// Resolve the signed-in user from the session cookie, if valid.
 async fn current_session(state: &AppState, headers: &HeaderMap) -> Option<SessionUser> {
-    let auth = state.auth.as_ref()?;
+    let auth = &state.auth;
     auth.oidc()?;
     let token = cookie_value(headers, SESSION_COOKIE)?;
     auth.verify_id_token(&token).await.ok()
@@ -218,7 +218,8 @@ async fn require_login(state: &AppState, headers: &HeaderMap) -> Result<SessionU
 ///
 /// GET /login
 async fn login(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(auth) = state.auth.as_ref().filter(|a| a.oidc().is_some()) else {
+    let auth = &state.auth;
+    if auth.oidc().is_none() {
         // Login is required but not configured — surface it rather than looping
         // back to the gated dashboard.
         return ErrorPageTemplate {
@@ -226,7 +227,7 @@ async fn login(State(state): State<AppState>, headers: HeaderMap) -> Response {
             message: "Dashboard login is not configured on this server.".to_string(),
         }
         .into_response();
-    };
+    }
     if current_session(&state, &headers).await.is_some() {
         return Redirect::to("/").into_response();
     }
@@ -259,9 +260,10 @@ async fn oauth_callback(
     headers: HeaderMap,
     Query(query): Query<CallbackQuery>,
 ) -> Response {
-    let Some(auth) = state.auth.as_ref().filter(|a| a.oidc().is_some()) else {
+    let auth = &state.auth;
+    if auth.oidc().is_none() {
         return Redirect::to("/").into_response();
-    };
+    }
 
     // On any failure, redirect to a clean URL (no authorization code left in the
     // address bar, where it could leak via history/bookmarks/Referer) and clear

@@ -132,17 +132,11 @@ async fn main() -> Result<()> {
 
 /// Build the request authenticator from the environment.
 ///
-/// Returns `None` (auth disabled, owner taken from the request body) unless
-/// `AUTH_ENABLED` is truthy. OIDC endpoints default to Vouch.
-fn build_authenticator() -> Option<Arc<Authenticator>> {
-    let enabled = std::env::var("AUTH_ENABLED").is_ok_and(|v| v == "true" || v == "1");
-    if !enabled {
-        tracing::warn!(
-            "API authentication disabled (set AUTH_ENABLED=true); owner is taken from the request body"
-        );
-        return None;
-    }
-
+/// Authentication is always on: every claim/release binds `owner` to the
+/// authenticated principal (the Unix login derived from the token's `email`
+/// claim), so there is no unauthenticated path. OIDC endpoints default to
+/// Vouch; override with `AUTH_OIDC_ISSUER` / `AUTH_OIDC_JWKS_URI`.
+fn build_authenticator() -> Arc<Authenticator> {
     let oidc = build_oidc_config();
     let config = AuthConfig {
         issuer: std::env::var("AUTH_OIDC_ISSUER")
@@ -160,7 +154,7 @@ fn build_authenticator() -> Option<Arc<Authenticator>> {
         dashboard_login = config.oidc.is_some(),
         "API authentication enabled (owner = email local part)"
     );
-    Some(Arc::new(Authenticator::new(config)))
+    Arc::new(Authenticator::new(config))
 }
 
 /// Build the dashboard OIDC login config from the environment.

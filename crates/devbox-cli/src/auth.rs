@@ -3,8 +3,8 @@
 //! The 5-step flow:
 //!
 //! 1. `GET {server}/.well-known/oauth-protected-resource` — discover the
-//!    authorization server and scopes (RFC 9728). A **404 means auth is
-//!    disabled** on this server; the CLI exits 0 with an informational message.
+//!    authorization server and scopes (RFC 9728). A 404 means the server does
+//!    not expose OAuth discovery (wrong `--server`, or an out-of-date server).
 //! 2. `GET {issuer}/.well-known/openid-configuration` — discover the OIDC
 //!    endpoints (device_authorization, token, registration).
 //! 3. `POST {registration_endpoint}` — anonymous DCR (RFC 7591). Cached in
@@ -27,29 +27,15 @@ use crate::session::{self, Client, Session};
 // Public surface
 // ============================================================================
 
-/// Outcome of a `login` call.
-pub(crate) enum LoginOutcome {
-    /// Login succeeded; session is written to disk.
-    LoggedIn(Session),
-    /// The server has authentication disabled (RFC 9728 endpoint returned 404).
-    /// The CLI should exit 0 with an informational message.
-    AuthDisabled,
-}
-
 /// Run the full 5-step login chain.
 ///
 /// # Errors
 ///
-/// Returns an error for network failures, malformed responses, or user denial.
-/// A 404 from the RFC 9728 endpoint is NOT an error — it maps to
-/// [`LoginOutcome::AuthDisabled`].
-pub(crate) async fn login(client: &reqwest::Client, server: &str) -> Result<LoginOutcome> {
+/// Returns an error for network failures, malformed responses, user denial, or
+/// a server that does not expose the RFC 9728 discovery endpoint (404).
+pub(crate) async fn login(client: &reqwest::Client, server: &str) -> Result<Session> {
     // Step 1 — RFC 9728 discovery.
-    let prm = match fetch_protected_resource(client, server).await {
-        Ok(p) => p,
-        Err(AuthStep::Disabled) => return Ok(LoginOutcome::AuthDisabled),
-        Err(AuthStep::Other(e)) => return Err(e),
-    };
+    let prm = fetch_protected_resource(client, server).await?;
 
     let issuer = prm
         .authorization_servers
@@ -88,21 +74,7 @@ pub(crate) async fn login(client: &reqwest::Client, server: &str) -> Result<Logi
 
     let session = Session::from_id_token(id_token)?;
     session::save_session(&session)?;
-    Ok(LoginOutcome::LoggedIn(session))
-}
-
-// ============================================================================
-// Intermediate error type (private — never crosses the module boundary)
-// ============================================================================
-
-/// A private two-case result used by `fetch_protected_resource` so the caller
-/// can distinguish 404 (auth disabled) from other failures without adding
-/// `thiserror` to the workspace (critic ruling: anyhow + PollOutcome only).
-enum AuthStep {
-    /// RFC 9728 endpoint returned 404 — auth is disabled on this server.
-    Disabled,
-    /// Any other failure.
-    Other(anyhow::Error),
+    Ok(session)
 }
 
 // ============================================================================
@@ -172,28 +144,29 @@ fn default_interval() -> u64 {
 async fn fetch_protected_resource(
     client: &reqwest::Client,
     server: &str,
-) -> Result<ProtectedResourceMeta, AuthStep> {
+) -> Result<ProtectedResourceMeta> {
     let url = format!("{server}/.well-known/oauth-protected-resource");
     let resp = client
         .get(&url)
         .send()
         .await
-        .map_err(|e| AuthStep::Other(anyhow::anyhow!("fetch {url}: {e}")))?;
+        .with_context(|| format!("fetch {url}"))?;
 
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        return Err(AuthStep::Disabled);
+        bail!(
+            "{server} does not expose OAuth discovery at \
+             /.well-known/oauth-protected-resource (is --server correct, and the \
+             server up to date?)"
+        );
     }
 
     if !resp.status().is_success() {
-        return Err(AuthStep::Other(anyhow::anyhow!(
-            "GET {url} returned {}",
-            resp.status()
-        )));
+        bail!("GET {url} returned {}", resp.status());
     }
 
     resp.json::<ProtectedResourceMeta>()
         .await
-        .map_err(|e| AuthStep::Other(anyhow::anyhow!("parse oauth-protected-resource: {e}")))
+        .with_context(|| format!("parse oauth-protected-resource from {url}"))
 }
 
 async fn fetch_oidc_config(client: &reqwest::Client, issuer: &str) -> Result<OidcDiscovery> {
@@ -785,11 +758,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 9: PRM 404 → LoginOutcome::AuthDisabled (not Err)
+    // Test 9: PRM 404 → hard error (server does not expose OAuth discovery)
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn login_prm_404_returns_auth_disabled() {
+    async fn login_prm_404_is_error() {
         // Serve a minimal devbox "server" that returns 404 on the PRM endpoint.
         let router = axum::Router::new().route(
             "/.well-known/oauth-protected-resource",
@@ -800,10 +773,11 @@ mod tests {
         let client = http();
 
         let result = login(&client, &base).await;
-        assert!(result.is_ok(), "PRM 404 should not be an error");
+        assert!(result.is_err(), "PRM 404 must be a hard error");
+        let msg = format!("{:#}", result.unwrap_err());
         assert!(
-            matches!(result.unwrap(), LoginOutcome::AuthDisabled),
-            "expected AuthDisabled"
+            msg.contains("OAuth discovery"),
+            "error should explain the missing discovery endpoint, got: {msg}"
         );
     }
 }
