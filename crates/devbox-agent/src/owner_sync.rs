@@ -112,16 +112,33 @@ async fn tick(client: &Client) -> Result<Pass> {
 /// a retry after a partial provisioning (account created but sudoers write
 /// failed) self-heals and the claimant keeps passwordless sudo.
 fn ensure_user(user: &str) -> Result<()> {
-    if !user_exists(user) {
-        // useradd's stock NAME_REGEX rejects dots; pass --badname for the
-        // email-derived `first.last` logins we allow (omitted for plain names so
-        // their behavior is unchanged).
-        let mut args: Vec<&str> = Vec::new();
-        if user.contains('.') {
-            args.push("--badname");
+    match existing_uid(user) {
+        // Refuse to hand passwordless sudo to a pre-existing system account.
+        // `is_valid_unix_username` already blocks the known cloud defaults
+        // (ubuntu/ec2-user, UID 1000); this catches any other system account
+        // (UID < 1000) so a misconfigured principal fails loudly here rather
+        // than silently reusing a shared account.
+        Some(uid) if uid < 1000 => {
+            bail!(
+                "refusing to reuse pre-existing system account '{user}' (uid {uid}); \
+                 a devbox owner must map to a dedicated account"
+            );
         }
-        args.extend(["-m", "-s", "/bin/bash", "-G", "docker", user]);
-        run_cmd("useradd", &args).with_context(|| format!("create login account for {user}"))?;
+        // A dedicated account from a prior pass — fall through to re-assert
+        // sudoers idempotently.
+        Some(_) => {}
+        None => {
+            // useradd's stock NAME_REGEX rejects dots; pass --badname for the
+            // email-derived `first.last` logins we allow (omitted for plain names
+            // so their behavior is unchanged).
+            let mut args: Vec<&str> = Vec::new();
+            if user.contains('.') {
+                args.push("--badname");
+            }
+            args.extend(["-m", "-s", "/bin/bash", "-G", "docker", user]);
+            run_cmd("useradd", &args)
+                .with_context(|| format!("create login account for {user}"))?;
+        }
     }
     let sudoers = format!("/etc/sudoers.d/devbox-{user}");
     std::fs::write(&sudoers, format!("{user} ALL=(ALL) NOPASSWD: ALL\n"))
@@ -134,15 +151,21 @@ fn ensure_user(user: &str) -> Result<()> {
     Ok(())
 }
 
-/// Whether a Unix account named `user` already exists.
-fn user_exists(user: &str) -> bool {
-    Command::new("id")
+/// The numeric UID of an existing Unix account named `user`, or `None` if no such
+/// account exists (or its UID can't be read). Used to distinguish a fresh login
+/// from a pre-existing system account.
+fn existing_uid(user: &str) -> Option<u32> {
+    let output = Command::new("id")
         .arg("-u")
         .arg(user)
-        .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    stdout.trim().parse::<u32>().ok()
 }
 
 /// Run a command, returning an error if it cannot be spawned or exits non-zero.
@@ -195,6 +218,16 @@ mod tests {
         assert_eq!(
             decide(Some("Justin")),
             Decision::Unsafe("Justin".to_string())
+        );
+    }
+
+    #[test]
+    fn reserved_owner_is_refused() {
+        // Reserved system / cloud-default names must never provision an account.
+        assert_eq!(decide(Some("root")), Decision::Unsafe("root".to_string()));
+        assert_eq!(
+            decide(Some("ec2-user")),
+            Decision::Unsafe("ec2-user".to_string())
         );
     }
 }

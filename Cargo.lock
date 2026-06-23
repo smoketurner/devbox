@@ -992,6 +992,7 @@ dependencies = [
  "aws-sdk-dsql",
  "aws-sdk-ec2",
  "axum",
+ "base64",
  "devbox-common",
  "jiff",
  "jsonwebtoken",

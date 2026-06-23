@@ -306,6 +306,7 @@ mod tests {
             issuer: "https://us.vouch.sh".to_string(),
             jwks_uri: "https://us.vouch.sh/oauth/jwks".to_string(),
             alb_region: None,
+            alb_arn: None,
             oidc: None,
         });
         AppState {

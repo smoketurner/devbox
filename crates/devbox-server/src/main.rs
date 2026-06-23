@@ -144,6 +144,7 @@ fn build_authenticator() -> Arc<Authenticator> {
         jwks_uri: std::env::var("AUTH_OIDC_JWKS_URI")
             .unwrap_or_else(|_| "https://us.vouch.sh/oauth/jwks".to_string()),
         alb_region: std::env::var("AWS_REGION").ok().filter(|s| !s.is_empty()),
+        alb_arn: std::env::var("AUTH_ALB_ARN").ok().filter(|s| !s.is_empty()),
         oidc,
     };
     tracing::info!(
@@ -179,10 +180,35 @@ fn build_oidc_config() -> Option<OidcConfig> {
     })
 }
 
-/// Wait for shutdown signal (Ctrl+C).
+/// Wait for a shutdown signal (Ctrl+C or SIGTERM).
+///
+/// ECS/Fargate stops a task by sending SIGTERM (Docker's default `STOPSIGNAL`),
+/// so listening only for SIGINT would skip the graceful-shutdown path and let the
+/// kernel kill the process mid-request. A failed handler registration falls back
+/// to a pending future rather than panicking.
 async fn shutdown_signal() {
-    tokio::signal::ctrl_c().await.ok();
-    tracing::info!("shutdown signal received");
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let ctrl_c = async {
+        tokio::signal::ctrl_c().await.ok();
+    };
+
+    let terminate = async {
+        match signal(SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to install SIGTERM handler");
+                std::future::pending().await
+            }
+        }
+    };
+
+    tokio::select! {
+        () = ctrl_c => tracing::info!("received SIGINT, initiating graceful shutdown"),
+        () = terminate => tracing::info!("received SIGTERM, initiating graceful shutdown"),
+    }
 }
 
 /// Redact password from database URL for logging.
