@@ -10,7 +10,7 @@ use axum::routing::{get, post};
 
 use devbox_common::{
     ClaimRequest, DevboxListResponse, DevboxResponse, DevboxState, HealthResponse,
-    PoolMetricsResponse, ReleaseRequest, is_valid_unix_username,
+    PoolMetricsResponse, ProtectedResourceMetadata, ReleaseRequest, is_valid_unix_username,
 };
 
 use crate::auth::Authenticator;
@@ -60,6 +60,10 @@ async fn resolve_owner(
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health_check))
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(protected_resource_metadata),
+        )
         .route("/api/v1/devboxes", get(list_devboxes))
         .route("/api/v1/devboxes/{id}", get(get_devbox))
         .route("/api/v1/devboxes/claim", post(claim_devbox))
@@ -67,6 +71,41 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/pool/metrics", get(pool_metrics))
         .merge(build_ui_router())
         .with_state(state)
+}
+
+/// RFC 9728 OAuth 2.0 Protected Resource Metadata endpoint.
+///
+/// Clients (the `devbox` CLI) fetch this to discover the authorization server
+/// and scopes without out-of-band configuration. Returns 404 when
+/// authentication is disabled (local dev with `AUTH_ENABLED` unset), signalling
+/// the CLI to skip login and fall back to `$USER` as the owner.
+///
+/// `scopes_supported` is hardcoded to `["openid","email"]` — the minimum the
+/// server requires — and NOT derived from `OidcConfig.scope`, which is `None`
+/// on API-only deployments. `resource` is advisory/best-effort from the `Host`
+/// header; the CLI only reads `authorization_servers`.
+async fn protected_resource_metadata(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ProtectedResourceMetadata>, AppError> {
+    let auth = state
+        .auth
+        .as_ref()
+        .ok_or_else(|| AppError::NotFound("authentication is not enabled".into()))?;
+
+    // Best-effort: read Host header for the resource URL. The CLI ignores this
+    // field; it is advisory per RFC 9728 §3.1.
+    let resource = headers
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .filter(|h| !h.is_empty())
+        .map_or_else(String::new, |h| format!("https://{h}"));
+
+    Ok(Json(ProtectedResourceMetadata {
+        resource,
+        authorization_servers: vec![auth.issuer().to_string()],
+        scopes_supported: vec!["openid".into(), "email".into()],
+    }))
 }
 
 /// Health check endpoint.
@@ -276,6 +315,26 @@ mod tests {
         }
     }
 
+    async fn setup_state_with_auth() -> AppState {
+        use crate::auth::{AuthConfig, Authenticator};
+        let pool = Pool::new_test();
+        if let Pool::Sqlite(ref p) = pool {
+            run_sqlite_migrations(p).await.unwrap();
+        }
+        let auth = Authenticator::new(AuthConfig {
+            issuer: "https://us.vouch.sh".to_string(),
+            jwks_uri: "https://us.vouch.sh/oauth/jwks".to_string(),
+            audience: None,
+            alb_region: None,
+            oidc: None,
+        });
+        AppState {
+            store: Arc::new(DocumentStore::new(pool)),
+            reconciler_config: Arc::new(test_config()),
+            auth: Some(Arc::new(auth)),
+        }
+    }
+
     fn test_config() -> ReconcilerConfig {
         ReconcilerConfig {
             pool_id: "test".to_string(),
@@ -416,6 +475,50 @@ mod tests {
             .await,
         );
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn protected_resource_metadata_returns_404_when_auth_disabled() {
+        let state = setup_state().await;
+        let status = status_of(protected_resource_metadata(State(state), HeaderMap::new()).await);
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn protected_resource_metadata_returns_200_with_correct_shape() {
+        let state = setup_state_with_auth().await;
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::HOST, "cp.example".parse().unwrap());
+
+        let meta = protected_resource_metadata(State(state), headers)
+            .await
+            .ok()
+            .map(|Json(m)| m)
+            .unwrap();
+
+        assert_eq!(
+            meta.authorization_servers.first().map(String::as_str),
+            Some("https://us.vouch.sh")
+        );
+        assert_eq!(meta.scopes_supported, ["openid", "email"]);
+        assert_eq!(meta.resource, "https://cp.example");
+    }
+
+    #[tokio::test]
+    async fn protected_resource_metadata_no_host_header_returns_empty_resource() {
+        // Pins the documented behavior: missing Host → empty resource string
+        // (advisory per RFC 9728 §3.1; CLI only reads authorization_servers).
+        let state = setup_state_with_auth().await;
+        let meta = protected_resource_metadata(State(state), HeaderMap::new())
+            .await
+            .ok()
+            .map(|Json(m)| m)
+            .unwrap();
+        assert_eq!(
+            meta.resource, "",
+            "missing Host header must yield empty resource"
+        );
+        assert_eq!(meta.authorization_servers, ["https://us.vouch.sh"]);
     }
 
     #[tokio::test]

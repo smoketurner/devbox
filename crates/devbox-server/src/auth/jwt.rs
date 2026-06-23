@@ -10,7 +10,7 @@ use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use secrecy::{ExposeSecret, SecretString};
 
-use devbox_common::is_valid_unix_username;
+use devbox_common::username_from_email;
 
 /// Header the ALB injects with a signed JWT for OIDC-authenticated requests.
 const ALB_OIDC_DATA_HEADER: &str = "x-amzn-oidc-data";
@@ -239,6 +239,12 @@ impl Authenticator {
         self.config.oidc.as_ref()
     }
 
+    /// The configured token issuer (Vouch authorization server URL).
+    #[must_use]
+    pub fn issuer(&self) -> &str {
+        &self.config.issuer
+    }
+
     /// Build the IdP authorization URL for the dashboard login redirect.
     ///
     /// `state` is the opaque CSRF token echoed back to the callback. Returns
@@ -415,19 +421,6 @@ fn decode_owner(
     Ok((owner, email.to_string()))
 }
 
-/// Derive a Unix login from an email: the local part (before `@`), surrounding
-/// whitespace trimmed and lowercased. Returns `None` unless that is already a
-/// valid Unix username.
-///
-/// Only surrounding whitespace is trimmed; internal characters are never
-/// stripped and the result is never truncated — a non-conforming local part is
-/// rejected, not mangled — so distinct local parts can never collide on the same
-/// `owner` (which would let one user act on another's devboxes).
-fn username_from_email(email: &str) -> Option<String> {
-    let local = email.trim().split('@').next()?.trim().to_ascii_lowercase();
-    is_valid_unix_username(&local).then_some(local)
-}
-
 #[cfg(test)]
 #[expect(
     clippy::unwrap_used,
@@ -496,43 +489,6 @@ mod tests {
             sign(json!({ "email": "jane@example.com", "iss": ISSUER, "exp": 9_999_999_999_u64 }));
         let key = DecodingKey::from_secret(b"a-different-secret");
         assert!(decode_owner(&token, &key, &validation()).is_err());
-    }
-
-    #[test]
-    fn username_from_email_takes_local_part() {
-        assert_eq!(
-            username_from_email("jdoe@example.com").as_deref(),
-            Some("jdoe")
-        );
-    }
-
-    #[test]
-    fn username_from_email_lowercases_and_trims() {
-        assert_eq!(
-            username_from_email("  JDoe@example.com  ").as_deref(),
-            Some("jdoe")
-        );
-    }
-
-    #[test]
-    fn username_from_email_allows_dots_without_collision() {
-        // Dots are kept (first.last logins), never stripped — so distinct local
-        // parts can't fold onto the same owner (a.b stays distinct from ab).
-        assert_eq!(
-            username_from_email("first.last@example.com").as_deref(),
-            Some("first.last")
-        );
-        assert_eq!(username_from_email("a.b@corp.com").as_deref(), Some("a.b"));
-        assert_eq!(username_from_email("ab@corp.com").as_deref(), Some("ab"));
-    }
-
-    #[test]
-    fn username_from_email_rejects_underiverable() {
-        assert!(username_from_email("123@example.com").is_none()); // leading digit
-        assert!(username_from_email("@example.com").is_none()); // empty local part
-        assert!(username_from_email("a+b@example.com").is_none()); // '+' not allowed
-        let long = format!("{}@example.com", "a".repeat(33));
-        assert!(username_from_email(&long).is_none()); // >32 chars, never truncated
     }
 
     fn base_config(oidc: Option<OidcConfig>) -> AuthConfig {

@@ -173,6 +173,50 @@ pub fn is_valid_unix_username(name: &str) -> bool {
         })
 }
 
+/// Derive a Unix login from an email address.
+///
+/// Takes the local part (before `@`), trims surrounding whitespace, and
+/// lowercases it. Returns `Some(login)` when the result satisfies
+/// [`is_valid_unix_username`], `None` otherwise.
+///
+/// An `@` sign is required — bare usernames without a domain are rejected.
+/// This makes the `@`-requirement explicit: a no-`@` input indicates a
+/// misconfigured OIDC claim mapping and should fail loudly rather than silently
+/// succeed with an unexpected value.
+///
+/// Only surrounding whitespace is trimmed; internal characters are never
+/// stripped and the result is never truncated — a non-conforming local part is
+/// rejected, not mangled — so distinct local parts can never collide on the
+/// same `owner` (which would let one user act on another's devboxes).
+#[must_use]
+pub fn username_from_email(email: &str) -> Option<String> {
+    // `split_once` returns None when '@' is absent, enforcing the requirement
+    // that the input is an email address, not a bare username.
+    let (local, _domain) = email.trim().split_once('@')?;
+    let local = local.trim().to_ascii_lowercase();
+    is_valid_unix_username(&local).then_some(local)
+}
+
+// ============================================================================
+// RFC 9728 — OAuth 2.0 Protected Resource Metadata
+// ============================================================================
+
+/// Metadata document served at `/.well-known/oauth-protected-resource` per
+/// [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728).
+///
+/// Clients (the `devbox` CLI) fetch this to discover the authorization server
+/// and required scopes without prior out-of-band configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtectedResourceMetadata {
+    /// The URL of this protected resource (advisory, best-effort from Host header).
+    pub resource: String,
+    /// Authorization server(s) that issue access tokens for this resource.
+    pub authorization_servers: Vec<String>,
+    /// Scopes supported by this resource (the `email` scope is required for
+    /// `devbox`; `openid` is required to obtain an ID token).
+    pub scopes_supported: Vec<String>,
+}
+
 // ============================================================================
 // DevboxState
 // ============================================================================
@@ -458,5 +502,68 @@ mod tests {
         let parsed: PoolMetricsResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.warming, 2);
         assert_eq!(parsed.ready_delta, 0);
+    }
+
+    #[test]
+    fn username_from_email_takes_local_part() {
+        assert_eq!(
+            username_from_email("jdoe@example.com").as_deref(),
+            Some("jdoe")
+        );
+    }
+
+    #[test]
+    fn username_from_email_lowercases_and_trims() {
+        assert_eq!(
+            username_from_email("  JDoe@example.com  ").as_deref(),
+            Some("jdoe")
+        );
+    }
+
+    #[test]
+    fn username_from_email_allows_dots_without_collision() {
+        // Dots are kept (first.last logins), never stripped — so distinct local
+        // parts can't fold onto the same owner (a.b stays distinct from ab).
+        assert_eq!(
+            username_from_email("first.last@example.com").as_deref(),
+            Some("first.last")
+        );
+        assert_eq!(username_from_email("a.b@corp.com").as_deref(), Some("a.b"));
+        assert_eq!(username_from_email("ab@corp.com").as_deref(), Some("ab"));
+    }
+
+    #[test]
+    fn username_from_email_rejects_underivable() {
+        assert!(username_from_email("123@example.com").is_none()); // leading digit
+        assert!(username_from_email("@example.com").is_none()); // empty local part
+        assert!(username_from_email("a+b@example.com").is_none()); // '+' not allowed
+        let long = format!("{}@example.com", "a".repeat(33));
+        assert!(username_from_email(&long).is_none()); // >32 chars, never truncated
+    }
+
+    #[test]
+    fn username_from_email_rejects_no_at_sign() {
+        // A bare username is not an email; returning None avoids silent misuse
+        // of a misconfigured OIDC claim mapping.
+        assert!(username_from_email("jdoe").is_none());
+        assert!(username_from_email("first.last").is_none());
+    }
+
+    #[test]
+    fn protected_resource_metadata_serde_roundtrip() {
+        let meta = ProtectedResourceMetadata {
+            resource: "https://cp.example".to_string(),
+            authorization_servers: vec!["https://us.vouch.sh".to_string()],
+            scopes_supported: vec!["openid".to_string(), "email".to_string()],
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let parsed: ProtectedResourceMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, meta);
+        assert_eq!(parsed.authorization_servers.len(), 1);
+        assert_eq!(
+            parsed.authorization_servers.first().map(String::as_str),
+            Some("https://us.vouch.sh")
+        );
+        assert_eq!(parsed.scopes_supported, ["openid", "email"]);
     }
 }

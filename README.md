@@ -109,17 +109,20 @@ make docker-run
 ### CLI
 
 ```bash
-# List all devboxes
-devbox list --server-url http://localhost:3000
+# Log in via device-code OAuth (Vouch + FIDO2/YubiKey)
+devbox login --server http://localhost:3000
 
-# Claim a devbox (owner derived from token)
-devbox claim --server-url http://localhost:3000
+# List all devboxes
+devbox list --server http://localhost:3000
+
+# Claim a devbox (owner derived from your login session)
+devbox claim --server http://localhost:3000
 
 # Check status (ID defaults to your active claim)
-devbox status --server-url http://localhost:3000
+devbox status --server http://localhost:3000
 
 # Release when done (ID defaults to your active claim)
-devbox release --server-url http://localhost:3000
+devbox release --server http://localhost:3000
 ```
 
 ## Crates
@@ -139,7 +142,7 @@ devbox release --server-url http://localhost:3000
 | `DATABASE_URL` | Database connection string (`sqlite:...` or `postgres://...`) | `sqlite::memory:` |
 | `RUST_LOG` | Tracing filter directive | `info` |
 | `PORT` | Server listen port | `3000` |
-| `DEVBOX_TOKEN` | Bearer token for CLI authentication (Vouch OIDC) | (none) |
+| `DEVBOX_SERVER` | Default server URL for the CLI | `http://localhost:3000` |
 
 ### Pool Configuration (planned)
 

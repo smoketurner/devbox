@@ -19,7 +19,11 @@ clap = { workspace = true, features = ["std", "help", "usage", "error-context", 
 devbox-common = { path = "../devbox-common" }
 dialoguer = { workspace = true }
 jsonwebtoken = { workspace = true, features = ["aws_lc_rs"] }
-reqwest = { workspace = true, features = ["json", "rustls"] }
+reqwest = { workspace = true, features = ["json", "form", "rustls"] }
 serde = { workspace = true, features = ["std", "derive"] }
 serde_json = { workspace = true, features = ["std"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[dev-dependencies]
+# In-process mock HTTP server for auth.rs poll-loop tests (axum already in workspace).
+axum = { workspace = true, features = ["http1", "json", "tokio"] }

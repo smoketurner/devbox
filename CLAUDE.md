@@ -179,17 +179,26 @@ dashboard is gated by app-side OIDC login (session cookie; see `auth/jwt.rs`
 `control-plane` module) to push a commit-SHA-tagged image to ECR, register a new
 ECS task-definition revision pinned to it, and roll the service — with the ECS
 deployment circuit breaker auto-rolling-back a failed deploy. No static AWS keys.
-**API auth** (`AUTH_ENABLED`): the server (`src/auth/`) resolves the caller from
-a `Bearer` Vouch JWT (CLI `--token` / `DEVBOX_TOKEN`) or an ALB's `x-amzn-oidc-data`
-(legacy path when fronted by an ALB), verifies it (ALB regional key / Vouch JWKS),
-and **binds `owner` to the verified principal** — so claim/release act only as the
-authenticated identity. The dashboard uses app-side OIDC login (`AUTH_OIDC_CLIENT_ID`,
-`AUTH_OIDC_CLIENT_SECRET`, `AUTH_OIDC_REDIRECT_URI`) with a session cookie.
-Read endpoints stay open. **Owner validation:** claim/release reject an
-`owner` that is not a valid Unix login name (`is_valid_unix_username` in
-`devbox-common`: `^[a-z_][a-z0-9_-]*$`, ≤32 chars) with a 400 — the same rule the
-host's `owner-sync` applies — so a misconfigured `AUTH_PRINCIPAL_CLAIM` fails at
-claim time instead of as a broken SSH login.
+**API auth** (`AUTH_ENABLED`): the CLI authenticates via **device-code OAuth
+(RFC 8628) + anonymous Dynamic Client Registration (RFC 7591)**. Running
+`devbox login` discovers the authorization server from `GET
+/.well-known/oauth-protected-resource` (RFC 9728), self-registers a public
+client with Vouch, and caches the resulting `id_token` under
+`~/.config/devbox/session.json`. Subsequent commands send it as a `Bearer`
+token. The server also accepts an ALB's `x-amzn-oidc-data` header (legacy path
+when fronted by an ALB). Both paths are verified against the Vouch JWKS (issuer
++ signature + `email` claim). **Security boundary:** any valid, unexpired Vouch
+`id_token` with an `email` claim is accepted; `AUTH_OIDC_AUDIENCE` is
+intentionally unset because each DCR-registered CLI install gets its own `aud`
+value, so audience pinning would reject all CLI tokens. Authorization is
+per-claim ownership, not per-audience — the server re-binds `owner` to the
+email-derived principal on every claim/release. The dashboard uses app-side OIDC
+login (`AUTH_OIDC_CLIENT_ID`, `AUTH_OIDC_CLIENT_SECRET`, `AUTH_OIDC_REDIRECT_URI`)
+with a session cookie. Read endpoints stay open. **Owner validation:**
+claim/release reject an `owner` that is not a valid Unix login name
+(`is_valid_unix_username` in `devbox-common`: `^[a-z_][a-z0-9_.-]*$`, ≤32
+chars) with a 400 — the same rule the host's `owner-sync` applies — so a
+misconfigured principal fails at claim time instead of as a broken SSH login.
 
 **Planned / not yet built** (ideas borrowed from [`.kiro/references.md`](.kiro/references.md)
 are tagged inline):

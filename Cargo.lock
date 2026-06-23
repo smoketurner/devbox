@@ -958,6 +958,7 @@ name = "devbox-cli"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "devbox-common",
  "dialoguer",
@@ -2268,6 +2269,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
