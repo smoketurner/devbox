@@ -6,8 +6,8 @@
 //! several). The file lives under the XDG *state* directory — it is
 //! machine-managed runtime state, not user-edited config.
 //!
-//! Owner is intentionally never stored: it is always re-derived from the
-//! authenticated session (see [`crate::token`]).
+//! Owner is intentionally never stored: it is always the authenticated
+//! principal, bound server-side from the bearer token (see [`crate::session`]).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

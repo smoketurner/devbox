@@ -10,7 +10,7 @@ use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use secrecy::{ExposeSecret, SecretString};
 
-use devbox_common::is_valid_unix_username;
+use devbox_common::username_from_email;
 
 /// Header the ALB injects with a signed JWT for OIDC-authenticated requests.
 const ALB_OIDC_DATA_HEADER: &str = "x-amzn-oidc-data";
@@ -22,8 +22,6 @@ pub struct AuthConfig {
     pub issuer: String,
     /// JWKS URI for bearer-token signing keys (e.g. `https://us.vouch.sh/oauth/jwks`).
     pub jwks_uri: String,
-    /// Expected audience (the OIDC client id). `None` skips audience validation.
-    pub audience: Option<String>,
     /// Region whose ALB public keys verify `x-amzn-oidc-data` (e.g. `us-east-1`).
     pub alb_region: Option<String>,
     /// OIDC Authorization Code settings for the browser dashboard login. `None`
@@ -95,6 +93,12 @@ pub struct Authenticator {
     jwks: RwLock<HashMap<String, DecodingKey>>,
     /// Cached ALB signing keys, keyed by `kid`.
     alb_keys: RwLock<HashMap<String, DecodingKey>>,
+    /// Test-only: when set, [`authenticate`](Self::authenticate) resolves every
+    /// request to this owner without touching the network (mocks the JWKS
+    /// boundary so sibling-module handler tests need not mint real tokens).
+    /// Always `None` in production builds.
+    #[cfg(test)]
+    test_owner: Option<String>,
 }
 
 impl Authenticator {
@@ -106,7 +110,25 @@ impl Authenticator {
             http: reqwest::Client::new(),
             jwks: RwLock::new(HashMap::new()),
             alb_keys: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            test_owner: None,
         }
+    }
+
+    /// Test-only constructor: an authenticator that resolves every authenticated
+    /// request to `owner`, bypassing network JWKS verification. Lets handler
+    /// tests exercise claim/release logic without minting real Vouch tokens; the
+    /// JWT verification path itself is covered by the `decode_owner` unit tests.
+    #[cfg(test)]
+    pub(crate) fn with_test_owner(owner: &str) -> Self {
+        let mut auth = Self::new(AuthConfig {
+            issuer: "https://us.vouch.sh".to_string(),
+            jwks_uri: "https://us.vouch.sh/oauth/jwks".to_string(),
+            alb_region: None,
+            oidc: None,
+        });
+        auth.test_owner = Some(owner.to_string());
+        auth
     }
 
     /// Resolve the caller's principal from request headers.
@@ -116,6 +138,11 @@ impl Authenticator {
     /// Returns [`AuthError::Missing`] when no credential is present, or
     /// [`AuthError::Invalid`] when one is present but fails verification.
     pub async fn authenticate(&self, headers: &HeaderMap) -> Result<Principal, AuthError> {
+        #[cfg(test)]
+        if let Some(owner) = &self.test_owner {
+            return Ok(Principal(owner.clone()));
+        }
+
         if let Some(value) = headers.get(ALB_OIDC_DATA_HEADER) {
             let token = value
                 .to_str()
@@ -144,10 +171,10 @@ impl Authenticator {
 
         let mut validation = Validation::new(token_algorithm(token)?);
         validation.set_issuer(&[self.config.issuer.as_str()]);
-        match self.config.audience.as_deref() {
-            Some(aud) => validation.set_audience(&[aud]),
-            None => validation.validate_aud = false,
-        }
+        // Audience is intentionally not validated: under DCR each CLI install's
+        // id_token carries `aud` = its own client_id, so there is no single
+        // audience to pin. The boundary is issuer + signature + `email`.
+        validation.validate_aud = false;
 
         let (owner, _email) = decode_owner(token, &key, &validation)?;
         Ok(Principal(owner))
@@ -237,6 +264,12 @@ impl Authenticator {
     #[must_use]
     pub fn oidc(&self) -> Option<&OidcConfig> {
         self.config.oidc.as_ref()
+    }
+
+    /// The configured token issuer (Vouch authorization server URL).
+    #[must_use]
+    pub fn issuer(&self) -> &str {
+        &self.config.issuer
     }
 
     /// Build the IdP authorization URL for the dashboard login redirect.
@@ -415,19 +448,6 @@ fn decode_owner(
     Ok((owner, email.to_string()))
 }
 
-/// Derive a Unix login from an email: the local part (before `@`), surrounding
-/// whitespace trimmed and lowercased. Returns `None` unless that is already a
-/// valid Unix username.
-///
-/// Only surrounding whitespace is trimmed; internal characters are never
-/// stripped and the result is never truncated — a non-conforming local part is
-/// rejected, not mangled — so distinct local parts can never collide on the same
-/// `owner` (which would let one user act on another's devboxes).
-fn username_from_email(email: &str) -> Option<String> {
-    let local = email.trim().split('@').next()?.trim().to_ascii_lowercase();
-    is_valid_unix_username(&local).then_some(local)
-}
-
 #[cfg(test)]
 #[expect(
     clippy::unwrap_used,
@@ -498,48 +518,10 @@ mod tests {
         assert!(decode_owner(&token, &key, &validation()).is_err());
     }
 
-    #[test]
-    fn username_from_email_takes_local_part() {
-        assert_eq!(
-            username_from_email("jdoe@example.com").as_deref(),
-            Some("jdoe")
-        );
-    }
-
-    #[test]
-    fn username_from_email_lowercases_and_trims() {
-        assert_eq!(
-            username_from_email("  JDoe@example.com  ").as_deref(),
-            Some("jdoe")
-        );
-    }
-
-    #[test]
-    fn username_from_email_allows_dots_without_collision() {
-        // Dots are kept (first.last logins), never stripped — so distinct local
-        // parts can't fold onto the same owner (a.b stays distinct from ab).
-        assert_eq!(
-            username_from_email("first.last@example.com").as_deref(),
-            Some("first.last")
-        );
-        assert_eq!(username_from_email("a.b@corp.com").as_deref(), Some("a.b"));
-        assert_eq!(username_from_email("ab@corp.com").as_deref(), Some("ab"));
-    }
-
-    #[test]
-    fn username_from_email_rejects_underiverable() {
-        assert!(username_from_email("123@example.com").is_none()); // leading digit
-        assert!(username_from_email("@example.com").is_none()); // empty local part
-        assert!(username_from_email("a+b@example.com").is_none()); // '+' not allowed
-        let long = format!("{}@example.com", "a".repeat(33));
-        assert!(username_from_email(&long).is_none()); // >32 chars, never truncated
-    }
-
     fn base_config(oidc: Option<OidcConfig>) -> AuthConfig {
         AuthConfig {
             issuer: ISSUER.to_string(),
             jwks_uri: "https://us.vouch.sh/oauth/jwks".to_string(),
-            audience: None,
             alb_region: None,
             oidc,
         }

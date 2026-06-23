@@ -9,9 +9,10 @@ Shared types for [devbox](../../README.md), used by both `devbox-server` and
   `InstanceType`, `AmiId`, `SubnetId`, `SecurityGroupId`.
 - **`DevboxState`** — the lifecycle enum: `Launching → Warming → Ready → Claimed
   → Terminating`.
-- **API request/response types** — `ClaimRequest`, `ReleaseRequest`,
-  `DevboxResponse`, `DevboxListResponse`, `HealthResponse`,
-  `PoolMetricsResponse`.
+- **API request/response types** — `ClaimRequest`, `DevboxResponse`,
+  `DevboxListResponse`, `HealthResponse`, `PoolMetricsResponse`,
+  `ProtectedResourceMetadata`. Release takes no body — the owner is the
+  authenticated principal, so there is no `ReleaseRequest`.
 - **Config structs** — `ServerConfig`, `DatabaseConfig`.
 
 All types derive `serde::{Serialize, Deserialize}`; the AWS-id newtypes are

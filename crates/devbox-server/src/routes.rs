@@ -10,7 +10,7 @@ use axum::routing::{get, post};
 
 use devbox_common::{
     ClaimRequest, DevboxListResponse, DevboxResponse, DevboxState, HealthResponse,
-    PoolMetricsResponse, ReleaseRequest, is_valid_unix_username,
+    PoolMetricsResponse, ProtectedResourceMetadata,
 };
 
 use crate::auth::Authenticator;
@@ -25,41 +25,30 @@ use crate::ui::build_ui_router;
 pub struct AppState {
     pub store: Arc<DocumentStore>,
     pub reconciler_config: Arc<ReconcilerConfig>,
-    /// When set, claim/release require an authenticated principal and bind
-    /// `owner` to it. When `None` (local dev), the request body's `owner` is
-    /// trusted.
-    pub auth: Option<Arc<Authenticator>>,
+    /// Claim/release always require an authenticated principal and bind `owner`
+    /// to it — the Unix login derived from the token's `email` claim.
+    pub auth: Arc<Authenticator>,
 }
 
-/// Resolve the caller's `owner`: when auth is enabled, the Unix login derived
-/// from the token's `email` claim; otherwise the body-supplied owner (local dev).
+/// Resolve the caller's `owner` from the request credential: the Unix login
+/// derived from the verified token's `email` claim.
 ///
 /// The owner doubles as the Unix login account the host provisions for the
-/// claimant (see [`is_valid_unix_username`]). The authenticated path already
-/// derives a valid login from the email; this guard catches a non-Unix-safe
-/// body-supplied owner in the no-auth path rather than silently breaking SSH.
-async fn resolve_owner(
-    state: &AppState,
-    headers: &HeaderMap,
-    body_owner: &str,
-) -> Result<String, AppError> {
-    let owner = match &state.auth {
-        Some(auth) => auth.authenticate(headers).await?.0,
-        None => body_owner.trim().to_string(),
-    };
-    if !is_valid_unix_username(&owner) {
-        return Err(AppError::BadRequest(format!(
-            "owner '{owner}' is not a valid Unix login name (must match \
-             ^[a-z_][a-z0-9_.-]*$, at most 32 characters)"
-        )));
-    }
-    Ok(owner)
+/// claimant. The derivation already gates on `is_valid_unix_username`
+/// (see `auth::jwt::decode_owner`), so a value returned here is always a valid
+/// login; a malformed `email` yields a 401 rather than a downstream SSH break.
+async fn authenticated_owner(state: &AppState, headers: &HeaderMap) -> Result<String, AppError> {
+    Ok(state.auth.authenticate(headers).await?.0)
 }
 
 /// Build the Axum router with all routes.
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health_check))
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(protected_resource_metadata),
+        )
         .route("/api/v1/devboxes", get(list_devboxes))
         .route("/api/v1/devboxes/{id}", get(get_devbox))
         .route("/api/v1/devboxes/claim", post(claim_devbox))
@@ -67,6 +56,34 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/pool/metrics", get(pool_metrics))
         .merge(build_ui_router())
         .with_state(state)
+}
+
+/// RFC 9728 OAuth 2.0 Protected Resource Metadata endpoint.
+///
+/// Clients (the `devbox` CLI) fetch this to discover the authorization server
+/// and scopes without out-of-band configuration.
+///
+/// `scopes_supported` is hardcoded to `["openid","email"]` — the minimum the
+/// server requires — and NOT derived from `OidcConfig.scope`, which is `None`
+/// on API-only deployments. `resource` is advisory/best-effort from the `Host`
+/// header; the CLI only reads `authorization_servers`.
+async fn protected_resource_metadata(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Json<ProtectedResourceMetadata> {
+    // Best-effort: read Host header for the resource URL. The CLI ignores this
+    // field; it is advisory per RFC 9728 §3.1.
+    let resource = headers
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .filter(|h| !h.is_empty())
+        .map_or_else(String::new, |h| format!("https://{h}"));
+
+    Json(ProtectedResourceMetadata {
+        resource,
+        authorization_servers: vec![state.auth.issuer().to_string()],
+        scopes_supported: vec!["openid".into(), "email".into()],
+    })
 }
 
 /// Health check endpoint.
@@ -110,7 +127,7 @@ async fn claim_devbox(
     headers: HeaderMap,
     JsonBody(req): JsonBody<ClaimRequest>,
 ) -> Result<Json<DevboxResponse>, AppError> {
-    let owner = resolve_owner(&state, &headers, &req.owner).await?;
+    let owner = authenticated_owner(&state, &headers).await?;
 
     let ready_docs = state.store.find_all::<DevboxDoc>("state", "ready").await?;
     if ready_docs.is_empty() {
@@ -165,9 +182,8 @@ async fn release_devbox(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    JsonBody(req): JsonBody<ReleaseRequest>,
 ) -> Result<Json<DevboxResponse>, AppError> {
-    let caller = resolve_owner(&state, &headers, &req.owner).await?;
+    let caller = authenticated_owner(&state, &headers).await?;
 
     let doc = state
         .store
@@ -261,19 +277,50 @@ mod tests {
     use crate::db::migrations::run_sqlite_migrations;
     use crate::db::pool::Pool;
 
+    use crate::auth::Authenticator;
+
     /// Build an `AppState` over a single-connection in-memory SQLite store
     /// (`max_connections(1)`, so concurrent handler calls share one database)
-    /// with auth disabled.
+    /// whose authenticator resolves every request to `owner` (the JWKS network
+    /// boundary is mocked; the JWT verification path itself is covered by the
+    /// `auth::jwt` `decode_owner` unit tests).
+    async fn setup_state_as(owner: &str) -> AppState {
+        AppState {
+            store: Arc::new(test_store().await),
+            reconciler_config: Arc::new(test_config()),
+            auth: Arc::new(Authenticator::with_test_owner(owner)),
+        }
+    }
+
+    /// Default test state: every request authenticates as `jdoe`.
     async fn setup_state() -> AppState {
+        setup_state_as("jdoe").await
+    }
+
+    /// Build an `AppState` whose authenticator has no test principal, so a
+    /// request without a credential fails with `AuthError::Missing` (no network
+    /// touched). Used to assert the unauthenticated path returns 401.
+    async fn setup_state_no_principal() -> AppState {
+        use crate::auth::AuthConfig;
+        let auth = Authenticator::new(AuthConfig {
+            issuer: "https://us.vouch.sh".to_string(),
+            jwks_uri: "https://us.vouch.sh/oauth/jwks".to_string(),
+            alb_region: None,
+            oidc: None,
+        });
+        AppState {
+            store: Arc::new(test_store().await),
+            reconciler_config: Arc::new(test_config()),
+            auth: Arc::new(auth),
+        }
+    }
+
+    async fn test_store() -> DocumentStore {
         let pool = Pool::new_test();
         if let Pool::Sqlite(ref p) = pool {
             run_sqlite_migrations(p).await.unwrap();
         }
-        AppState {
-            store: Arc::new(DocumentStore::new(pool)),
-            reconciler_config: Arc::new(test_config()),
-            auth: None,
-        }
+        DocumentStore::new(pool)
     }
 
     fn test_config() -> ReconcilerConfig {
@@ -314,19 +361,18 @@ mod tests {
         }
     }
 
-    fn claim(owner: &str) -> ClaimRequest {
+    fn claim() -> ClaimRequest {
         ClaimRequest {
-            owner: owner.to_string(),
             instance_type: None,
         }
     }
 
     #[tokio::test]
-    async fn claim_marks_box_claimed_with_owner() {
-        let state = setup_state().await;
+    async fn claim_marks_box_claimed_with_authenticated_owner() {
+        let state = setup_state_as("jdoe").await;
         insert(&state, ready_devbox()).await;
 
-        let body = claim_devbox(State(state), HeaderMap::new(), JsonBody(claim("jdoe")))
+        let body = claim_devbox(State(state), HeaderMap::new(), JsonBody(claim()))
             .await
             .ok()
             .unwrap()
@@ -340,32 +386,18 @@ mod tests {
     async fn claim_empty_pool_is_conflict() {
         let state = setup_state().await;
         let status =
-            status_of(claim_devbox(State(state), HeaderMap::new(), JsonBody(claim("jdoe"))).await);
+            status_of(claim_devbox(State(state), HeaderMap::new(), JsonBody(claim())).await);
         assert_eq!(status, StatusCode::CONFLICT);
     }
 
     #[tokio::test]
-    async fn claim_rejects_non_unix_owner() {
-        let state = setup_state().await;
+    async fn claim_without_credential_is_unauthorized() {
+        let state = setup_state_no_principal().await;
         insert(&state, ready_devbox()).await;
-        let status = status_of(
-            claim_devbox(
-                State(state),
-                HeaderMap::new(),
-                JsonBody(claim("jane@example.com")),
-            )
-            .await,
-        );
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn claim_rejects_blank_owner() {
-        let state = setup_state().await;
-        insert(&state, ready_devbox()).await;
+        // No Authorization / x-amzn-oidc-data header → AuthError::Missing → 401.
         let status =
-            status_of(claim_devbox(State(state), HeaderMap::new(), JsonBody(claim("   "))).await);
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+            status_of(claim_devbox(State(state), HeaderMap::new(), JsonBody(claim())).await);
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -374,16 +406,8 @@ mod tests {
         insert(&state, ready_devbox()).await;
 
         let (r1, r2) = tokio::join!(
-            claim_devbox(
-                State(state.clone()),
-                HeaderMap::new(),
-                JsonBody(claim("alice"))
-            ),
-            claim_devbox(
-                State(state.clone()),
-                HeaderMap::new(),
-                JsonBody(claim("bob"))
-            ),
+            claim_devbox(State(state.clone()), HeaderMap::new(), JsonBody(claim())),
+            claim_devbox(State(state.clone()), HeaderMap::new(), JsonBody(claim())),
         );
 
         let statuses = [status_of(r1), status_of(r2)];
@@ -398,24 +422,44 @@ mod tests {
 
     #[tokio::test]
     async fn release_by_non_owner_is_forbidden() {
-        let state = setup_state().await;
+        // Box owned by alice; caller authenticates as bob.
+        let state = setup_state_as("bob").await;
         let mut doc = ready_devbox();
         doc.state = DevboxState::Claimed;
         doc.owner = Some("alice".to_string());
         let id = insert(&state, doc).await;
 
-        let status = status_of(
-            release_devbox(
-                State(state),
-                Path(id),
-                HeaderMap::new(),
-                JsonBody(ReleaseRequest {
-                    owner: "bob".to_string(),
-                }),
-            )
-            .await,
-        );
+        let status = status_of(release_devbox(State(state), Path(id), HeaderMap::new()).await);
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn protected_resource_metadata_returns_correct_shape() {
+        let state = setup_state().await;
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::HOST, "cp.example".parse().unwrap());
+
+        let Json(meta) = protected_resource_metadata(State(state), headers).await;
+
+        assert_eq!(
+            meta.authorization_servers.first().map(String::as_str),
+            Some("https://us.vouch.sh")
+        );
+        assert_eq!(meta.scopes_supported, ["openid", "email"]);
+        assert_eq!(meta.resource, "https://cp.example");
+    }
+
+    #[tokio::test]
+    async fn protected_resource_metadata_no_host_header_returns_empty_resource() {
+        // Pins the documented behavior: missing Host → empty resource string
+        // (advisory per RFC 9728 §3.1; CLI only reads authorization_servers).
+        let state = setup_state().await;
+        let Json(meta) = protected_resource_metadata(State(state), HeaderMap::new()).await;
+        assert_eq!(
+            meta.resource, "",
+            "missing Host header must yield empty resource"
+        );
+        assert_eq!(meta.authorization_servers, ["https://us.vouch.sh"]);
     }
 
     #[tokio::test]
@@ -423,17 +467,7 @@ mod tests {
         let state = setup_state().await;
         let id = insert(&state, ready_devbox()).await;
 
-        let status = status_of(
-            release_devbox(
-                State(state),
-                Path(id),
-                HeaderMap::new(),
-                JsonBody(ReleaseRequest {
-                    owner: "alice".to_string(),
-                }),
-            )
-            .await,
-        );
+        let status = status_of(release_devbox(State(state), Path(id), HeaderMap::new()).await);
         assert_eq!(status, StatusCode::CONFLICT);
     }
 }
