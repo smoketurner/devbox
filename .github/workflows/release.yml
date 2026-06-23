@@ -42,6 +42,13 @@ jobs:
         uses: docker/bake-action@6614cfa25eff9a0b2b2697efb0b6159e7680d584 # v7.2.0
         with:
           targets: ci
+          # Build from scratch: a fully cache-hit bake reports the `type=local`
+          # export as succeeding but never materializes the binaries on the
+          # runner, so the assemble step below finds nothing. CI pre-populates
+          # the cache for the tagged commit, so without this a release always
+          # hits the empty-export path. Releases are infrequent; a clean build
+          # is also better for reproducibility.
+          no-cache: true
       - name: Assemble release artifacts
         run: |
           set -euo pipefail
