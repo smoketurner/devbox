@@ -148,19 +148,54 @@ impl AsRef<str> for SecurityGroupId {
 // Principal / username validation
 // ============================================================================
 
-/// Whether `name` is a valid Linux login account name.
+/// Login names that must never be provisioned as a devbox owner: system accounts
+/// and cloud-image defaults.
+///
+/// A devbox `owner` doubles as the Unix account the host provisions for the
+/// claimant. Provisioning one of these names would *reuse* a pre-existing account
+/// (and grant it passwordless sudo) instead of a dedicated per-claimant account —
+/// breaking the one-account-per-claimant design and confusing audit trails. The
+/// on-host `owner-sync` also refuses any pre-existing account with UID < 1000 as
+/// defense-in-depth; this list additionally catches cloud defaults like `ubuntu`
+/// and `ec2-user`, which are UID 1000.
+const RESERVED_USERNAMES: &[&str] = &[
+    "root",
+    "admin",
+    "ubuntu",
+    "ec2-user",
+    "daemon",
+    "bin",
+    "sys",
+    "sync",
+    "nobody",
+    "sshd",
+    "docker",
+    "systemd-network",
+    "systemd-resolve",
+];
+
+/// Whether `name` is a reserved system or cloud-default login name (see
+/// [`RESERVED_USERNAMES`]). Case-insensitive.
+#[must_use]
+pub fn is_reserved_username(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    RESERVED_USERNAMES.contains(&lower.as_str())
+}
+
+/// Whether `name` is a valid Linux login account name for a devbox owner.
 ///
 /// Allows `^[a-z_][a-z0-9_.-]*$`, at most 32 characters — a superset of
 /// `useradd`'s stock `NAME_REGEX` that also permits dots, so email-derived
-/// `first.last` logins work. A devbox `owner` doubles as the Unix login account
-/// the host provisions for the claimant, so a principal that is not a valid
-/// username (e.g. a full email address) can never be logged into over SSH.
-/// Claims reject such an owner up front, and the on-host `owner-sync` agent
-/// applies the same rule (passing `useradd --badname` for dotted names, which
-/// fall outside useradd's stock regex).
+/// `first.last` logins work — and rejects [reserved names](is_reserved_username).
+/// A devbox `owner` doubles as the Unix login account the host provisions for the
+/// claimant, so a principal that is not a valid username (e.g. a full email
+/// address) or that collides with a system/cloud-default account can never be
+/// safely logged into over SSH. Claims reject such an owner up front, and the
+/// on-host `owner-sync` agent applies the same rule (passing `useradd --badname`
+/// for dotted names, which fall outside useradd's stock regex).
 #[must_use]
 pub fn is_valid_unix_username(name: &str) -> bool {
-    if name.is_empty() || name.len() > 32 {
+    if name.is_empty() || name.len() > 32 || is_reserved_username(name) {
         return false;
     }
     let first_ok = name
@@ -485,6 +520,17 @@ mod tests {
         assert!(!is_valid_unix_username(".hidden")); // leading dot
         assert!(!is_valid_unix_username("a/../b"));
         assert!(!is_valid_unix_username(&"x".repeat(33)));
+    }
+
+    #[test]
+    fn test_is_valid_unix_username_rejects_reserved() {
+        // System and cloud-default accounts must not be reused as owners.
+        assert!(!is_valid_unix_username("root"));
+        assert!(!is_valid_unix_username("ubuntu"));
+        assert!(!is_valid_unix_username("ec2-user"));
+        assert!(is_reserved_username("ROOT")); // case-insensitive
+        // An email whose local part is a reserved name yields no owner.
+        assert_eq!(username_from_email("root@example.com"), None);
     }
 
     #[test]
