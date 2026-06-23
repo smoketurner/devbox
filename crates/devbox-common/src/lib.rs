@@ -163,6 +163,7 @@ const RESERVED_USERNAMES: &[&str] = &[
     "admin",
     "ubuntu",
     "ec2-user",
+    "ssm-user",
     "daemon",
     "bin",
     "sys",
@@ -528,6 +529,7 @@ mod tests {
         assert!(!is_valid_unix_username("root"));
         assert!(!is_valid_unix_username("ubuntu"));
         assert!(!is_valid_unix_username("ec2-user"));
+        assert!(!is_valid_unix_username("ssm-user")); // SSM Session Manager default
         assert!(is_reserved_username("ROOT")); // case-insensitive
         // An email whose local part is a reserved name yields no owner.
         assert_eq!(username_from_email("root@example.com"), None);
