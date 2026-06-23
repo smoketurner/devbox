@@ -25,7 +25,8 @@ pub struct AuthConfig {
     /// Region whose ALB public keys verify `x-amzn-oidc-data` (e.g. `us-east-1`).
     pub alb_region: Option<String>,
     /// OIDC Authorization Code settings for the browser dashboard login. `None`
-    /// leaves the dashboard ungated (the API bearer path is unaffected).
+    /// renders the login page unusable (shows an error); all dashboard routes
+    /// require a valid session.
     pub oidc: Option<OidcConfig>,
 }
 
