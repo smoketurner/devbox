@@ -30,6 +30,7 @@ mod store_tests {
             instance_type: InstanceType("m5.large".to_string()),
             ami_id: AmiId("ami-12345678".to_string()),
             subnet_id: SubnetId("subnet-12345678".to_string()),
+            region: "us-east-1".to_string(),
             ebs_volume_id: Some("vol-12345678".to_string()),
             owner: None,
             claimed_at: None,

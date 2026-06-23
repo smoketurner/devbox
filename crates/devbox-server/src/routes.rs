@@ -21,14 +21,21 @@ use crate::reconcile::ReconcilerConfig;
 use crate::ui::build_ui_router;
 
 /// Application state shared across handlers.
-#[derive(Clone)]
+///
+/// Shared with handlers as a single `Arc<AppState>` (see [`SharedState`]), so the
+/// per-request clone is one refcount bump and the fields need no individual
+/// `Arc`. `store` is the exception: it is also held by the background reconciler
+/// task, so it stays `Arc<DocumentStore>`.
 pub struct AppState {
     pub store: Arc<DocumentStore>,
-    pub reconciler_config: Arc<ReconcilerConfig>,
+    pub reconciler_config: ReconcilerConfig,
     /// Claim/release always require an authenticated principal and bind `owner`
     /// to it — the Unix login derived from the token's `email` claim.
-    pub auth: Arc<Authenticator>,
+    pub auth: Authenticator,
 }
+
+/// Handle to the shared application state, passed to every handler.
+pub type SharedState = Arc<AppState>;
 
 /// Resolve the caller's `owner` from the request credential: the Unix login
 /// derived from the verified token's `email` claim.
@@ -42,7 +49,7 @@ async fn authenticated_owner(state: &AppState, headers: &HeaderMap) -> Result<St
 }
 
 /// Build the Axum router with all routes.
-pub fn build_router(state: AppState) -> Router {
+pub fn build_router(state: SharedState) -> Router {
     Router::new()
         .route("/health", get(health_check))
         .route(
@@ -68,7 +75,7 @@ pub fn build_router(state: AppState) -> Router {
 /// on API-only deployments. `resource` is advisory/best-effort from the `Host`
 /// header; the CLI only reads `authorization_servers`.
 async fn protected_resource_metadata(
-    State(state): State<AppState>,
+    State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> Json<ProtectedResourceMetadata> {
     // Best-effort: read Host header for the resource URL. The CLI ignores this
@@ -87,7 +94,7 @@ async fn protected_resource_metadata(
 }
 
 /// Health check endpoint.
-async fn health_check(State(state): State<AppState>) -> Json<HealthResponse> {
+async fn health_check(State(state): State<SharedState>) -> Json<HealthResponse> {
     let db_status = match state.store.pool().is_healthy().await {
         Ok(()) => "healthy".to_string(),
         Err(e) => format!("unhealthy: {e}"),
@@ -101,7 +108,7 @@ async fn health_check(State(state): State<AppState>) -> Json<HealthResponse> {
 
 /// List all devboxes.
 async fn list_devboxes(
-    State(state): State<AppState>,
+    State(state): State<SharedState>,
 ) -> Result<Json<DevboxListResponse>, AppError> {
     let docs = state.store.list_all::<DevboxDoc>().await?;
     let devboxes = docs.into_iter().map(DevboxResponse::from).collect();
@@ -110,7 +117,7 @@ async fn list_devboxes(
 
 /// Get a single devbox by ID.
 async fn get_devbox(
-    State(state): State<AppState>,
+    State(state): State<SharedState>,
     Path(id): Path<String>,
 ) -> Result<Json<DevboxResponse>, AppError> {
     let doc = state
@@ -123,7 +130,7 @@ async fn get_devbox(
 
 /// Claim an available devbox.
 async fn claim_devbox(
-    State(state): State<AppState>,
+    State(state): State<SharedState>,
     headers: HeaderMap,
     JsonBody(req): JsonBody<ClaimRequest>,
 ) -> Result<Json<DevboxResponse>, AppError> {
@@ -179,7 +186,7 @@ async fn claim_devbox(
 
 /// Release a claimed devbox.
 async fn release_devbox(
-    State(state): State<AppState>,
+    State(state): State<SharedState>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<DevboxResponse>, AppError> {
@@ -226,7 +233,7 @@ async fn release_devbox(
 
 /// Get pool metrics.
 async fn pool_metrics(
-    State(state): State<AppState>,
+    State(state): State<SharedState>,
 ) -> Result<Json<PoolMetricsResponse>, AppError> {
     let docs = state.store.list_all::<DevboxDoc>().await?;
 
@@ -284,23 +291,23 @@ mod tests {
     /// whose authenticator resolves every request to `owner` (the JWKS network
     /// boundary is mocked; the JWT verification path itself is covered by the
     /// `auth::jwt` `decode_owner` unit tests).
-    async fn setup_state_as(owner: &str) -> AppState {
-        AppState {
+    async fn setup_state_as(owner: &str) -> SharedState {
+        Arc::new(AppState {
             store: Arc::new(test_store().await),
-            reconciler_config: Arc::new(test_config()),
-            auth: Arc::new(Authenticator::with_test_owner(owner)),
-        }
+            reconciler_config: test_config(),
+            auth: Authenticator::with_test_owner(owner),
+        })
     }
 
     /// Default test state: every request authenticates as `jdoe`.
-    async fn setup_state() -> AppState {
+    async fn setup_state() -> SharedState {
         setup_state_as("jdoe").await
     }
 
     /// Build an `AppState` whose authenticator has no test principal, so a
     /// request without a credential fails with `AuthError::Missing` (no network
     /// touched). Used to assert the unauthenticated path returns 401.
-    async fn setup_state_no_principal() -> AppState {
+    async fn setup_state_no_principal() -> SharedState {
         use crate::auth::AuthConfig;
         let auth = Authenticator::new(AuthConfig {
             issuer: "https://us.vouch.sh".to_string(),
@@ -309,11 +316,11 @@ mod tests {
             alb_arn: None,
             oidc: None,
         });
-        AppState {
+        Arc::new(AppState {
             store: Arc::new(test_store().await),
-            reconciler_config: Arc::new(test_config()),
-            auth: Arc::new(auth),
-        }
+            reconciler_config: test_config(),
+            auth,
+        })
     }
 
     async fn test_store() -> DocumentStore {
@@ -342,6 +349,7 @@ mod tests {
             instance_type: InstanceType("m5.large".to_string()),
             ami_id: AmiId("ami-12345678".to_string()),
             subnet_id: SubnetId("subnet-12345678".to_string()),
+            region: "us-east-1".to_string(),
             ebs_volume_id: None,
             owner: None,
             claimed_at: None,
@@ -381,6 +389,9 @@ mod tests {
 
         assert_eq!(body.state, DevboxState::Claimed);
         assert_eq!(body.owner.as_deref(), Some("jdoe"));
+        // The instance's region (from instance metadata, carried on the doc) is
+        // surfaced so the CLI can open the SSM tunnel without client-side config.
+        assert_eq!(body.region, "us-east-1");
     }
 
     #[tokio::test]

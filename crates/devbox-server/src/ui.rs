@@ -16,7 +16,7 @@ use rust_embed::Embed;
 use crate::auth::{SessionUser, random_token};
 use crate::db::document_type::Document;
 use crate::documents::devbox::DevboxDoc;
-use crate::routes::AppState;
+use crate::routes::{AppState, SharedState};
 use devbox_common::DevboxState;
 
 /// Cookie holding the Vouch OIDC ID token after a successful dashboard login.
@@ -217,7 +217,7 @@ async fn require_login(state: &AppState, headers: &HeaderMap) -> Result<SessionU
 /// redirect to the IdP.
 ///
 /// GET /login
-async fn login(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn login(State(state): State<SharedState>, headers: HeaderMap) -> Response {
     let auth = &state.auth;
     if auth.oidc().is_none() {
         // Login is required but not configured — surface it rather than looping
@@ -256,7 +256,7 @@ async fn login(State(state): State<AppState>, headers: HeaderMap) -> Response {
 ///
 /// GET /oauth2/idpresponse
 async fn oauth_callback(
-    State(state): State<AppState>,
+    State(state): State<SharedState>,
     headers: HeaderMap,
     Query(query): Query<CallbackQuery>,
 ) -> Response {
@@ -342,7 +342,7 @@ async fn logout() -> Response {
 // ============================================================================
 
 /// Build the UI router.
-pub fn build_ui_router() -> Router<AppState> {
+pub fn build_ui_router() -> Router<SharedState> {
     Router::new()
         .route("/", get(dashboard))
         .route("/login", get(login))
@@ -358,7 +358,7 @@ pub fn build_ui_router() -> Router<AppState> {
 /// Render the dashboard page.
 ///
 /// GET /
-async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn dashboard(State(state): State<SharedState>, headers: HeaderMap) -> Response {
     let display_name = match require_login(&state, &headers).await {
         Ok(user) => user.display,
         Err(redirect) => return redirect,
@@ -396,7 +396,7 @@ async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Respons
 ///
 /// GET /devboxes/{id}
 async fn devbox_detail(
-    State(state): State<AppState>,
+    State(state): State<SharedState>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
@@ -425,7 +425,7 @@ async fn devbox_detail(
 /// Render the claim form.
 ///
 /// GET /devboxes/claim
-async fn claim_form(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn claim_form(State(state): State<SharedState>, headers: HeaderMap) -> Response {
     if let Err(redirect) = require_login(&state, &headers).await {
         return redirect;
     }
@@ -440,7 +440,7 @@ async fn claim_form(State(state): State<AppState>, headers: HeaderMap) -> Respon
 ///
 /// POST /devboxes/claim
 async fn submit_claim(
-    State(state): State<AppState>,
+    State(state): State<SharedState>,
     headers: HeaderMap,
     Form(form): Form<ClaimFormData>,
 ) -> Response {
@@ -516,7 +516,7 @@ async fn submit_claim(
 ///
 /// POST /devboxes/{id}/release
 async fn submit_release(
-    State(state): State<AppState>,
+    State(state): State<SharedState>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {

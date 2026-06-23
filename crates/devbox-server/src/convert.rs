@@ -14,6 +14,7 @@ impl From<Document<DevboxDoc>> for DevboxResponse {
             instance_type: doc.data.instance_type,
             ami_id: doc.data.ami_id,
             owner: doc.data.owner,
+            region: doc.data.region,
             created_at: doc.created_at.to_string(),
             claimed_at: doc.data.claimed_at.map(|ts| ts.to_string()),
         }

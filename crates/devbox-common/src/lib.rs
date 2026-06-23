@@ -316,6 +316,10 @@ pub struct DevboxResponse {
     pub instance_type: InstanceType,
     pub ami_id: AmiId,
     pub owner: Option<String>,
+    /// AWS region the instance runs in. Every pool instance resides in the
+    /// control plane's region; the CLI uses this to open the SSM tunnel without
+    /// any client-side AWS region configuration.
+    pub region: String,
     pub created_at: String,
     pub claimed_at: Option<String>,
 }

@@ -233,6 +233,7 @@ async fn sync_docs_with_asg(
             instance_type: InstanceType(info.instance_type.clone()),
             ami_id: AmiId(info.ami_id.clone()),
             subnet_id: SubnetId(info.subnet_id.clone()),
+            region: info.region.clone(),
             ebs_volume_id: None,
             owner: None,
             claimed_at: None,

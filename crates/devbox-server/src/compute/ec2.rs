@@ -8,6 +8,8 @@ use super::{AsgDescription, AsgInstance, Compute, InstanceInfo};
 pub struct Ec2 {
     ec2_client: aws_sdk_ec2::Client,
     asg_client: aws_sdk_autoscaling::Client,
+    /// Region these clients target; every instance the pool manages lives here.
+    region: String,
 }
 
 impl Ec2 {
@@ -16,6 +18,10 @@ impl Ec2 {
         Self {
             ec2_client: aws_sdk_ec2::Client::new(config),
             asg_client: aws_sdk_autoscaling::Client::new(config),
+            region: config
+                .region()
+                .map(|r| r.as_ref().to_string())
+                .unwrap_or_default(),
         }
     }
 }
@@ -143,6 +149,7 @@ impl Compute for Ec2 {
                         .unwrap_or_default(),
                     ami_id: instance.image_id().unwrap_or_default().to_string(),
                     subnet_id: instance.subnet_id().unwrap_or_default().to_string(),
+                    region: self.region.clone(),
                     ready,
                 });
             }

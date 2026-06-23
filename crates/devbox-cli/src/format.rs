@@ -119,6 +119,7 @@ mod tests {
                 instance_type: InstanceType("m5.large".to_string()),
                 ami_id: AmiId("ami-12345678".to_string()),
                 owner: Some("alice".to_string()),
+                region: "us-east-1".to_string(),
                 created_at: "2024-01-01T00:00:00Z".to_string(),
                 claimed_at: None,
             }],
@@ -139,6 +140,7 @@ mod tests {
             instance_type: InstanceType("m5.large".to_string()),
             ami_id: AmiId("ami-123".to_string()),
             owner: Some("bob".to_string()),
+            region: "us-east-1".to_string(),
             created_at: "2024-01-01T00:00:00Z".to_string(),
             claimed_at: Some("2024-01-02T00:00:00Z".to_string()),
         };
@@ -160,6 +162,7 @@ mod tests {
             instance_type: InstanceType("m5.large".to_string()),
             ami_id: AmiId("ami-123".to_string()),
             owner: Some("alice".to_string()),
+            region: "us-east-1".to_string(),
             created_at: "2024-01-01T00:00:00Z".to_string(),
             claimed_at: Some("2024-01-02T00:00:00Z".to_string()),
         };
@@ -179,6 +182,7 @@ mod tests {
             instance_type: InstanceType("m5.large".to_string()),
             ami_id: AmiId("ami-123".to_string()),
             owner: None,
+            region: "us-east-1".to_string(),
             created_at: "2024-01-01T00:00:00Z".to_string(),
             claimed_at: None,
         };

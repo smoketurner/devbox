@@ -14,7 +14,8 @@ use devbox_common::DevboxResponse;
 pub(crate) struct SshOptions {
     /// Override the login user (defaults to the devbox owner / cert principal).
     pub user: Option<String>,
-    /// AWS region for the SSM tunnel (forwarded to the aws CLI ProxyCommand).
+    /// Override the AWS region for the SSM tunnel (defaults to the devbox's
+    /// region as reported by the server).
     pub region: Option<String>,
     /// AWS profile for the SSM tunnel.
     pub profile: Option<String>,
@@ -62,13 +63,16 @@ fn build_args(devbox: &DevboxResponse, opts: &SshOptions) -> Result<Vec<String>>
             .with_context(|| format!("devbox {} has no owner; pass --user", devbox.id))?,
     };
 
+    // The devbox always carries the region it runs in; an explicit `--region`
+    // overrides it. Either way the ProxyCommand is fully specified, so `ssh`
+    // never depends on the caller's ambient AWS region config.
+    let region = opts.region.as_deref().unwrap_or(devbox.region.as_str());
+
     let mut session = format!(
         "aws ssm start-session --target {instance_id} \
-         --document-name AWS-StartSSHSession --parameters portNumber=%p"
+         --document-name AWS-StartSSHSession --parameters portNumber=%p \
+         --region {region}"
     );
-    if let Some(region) = opts.region.as_deref() {
-        session.push_str(&format!(" --region {region}"));
-    }
     if let Some(profile) = opts.profile.as_deref() {
         session.push_str(&format!(" --profile {profile}"));
     }
@@ -143,6 +147,7 @@ mod tests {
             instance_type: InstanceType("m5.large".to_string()),
             ami_id: AmiId("ami-123".to_string()),
             owner: owner.map(str::to_string),
+            region: "us-west-2".to_string(),
             created_at: "2024-01-01T00:00:00Z".to_string(),
             claimed_at: Some("2024-01-02T00:00:00Z".to_string()),
         }
@@ -191,8 +196,22 @@ mod tests {
             .iter()
             .find(|a| a.starts_with("ProxyCommand="))
             .expect("proxy");
+        // The explicit --region flag overrides the devbox's own region.
         assert!(proxy.contains("--region us-east-1"));
         assert!(proxy.contains("--profile dev"));
+    }
+
+    #[test]
+    fn region_defaults_to_devbox_region() {
+        // With no --region flag, the ProxyCommand is still fully specified from
+        // the devbox's own region, so ssh never needs ambient AWS region config.
+        let devbox = claimed(Some("i-0abc"), Some("jdoe"));
+        let args = build_args(&devbox, &opts()).expect("args");
+        let proxy = args
+            .iter()
+            .find(|a| a.starts_with("ProxyCommand="))
+            .expect("proxy");
+        assert!(proxy.contains("--region us-west-2"));
     }
 
     #[test]

@@ -392,6 +392,7 @@ mod tests {
             instance_type: InstanceType("m5.large".to_string()),
             ami_id: AmiId("ami-12345678".to_string()),
             owner: owner.map(str::to_string),
+            region: "us-east-1".to_string(),
             created_at: "2026-06-23T00:00:00Z".to_string(),
             claimed_at: None,
         }

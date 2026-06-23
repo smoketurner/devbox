@@ -30,6 +30,7 @@ struct MockInstance {
     instance_type: String,
     ami_id: String,
     subnet_id: String,
+    region: String,
     tags: HashMap<String, String>,
 }
 
@@ -107,6 +108,7 @@ impl MockCompute {
                 instance_type: "m7g.large".to_string(),
                 ami_id: "ami-mock0000000000".to_string(),
                 subnet_id: "subnet-mock00000000".to_string(),
+                region: "us-east-1".to_string(),
                 tags: HashMap::new(),
             },
         );
@@ -253,6 +255,7 @@ impl Compute for MockCompute {
                 instance_type: inst.instance_type.clone(),
                 ami_id: inst.ami_id.clone(),
                 subnet_id: inst.subnet_id.clone(),
+                region: inst.region.clone(),
                 ready: inst.tags.get("devbox:ready").map(String::as_str) == Some("true"),
             })
             .collect();

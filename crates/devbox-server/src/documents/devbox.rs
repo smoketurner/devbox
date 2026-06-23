@@ -19,6 +19,12 @@ pub struct DevboxDoc {
     pub ami_id: AmiId,
     /// Subnet ID where the instance is launched.
     pub subnet_id: SubnetId,
+    /// AWS region the instance runs in (read from instance metadata, like
+    /// `subnet_id`). Surfaced in the API so the CLI can open the SSM tunnel
+    /// without client-side region configuration. Defaults empty for documents
+    /// written before this field existed; the reconciler backfills it.
+    #[serde(default)]
+    pub region: String,
     /// EBS volume ID (if attached).
     pub ebs_volume_id: Option<String>,
     /// Owner (user who claimed the devbox).
@@ -76,6 +82,7 @@ mod tests {
             instance_type: InstanceType("m5.large".to_string()),
             ami_id: AmiId("ami-12345678".to_string()),
             subnet_id: SubnetId("subnet-12345678".to_string()),
+            region: "us-east-1".to_string(),
             ebs_volume_id: Some("vol-12345678".to_string()),
             owner: None,
             claimed_at: None,

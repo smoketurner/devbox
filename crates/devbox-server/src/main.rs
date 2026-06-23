@@ -83,12 +83,12 @@ async fn main() -> Result<()> {
         .validate()
         .context("invalid reconciler configuration")?;
 
-    let reconciler_config = Arc::new(reconciler_config);
-
     // Load AWS config and create EC2 client. Retries are configured here, at the
     // SDK layer, so every compute call absorbs transient throttling/brownouts
     // without per-call retry loops — a momentary EC2 API failure must not stall
-    // the warm pool (the reconciler simply continues on the next tick).
+    // the warm pool (the reconciler simply continues on the next tick). The EC2
+    // client also captures the SDK's region and stamps it onto each instance it
+    // describes, so the CLI can open the SSM tunnel without client-side config.
     let aws_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .retry_config(aws_config::retry::RetryConfig::standard().with_max_attempts(5))
         .load()
@@ -100,16 +100,16 @@ async fn main() -> Result<()> {
     let reconcile_handle = spawn_reconciliation_loop(
         Arc::clone(&store),
         ec2_client,
-        (*reconciler_config).clone(),
+        reconciler_config.clone(),
         cancel.clone(),
     );
 
-    // Build router
-    let app = build_router(AppState {
+    // Build router. State is shared as a single Arc<AppState>.
+    let app = build_router(Arc::new(AppState {
         store: Arc::clone(&store),
-        reconciler_config: Arc::clone(&reconciler_config),
+        reconciler_config,
         auth: build_authenticator(),
-    });
+    }));
 
     // Start server
     let addr = format!("0.0.0.0:{port}");
@@ -136,7 +136,7 @@ async fn main() -> Result<()> {
 /// authenticated principal (the Unix login derived from the token's `email`
 /// claim), so there is no unauthenticated path. OIDC endpoints default to
 /// Vouch; override with `AUTH_OIDC_ISSUER` / `AUTH_OIDC_JWKS_URI`.
-fn build_authenticator() -> Arc<Authenticator> {
+fn build_authenticator() -> Authenticator {
     let oidc = build_oidc_config();
     let config = AuthConfig {
         issuer: std::env::var("AUTH_OIDC_ISSUER")
@@ -152,7 +152,7 @@ fn build_authenticator() -> Arc<Authenticator> {
         dashboard_login = config.oidc.is_some(),
         "API authentication enabled (owner = email local part)"
     );
-    Arc::new(Authenticator::new(config))
+    Authenticator::new(config)
 }
 
 /// Build the dashboard OIDC login config from the environment.

@@ -34,6 +34,8 @@ pub struct InstanceInfo {
     pub ami_id: String,
     /// Subnet the instance is in.
     pub subnet_id: String,
+    /// AWS region the instance runs in (the region this compute client targets).
+    pub region: String,
     /// Whether the instance has self-reported readiness via the `devbox:ready=true` tag.
     pub ready: bool,
 }
