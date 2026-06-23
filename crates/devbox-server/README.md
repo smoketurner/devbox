@@ -44,7 +44,7 @@ cargo run --bin devbox-server            # serves http://localhost:3000
 ```
 
 Key env vars: `DATABASE_URL`, `PORT`, `POOL_ID`, `POOL_TARGET_WARM_SIZE`, and the
-OIDC settings `AUTH_OIDC_ISSUER` / `AUTH_OIDC_JWKS_URI` / `AUTH_OIDC_AUDIENCE`
-(authentication is always on; endpoints default to Vouch, and
-`AUTH_OIDC_AUDIENCE` must stay unset under DCR). The reconciler adopts the ASG
-named `devbox-pool-<POOL_ID>`.
+OIDC settings `AUTH_OIDC_ISSUER` / `AUTH_OIDC_JWKS_URI` (authentication is always
+on; endpoints default to Vouch). Token audience is not validated — under DCR each
+CLI install has its own `aud`. The reconciler adopts the ASG named
+`devbox-pool-<POOL_ID>`.

@@ -192,9 +192,11 @@ client with Vouch, and caches the resulting `id_token` under
 accepts an ALB's `x-amzn-oidc-data` header (legacy path when fronted by an ALB).
 Both paths are verified against the Vouch JWKS (issuer + signature + `email`
 claim). **Security boundary:** any valid, unexpired Vouch `id_token` with an
-`email` claim is accepted; `AUTH_OIDC_AUDIENCE` is intentionally unset because
-each DCR-registered CLI install gets its own `aud` value, so audience pinning
-would reject all CLI tokens. Authorization is per-claim ownership, not
+`email` claim is accepted; **audience is intentionally not validated** because
+each DCR-registered CLI install gets its own `aud` value (= its own `client_id`),
+so there is no single audience to pin — there is no audience config knob (a
+future tightening would use RFC 8707 resource indicators, pinning to the
+server's own `resource`). Authorization is per-claim ownership, not
 per-audience. The owner is derived through `username_from_email`, which gates on
 `is_valid_unix_username` (`^[a-z_][a-z0-9_.-]*$`, ≤32 chars — the same rule the
 host's `owner-sync` applies); a token whose `email` local part is not a valid

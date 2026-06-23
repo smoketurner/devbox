@@ -305,7 +305,6 @@ mod tests {
         let auth = Authenticator::new(AuthConfig {
             issuer: "https://us.vouch.sh".to_string(),
             jwks_uri: "https://us.vouch.sh/oauth/jwks".to_string(),
-            audience: None,
             alb_region: None,
             oidc: None,
         });

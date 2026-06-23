@@ -22,8 +22,6 @@ pub struct AuthConfig {
     pub issuer: String,
     /// JWKS URI for bearer-token signing keys (e.g. `https://us.vouch.sh/oauth/jwks`).
     pub jwks_uri: String,
-    /// Expected audience (the OIDC client id). `None` skips audience validation.
-    pub audience: Option<String>,
     /// Region whose ALB public keys verify `x-amzn-oidc-data` (e.g. `us-east-1`).
     pub alb_region: Option<String>,
     /// OIDC Authorization Code settings for the browser dashboard login. `None`
@@ -126,7 +124,6 @@ impl Authenticator {
         let mut auth = Self::new(AuthConfig {
             issuer: "https://us.vouch.sh".to_string(),
             jwks_uri: "https://us.vouch.sh/oauth/jwks".to_string(),
-            audience: None,
             alb_region: None,
             oidc: None,
         });
@@ -174,10 +171,10 @@ impl Authenticator {
 
         let mut validation = Validation::new(token_algorithm(token)?);
         validation.set_issuer(&[self.config.issuer.as_str()]);
-        match self.config.audience.as_deref() {
-            Some(aud) => validation.set_audience(&[aud]),
-            None => validation.validate_aud = false,
-        }
+        // Audience is intentionally not validated: under DCR each CLI install's
+        // id_token carries `aud` = its own client_id, so there is no single
+        // audience to pin. The boundary is issuer + signature + `email`.
+        validation.validate_aud = false;
 
         let (owner, _email) = decode_owner(token, &key, &validation)?;
         Ok(Principal(owner))
@@ -525,7 +522,6 @@ mod tests {
         AuthConfig {
             issuer: ISSUER.to_string(),
             jwks_uri: "https://us.vouch.sh/oauth/jwks".to_string(),
-            audience: None,
             alb_region: None,
             oidc,
         }
