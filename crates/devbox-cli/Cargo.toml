@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true, features = ["std"] }
-clap = { workspace = true, features = ["std", "derive", "env"] }
+clap = { workspace = true, features = ["std", "help", "usage", "error-context", "suggestions", "derive", "env"] }
 devbox-common = { path = "../devbox-common" }
 dialoguer = { workspace = true }
 jsonwebtoken = { workspace = true, features = ["aws_lc_rs"] }
