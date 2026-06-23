@@ -5,7 +5,7 @@
 | Need | Location |
 |------|----------|
 | Shared types (DevboxId, DevboxState, API types) | `crates/devbox-common/src/lib.rs` |
-| CLI binary + subcommands | `crates/devbox-cli/src/main.rs`, `crates/devbox-cli/src/state.rs`, `crates/devbox-cli/src/token.rs` |
+| CLI binary + subcommands | `crates/devbox-cli/src/main.rs`, `crates/devbox-cli/src/state.rs`, `crates/devbox-cli/src/auth.rs`, `crates/devbox-cli/src/session.rs` |
 | Server binary entry point | `crates/devbox-server/src/main.rs` |
 | Server library root | `crates/devbox-server/src/lib.rs` |
 | HTTP route handlers | `crates/devbox-server/src/routes.rs` |

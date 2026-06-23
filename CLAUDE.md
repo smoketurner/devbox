@@ -56,9 +56,10 @@ Machines are **cattle, not pets**: each is used once and terminated on release.
   account: `devbox-agent owner-sync` provisions a Unix account named after the
   `devbox:owner` principal (passwordless sudo, owns `/workspace`). `devbox ssh`
   logs in as that principal over an SSM Session Manager tunnel (no public IP).
-- **Integration contract:** the `owner` in a claim request MUST equal the
-  certificate principal Vouch issues (same identity namespace for humans and
-  agents). The principal is not secret; security lives in the CA signature.
+- **Integration contract:** the `owner` derived from the authenticated token's
+  `email` claim MUST equal the certificate principal Vouch issues (same identity
+  namespace for humans and agents). The principal is not secret; security lives
+  in the CA signature.
 - Isolation per instance: dedicated security group, IMDSv2 required, no
   production IAM, EBS encrypted at rest.
 
@@ -147,8 +148,8 @@ cargo run --bin devbox-server          # serves http://localhost:3000
 | `GET /health` | Server + database health |
 | `GET /api/v1/devboxes` | List all devboxes |
 | `GET /api/v1/devboxes/{id}` | Get one devbox |
-| `POST /api/v1/devboxes/claim` | Claim a Ready devbox (body: `owner`, optional `instance_type`) |
-| `POST /api/v1/devboxes/{id}/release` | Release a Claimed devbox (body: `owner`) |
+| `POST /api/v1/devboxes/claim` | Claim a Ready devbox (body: optional `instance_type`; `owner` from token) |
+| `POST /api/v1/devboxes/{id}/release` | Release a Claimed devbox (no body; `owner` from token) |
 | `GET /api/v1/pool/metrics` | Pool counts vs target |
 | `GET /` | HTML dashboard |
 
