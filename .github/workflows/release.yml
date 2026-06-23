@@ -53,9 +53,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          for crate in devbox-cli devbox-server devbox-agent; do
-            cp "target/${TARGET}/release/${crate}" "dist/${crate}-${TARGET}"
-          done
+          # The devbox-cli crate builds a binary named `devbox`; server/agent
+          # match their crate names. Map each to a crate-named release asset.
+          cp "target/${TARGET}/release/devbox"        "dist/devbox-cli-${TARGET}"
+          cp "target/${TARGET}/release/devbox-server" "dist/devbox-server-${TARGET}"
+          cp "target/${TARGET}/release/devbox-agent"  "dist/devbox-agent-${TARGET}"
       - name: Upload artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
