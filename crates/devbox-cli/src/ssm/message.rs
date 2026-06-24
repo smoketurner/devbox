@@ -39,34 +39,94 @@ pub(crate) const CLIENT_VERSION: &str = "1.3.0.0";
 const ACTION_SUCCESS: u32 = 1;
 const ACTION_FAILED: u32 = 2;
 
-/// `MessageType` header strings.
-pub(crate) mod message_type {
-    pub(crate) const INPUT_STREAM_DATA: &str = "input_stream_data";
-    pub(crate) const ACKNOWLEDGE: &str = "acknowledge";
-    pub(crate) const OUTPUT_STREAM_DATA: &str = "output_stream_data";
-    pub(crate) const CHANNEL_CLOSED: &str = "channel_closed";
-    pub(crate) const START_PUBLICATION: &str = "start_publication";
-    pub(crate) const PAUSE_PUBLICATION: &str = "pause_publication";
+/// The `MessageType` header field, modeled so dispatch is exhaustive. Unknown
+/// values round-trip via [`MessageType::Other`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MessageType {
+    InputStreamData,
+    OutputStreamData,
+    Acknowledge,
+    ChannelClosed,
+    StartPublication,
+    PausePublication,
+    Other(String),
 }
 
-/// `PayloadType` header values.
-pub(crate) mod payload_type {
-    pub(crate) const OUTPUT: u32 = 1;
-    pub(crate) const HANDSHAKE_REQUEST: u32 = 5;
-    pub(crate) const HANDSHAKE_RESPONSE: u32 = 6;
-    pub(crate) const HANDSHAKE_COMPLETE: u32 = 7;
-    pub(crate) const FLAG: u32 = 10;
-    pub(crate) const STDERR: u32 = 11;
+impl MessageType {
+    /// The on-wire string for this type.
+    fn as_wire(&self) -> &str {
+        match self {
+            Self::InputStreamData => "input_stream_data",
+            Self::OutputStreamData => "output_stream_data",
+            Self::Acknowledge => "acknowledge",
+            Self::ChannelClosed => "channel_closed",
+            Self::StartPublication => "start_publication",
+            Self::PausePublication => "pause_publication",
+            Self::Other(raw) => raw.as_str(),
+        }
+    }
+
+    /// Parse an on-wire string (also used for the text flow-control frames).
+    pub(crate) fn from_wire(raw: &str) -> Self {
+        match raw {
+            "input_stream_data" => Self::InputStreamData,
+            "output_stream_data" => Self::OutputStreamData,
+            "acknowledge" => Self::Acknowledge,
+            "channel_closed" => Self::ChannelClosed,
+            "start_publication" => Self::StartPublication,
+            "pause_publication" => Self::PausePublication,
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
+/// The `PayloadType` header field. Unknown values round-trip via
+/// [`PayloadType::Other`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PayloadType {
+    Output,
+    HandshakeRequest,
+    HandshakeResponse,
+    HandshakeComplete,
+    Flag,
+    StdErr,
+    Other(u32),
+}
+
+impl PayloadType {
+    fn as_u32(self) -> u32 {
+        match self {
+            Self::Output => 1,
+            Self::HandshakeRequest => 5,
+            Self::HandshakeResponse => 6,
+            Self::HandshakeComplete => 7,
+            Self::Flag => 10,
+            Self::StdErr => 11,
+            Self::Other(raw) => raw,
+        }
+    }
+
+    fn from_u32(raw: u32) -> Self {
+        match raw {
+            1 => Self::Output,
+            5 => Self::HandshakeRequest,
+            6 => Self::HandshakeResponse,
+            7 => Self::HandshakeComplete,
+            10 => Self::Flag,
+            11 => Self::StdErr,
+            other => Self::Other(other),
+        }
+    }
 }
 
 /// A parsed or to-be-serialized data-channel message.
 #[derive(Debug, Clone)]
 pub(crate) struct ClientMessage {
-    pub(crate) message_type: String,
+    pub(crate) message_type: MessageType,
     pub(crate) sequence_number: i64,
     pub(crate) flags: u64,
     pub(crate) message_id: Uuid,
-    pub(crate) payload_type: u32,
+    pub(crate) payload_type: PayloadType,
     pub(crate) payload: Bytes,
 }
 
@@ -84,7 +144,10 @@ impl ClientMessage {
         buf.extend_from_slice(&HL_VALUE.to_be_bytes());
 
         let mut type_field = [b' '; MESSAGE_TYPE_LEN];
-        for (slot, byte) in type_field.iter_mut().zip(self.message_type.bytes()) {
+        for (slot, byte) in type_field
+            .iter_mut()
+            .zip(self.message_type.as_wire().bytes())
+        {
             *slot = byte;
         }
         buf.extend_from_slice(&type_field);
@@ -95,7 +158,7 @@ impl ClientMessage {
         buf.extend_from_slice(&self.flags.to_be_bytes());
         buf.extend_from_slice(&encode_uuid(&self.message_id));
         buf.extend_from_slice(&digest);
-        buf.extend_from_slice(&self.payload_type.to_be_bytes());
+        buf.extend_from_slice(&self.payload_type.as_u32().to_be_bytes());
         buf.extend_from_slice(&payload_len.to_be_bytes());
         buf.extend_from_slice(&self.payload);
         Ok(buf)
@@ -107,17 +170,18 @@ impl ClientMessage {
         if buf.len() < HEADER_LEN {
             bail!("data-channel message too short: {} bytes", buf.len());
         }
-        let message_type = read_string(
+        let message_type = MessageType::from_wire(&read_string(
             buf.get(OFF_MESSAGE_TYPE..OFF_SCHEMA_VERSION)
                 .context("message_type field")?,
-        );
+        ));
         let sequence_number = i64::from_be_bytes(read_array(buf, OFF_SEQUENCE)?);
         let flags = u64::from_be_bytes(read_array(buf, OFF_FLAGS)?);
         let message_id = decode_uuid(
             buf.get(OFF_MESSAGE_ID..OFF_DIGEST)
                 .context("message_id field")?,
         )?;
-        let payload_type = u32::from_be_bytes(read_array(buf, OFF_PAYLOAD_TYPE)?);
+        let payload_type =
+            PayloadType::from_u32(u32::from_be_bytes(read_array(buf, OFF_PAYLOAD_TYPE)?));
         let payload_len = usize::try_from(u32::from_be_bytes(read_array(buf, OFF_PAYLOAD_LEN)?))
             .context("payload length")?;
         let end = HEADER_LEN
@@ -136,9 +200,13 @@ impl ClientMessage {
 }
 
 /// Build an `input_stream_data` message for the given sequence number.
-pub(crate) fn input_data(sequence_number: i64, payload_type: u32, payload: Bytes) -> ClientMessage {
+pub(crate) fn input_data(
+    sequence_number: i64,
+    payload_type: PayloadType,
+    payload: Bytes,
+) -> ClientMessage {
     ClientMessage {
-        message_type: message_type::INPUT_STREAM_DATA.to_string(),
+        message_type: MessageType::InputStreamData,
         sequence_number,
         flags: 0,
         message_id: Uuid::new_v4(),
@@ -150,17 +218,17 @@ pub(crate) fn input_data(sequence_number: i64, payload_type: u32, payload: Bytes
 /// Build an `acknowledge` message for a received message.
 pub(crate) fn acknowledge(incoming: &ClientMessage, is_sequential: bool) -> Result<ClientMessage> {
     let content = AcknowledgeContent {
-        acknowledged_message_type: incoming.message_type.clone(),
+        acknowledged_message_type: incoming.message_type.as_wire().to_string(),
         acknowledged_message_id: incoming.message_id.to_string(),
         acknowledged_message_sequence_number: incoming.sequence_number,
         is_sequential_message: is_sequential,
     };
     Ok(ClientMessage {
-        message_type: message_type::ACKNOWLEDGE.to_string(),
+        message_type: MessageType::Acknowledge,
         sequence_number: 0,
         flags: FLAGS_ACK,
         message_id: Uuid::new_v4(),
-        payload_type: 0,
+        payload_type: PayloadType::Other(0),
         payload: Bytes::from(serde_json::to_vec(&content).context("serialize acknowledge")?),
     })
 }
@@ -255,7 +323,7 @@ fn decode_uuid(wire: &[u8]) -> Result<Uuid> {
     Ok(Uuid::from_bytes(bytes))
 }
 
-/// Read a fixed 4-byte field at `offset`.
+/// Read a fixed `N`-byte field at `offset`.
 fn read_array<const N: usize>(buf: &[u8], offset: usize) -> Result<[u8; N]> {
     let end = offset.checked_add(N).context("field offset overflow")?;
     buf.get(offset..end)
@@ -335,7 +403,7 @@ mod tests {
     use super::*;
 
     fn sample(payload: &[u8]) -> ClientMessage {
-        input_data(7, payload_type::OUTPUT, Bytes::copy_from_slice(payload))
+        input_data(7, PayloadType::Output, Bytes::copy_from_slice(payload))
     }
 
     #[test]
@@ -343,12 +411,22 @@ mod tests {
         let msg = sample(b"hello ssh");
         let wire = msg.serialize().expect("serialize");
         let back = ClientMessage::deserialize(&wire).expect("deserialize");
-        assert_eq!(back.message_type, message_type::INPUT_STREAM_DATA);
+        assert_eq!(back.message_type, MessageType::InputStreamData);
         assert_eq!(back.sequence_number, 7);
         assert_eq!(back.flags, 0);
-        assert_eq!(back.payload_type, payload_type::OUTPUT);
+        assert_eq!(back.payload_type, PayloadType::Output);
         assert_eq!(back.message_id, msg.message_id);
         assert_eq!(back.payload.as_ref(), b"hello ssh");
+    }
+
+    #[test]
+    fn unknown_types_round_trip() {
+        assert_eq!(
+            MessageType::from_wire("bogus"),
+            MessageType::Other("bogus".to_string())
+        );
+        assert_eq!(PayloadType::from_u32(42), PayloadType::Other(42));
+        assert_eq!(PayloadType::Other(42).as_u32(), 42);
     }
 
     #[test]
@@ -397,11 +475,11 @@ mod tests {
     #[test]
     fn acknowledge_payload_has_expected_json() {
         let incoming = ClientMessage {
-            message_type: message_type::OUTPUT_STREAM_DATA.to_string(),
+            message_type: MessageType::OutputStreamData,
             sequence_number: 42,
             flags: 0,
             message_id: Uuid::nil(),
-            payload_type: payload_type::OUTPUT,
+            payload_type: PayloadType::Output,
             payload: Bytes::new(),
         };
         let ack = acknowledge(&incoming, true).expect("ack");

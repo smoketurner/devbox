@@ -94,7 +94,7 @@ pub(crate) async fn run_proxy(
         };
 
         let started = Instant::now();
-        match channel::run_connection(ws, &token, &mut state, &mut input).await {
+        match channel::run_connection(ws, &token, &mut state, &mut input).await? {
             channel::Outcome::Closed => return Ok(()),
             channel::Outcome::Dropped => {
                 eprintln!("devbox ssm-proxy: connection dropped; resuming session");

@@ -13,7 +13,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
@@ -22,7 +22,7 @@ use tokio::time::MissedTickBehavior;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::ssm::message::{self, ClientMessage, message_type, payload_type};
+use crate::ssm::message::{self, ClientMessage, MessageType, PayloadType};
 
 /// How often the retransmission scheduler scans the unacknowledged buffer.
 const RESEND_INTERVAL: Duration = Duration::from_millis(100);
@@ -71,6 +71,16 @@ pub(crate) enum Outcome {
     Dropped,
 }
 
+/// A data-channel failure, classified for the reconnect loop: transport errors
+/// are recoverable by a resume; protocol errors are deterministic and fail fast
+/// rather than burning the reconnect budget on a retry that cannot succeed.
+enum ChannelError {
+    Transport(anyhow::Error),
+    Protocol(anyhow::Error),
+}
+
+type ChannelResult<T> = std::result::Result<T, ChannelError>;
+
 /// Jacobson/Karels RTT estimator producing an adaptive retransmission timeout.
 struct RttEstimator {
     srtt: Duration,
@@ -89,6 +99,8 @@ impl RttEstimator {
 
     /// Fold a new RTT sample in and recompute the timeout (RFC 6298).
     fn update(&mut self, sample: Duration) {
+        // Clamp the sample so the `mul_f64` math below cannot overflow.
+        let sample = sample.min(MAX_RTO);
         if self.srtt.is_zero() {
             self.srtt = sample;
             self.rttvar = sample.mul_f64(0.5);
@@ -111,7 +123,7 @@ impl RttEstimator {
 /// An unacknowledged outgoing message held for possible retransmission.
 struct Outgoing {
     sequence_number: i64,
-    bytes: Vec<u8>,
+    bytes: Bytes,
     sent_at: Instant,
     last_sent: Instant,
     attempts: u32,
@@ -124,6 +136,11 @@ pub(crate) struct SessionState<W> {
     out_seq: i64,
     outgoing: Vec<Outgoing>,
     incoming: BTreeMap<i64, ClientMessage>,
+    // `can_send` / `handshake_done` persist across a resume on purpose: the
+    // session is already established, so we keep publishing rather than risk a
+    // stall if the agent does not re-emit `start_publication` on resume. Sending
+    // before the agent re-gates is safe — the reliable layer retransmits until it
+    // acks. (The exact resume re-gating behavior is pending live verification.)
     can_send: bool,
     handshake_done: bool,
     rtt: RttEstimator,
@@ -153,22 +170,18 @@ struct Channel<'a, S, W> {
 impl<S: AsyncRead + AsyncWrite + Unpin, W: AsyncWrite + Unpin> Channel<'_, S, W> {
     /// Send the OpenDataChannel frame and replay any still-unacked outgoing
     /// messages (the resume path), resetting their timers.
-    async fn open_and_resync(&mut self, token_value: &str) -> Result<()> {
-        self.sink
-            .send(Message::text(message::open_data_channel_json(token_value)?))
-            .await
-            .context("send OpenDataChannel")?;
-        let pending: Vec<Vec<u8>> = self
+    async fn open_and_resync(&mut self, token_value: &str) -> ChannelResult<()> {
+        let json = message::open_data_channel_json(token_value).map_err(ChannelError::Protocol)?;
+        self.send(Message::text(json), "send OpenDataChannel")
+            .await?;
+        let pending: Vec<Bytes> = self
             .state
             .outgoing
             .iter()
             .map(|o| o.bytes.clone())
             .collect();
         for bytes in pending {
-            self.sink
-                .send(Message::Binary(Bytes::from(bytes)))
-                .await
-                .context("resync outgoing")?;
+            self.send(Message::Binary(bytes), "resync outgoing").await?;
         }
         let now = Instant::now();
         for out in &mut self.state.outgoing {
@@ -177,14 +190,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin, W: AsyncWrite + Unpin> Channel<'_, S, W>
         Ok(())
     }
 
+    /// Send a frame, classifying a failure as a (recoverable) transport error.
+    async fn send(&mut self, message: Message, context: &'static str) -> ChannelResult<()> {
+        self.sink
+            .send(message)
+            .await
+            .context(context)
+            .map_err(ChannelError::Transport)
+    }
+
     /// Send an `input_stream_data` message, assigning the next sequence number
     /// and buffering it for retransmission.
-    async fn send_input(&mut self, payload_type: u32, payload: Bytes) -> Result<()> {
-        let bytes = message::input_data(self.state.out_seq, payload_type, payload).serialize()?;
-        self.sink
-            .send(Message::Binary(Bytes::from(bytes.clone())))
-            .await
-            .context("send input_stream_data")?;
+    async fn send_input(&mut self, payload_type: PayloadType, payload: Bytes) -> ChannelResult<()> {
+        let serialized = message::input_data(self.state.out_seq, payload_type, payload)
+            .serialize()
+            .map_err(ChannelError::Protocol)?;
+        let bytes = Bytes::from(serialized);
+        self.send(Message::Binary(bytes.clone()), "send input_stream_data")
+            .await?;
         let now = Instant::now();
         self.state.outgoing.push(Outgoing {
             sequence_number: self.state.out_seq,
@@ -197,17 +220,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin, W: AsyncWrite + Unpin> Channel<'_, S, W>
             .state
             .out_seq
             .checked_add(1)
-            .context("outgoing sequence overflow")?;
+            .context("outgoing sequence overflow")
+            .map_err(ChannelError::Protocol)?;
         Ok(())
     }
 
     /// Acknowledge a received message.
-    async fn send_ack(&mut self, incoming: &ClientMessage, is_sequential: bool) -> Result<()> {
-        let bytes = message::acknowledge(incoming, is_sequential)?.serialize()?;
-        self.sink
-            .send(Message::Binary(Bytes::from(bytes)))
+    async fn send_ack(
+        &mut self,
+        incoming: &ClientMessage,
+        is_sequential: bool,
+    ) -> ChannelResult<()> {
+        let serialized = message::acknowledge(incoming, is_sequential)
+            .map_err(ChannelError::Protocol)?
+            .serialize()
+            .map_err(ChannelError::Protocol)?;
+        self.send(Message::Binary(Bytes::from(serialized)), "send acknowledge")
             .await
-            .context("send acknowledge")
     }
 
     /// Drop the outgoing message the agent acknowledged, sampling its RTT. A
@@ -239,35 +268,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin, W: AsyncWrite + Unpin> Channel<'_, S, W>
     }
 
     /// Act on a received payload. Returns `true` when the session should close.
-    async fn process_payload(&mut self, msg: &ClientMessage) -> Result<bool> {
+    async fn process_payload(&mut self, msg: &ClientMessage) -> ChannelResult<bool> {
         match msg.payload_type {
-            payload_type::OUTPUT => {
-                self.state
-                    .output
-                    .write_all(&msg.payload)
-                    .await
-                    .context("write output stream")?;
-                self.state
-                    .output
-                    .flush()
-                    .await
-                    .context("flush output stream")?;
+            PayloadType::Output => {
+                self.write_output(&msg.payload).await?;
                 Ok(false)
             }
-            payload_type::STDERR => {
+            PayloadType::StdErr => {
                 let mut stderr = tokio::io::stderr();
                 stderr
                     .write_all(&msg.payload)
                     .await
-                    .context("write stderr")?;
-                stderr.flush().await.context("flush stderr")?;
+                    .context("write stderr")
+                    .map_err(ChannelError::Transport)?;
+                stderr
+                    .flush()
+                    .await
+                    .context("flush stderr")
+                    .map_err(ChannelError::Transport)?;
                 Ok(false)
             }
-            payload_type::HANDSHAKE_REQUEST => {
+            PayloadType::HandshakeRequest => {
                 match serde_json::from_slice::<message::HandshakeRequestPayload>(&msg.payload) {
                     Ok(request) => {
-                        let payload = message::handshake_response_payload(&request)?;
-                        self.send_input(payload_type::HANDSHAKE_RESPONSE, payload)
+                        let payload = message::handshake_response_payload(&request)
+                            .map_err(ChannelError::Protocol)?;
+                        self.send_input(PayloadType::HandshakeResponse, payload)
                             .await?;
                     }
                     Err(e) => {
@@ -276,7 +302,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin, W: AsyncWrite + Unpin> Channel<'_, S, W>
                 }
                 Ok(false)
             }
-            payload_type::HANDSHAKE_COMPLETE => {
+            PayloadType::HandshakeComplete => {
                 if let Ok(complete) =
                     serde_json::from_slice::<message::HandshakeComplete>(&msg.payload)
                     && !complete.customer_message.is_empty()
@@ -286,17 +312,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin, W: AsyncWrite + Unpin> Channel<'_, S, W>
                 self.state.handshake_done = true;
                 Ok(false)
             }
-            payload_type::FLAG => {
+            PayloadType::Flag => {
                 eprintln!("devbox ssm-proxy: session disconnect flag received");
                 Ok(true)
             }
-            _ => Ok(false),
+            PayloadType::HandshakeResponse | PayloadType::Other(_) => Ok(false),
         }
+    }
+
+    async fn write_output(&mut self, data: &[u8]) -> ChannelResult<()> {
+        self.state
+            .output
+            .write_all(data)
+            .await
+            .context("write output stream")
+            .map_err(ChannelError::Transport)?;
+        self.state
+            .output
+            .flush()
+            .await
+            .context("flush output stream")
+            .map_err(ChannelError::Transport)
     }
 
     /// Handle an `output_stream_data` message with in-order delivery, acking and
     /// draining any buffered successors. Returns `true` to close the session.
-    async fn handle_output_stream(&mut self, msg: ClientMessage) -> Result<bool> {
+    async fn handle_output_stream(&mut self, msg: ClientMessage) -> ChannelResult<bool> {
         match msg.sequence_number.cmp(&self.state.expected_seq) {
             Ordering::Equal => {
                 self.send_ack(&msg, true).await?;
@@ -329,63 +370,59 @@ impl<S: AsyncRead + AsyncWrite + Unpin, W: AsyncWrite + Unpin> Channel<'_, S, W>
         }
     }
 
-    fn advance_expected(&mut self) -> Result<()> {
+    fn advance_expected(&mut self) -> ChannelResult<()> {
         self.state.expected_seq = self
             .state
             .expected_seq
             .checked_add(1)
-            .context("expected sequence overflow")?;
+            .context("expected sequence overflow")
+            .map_err(ChannelError::Protocol)?;
         Ok(())
     }
 
     /// Dispatch a parsed binary message. Returns `true` to close the session.
-    async fn handle_incoming(&mut self, msg: ClientMessage) -> Result<bool> {
-        match msg.message_type.as_str() {
-            message_type::OUTPUT_STREAM_DATA => self.handle_output_stream(msg).await,
-            message_type::ACKNOWLEDGE => {
-                self.handle_ack(&msg);
-                Ok(false)
-            }
-            message_type::CHANNEL_CLOSED => Ok(true),
-            message_type::START_PUBLICATION => {
-                self.state.can_send = true;
-                Ok(false)
-            }
-            message_type::PAUSE_PUBLICATION => {
-                self.state.can_send = false;
-                Ok(false)
-            }
-            _ => Ok(false),
+    async fn handle_incoming(&mut self, msg: ClientMessage) -> ChannelResult<bool> {
+        match msg.message_type {
+            MessageType::OutputStreamData => return self.handle_output_stream(msg).await,
+            MessageType::Acknowledge => self.handle_ack(&msg),
+            MessageType::ChannelClosed => return Ok(true),
+            MessageType::StartPublication => self.state.can_send = true,
+            MessageType::PausePublication => self.state.can_send = false,
+            MessageType::InputStreamData | MessageType::Other(_) => {}
         }
+        Ok(false)
     }
 
     /// Handle a text frame (flow-control / close signals). Returns `true` to close.
     fn handle_text(&mut self, text: &str) -> bool {
-        match text.trim() {
-            message_type::START_PUBLICATION => {
+        match MessageType::from_wire(text.trim()) {
+            MessageType::StartPublication => {
                 self.state.can_send = true;
                 false
             }
-            message_type::PAUSE_PUBLICATION => {
+            MessageType::PausePublication => {
                 self.state.can_send = false;
                 false
             }
-            message_type::CHANNEL_CLOSED => true,
-            _ => false,
+            MessageType::ChannelClosed => true,
+            MessageType::InputStreamData
+            | MessageType::OutputStreamData
+            | MessageType::Acknowledge
+            | MessageType::Other(_) => false,
         }
     }
 
     /// Resend unacknowledged messages whose adaptive timeout elapsed.
-    async fn resend_timed_out(&mut self) -> Result<()> {
+    async fn resend_timed_out(&mut self) -> ChannelResult<()> {
         let rto = self.state.rtt.rto;
-        let mut resend: Vec<Vec<u8>> = Vec::new();
+        let mut resend: Vec<Bytes> = Vec::new();
         for out in &mut self.state.outgoing {
             if out.last_sent.elapsed() > rto {
                 if out.attempts >= MAX_RESEND_ATTEMPTS {
-                    bail!(
+                    return Err(ChannelError::Transport(anyhow!(
                         "retransmission limit reached for sequence {}",
                         out.sequence_number
-                    );
+                    )));
                 }
                 resend.push(out.bytes.clone());
                 out.last_sent = Instant::now();
@@ -393,24 +430,35 @@ impl<S: AsyncRead + AsyncWrite + Unpin, W: AsyncWrite + Unpin> Channel<'_, S, W>
             }
         }
         for bytes in resend {
-            self.sink
-                .send(Message::Binary(Bytes::from(bytes)))
-                .await
-                .context("resend input_stream_data")?;
+            self.send(Message::Binary(bytes), "resend input_stream_data")
+                .await?;
         }
         Ok(())
     }
 }
 
+/// Map a channel error to a loop outcome: transport errors resume, protocol
+/// errors fail fast.
+fn on_channel_error(error: ChannelError, context: &str) -> Result<Outcome> {
+    match error {
+        ChannelError::Transport(e) => {
+            eprintln!("devbox ssm-proxy: {context}: {e}");
+            Ok(Outcome::Dropped)
+        }
+        ChannelError::Protocol(e) => Err(e.context(context.to_string())),
+    }
+}
+
 /// Run one WebSocket connection over `state`: open it (replaying any unacked
 /// data), then pipe `input`/`output` until the peer closes ([`Outcome::Closed`])
-/// or the connection drops ([`Outcome::Dropped`], the caller should resume).
+/// or the connection drops ([`Outcome::Dropped`], the caller should resume). A
+/// protocol-invariant violation returns `Err` so the caller fails fast.
 pub(crate) async fn run_connection<S, R, W>(
     ws: WebSocketStream<S>,
     token_value: &str,
     state: &mut SessionState<W>,
     input: &mut R,
-) -> Outcome
+) -> Result<Outcome>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
@@ -419,8 +467,7 @@ where
     let (sink, mut stream) = ws.split();
     let mut channel = Channel { sink, state };
     if let Err(e) = channel.open_and_resync(token_value).await {
-        eprintln!("devbox ssm-proxy: failed to open data channel: {e}");
-        return Outcome::Dropped;
+        return on_channel_error(e, "open data channel");
     }
 
     let mut input_buf = vec![0u8; STDIN_BUF];
@@ -434,45 +481,41 @@ where
     loop {
         tokio::select! {
             item = stream.next() => {
-                let Some(item) = item else { return Outcome::Dropped };
+                let Some(item) = item else { return Ok(Outcome::Dropped) };
                 let message = match item {
                     Ok(message) => message,
                     Err(e) => {
                         eprintln!("devbox ssm-proxy: websocket receive error: {e}");
-                        return Outcome::Dropped;
+                        return Ok(Outcome::Dropped);
                     }
                 };
                 // Any inbound frame (data, pong, ping) proves the peer is alive.
                 last_inbound = Instant::now();
                 match message {
-                    // A malformed frame is skipped, not fatal. A handler error is
-                    // a connection problem → drop so the caller can resume.
+                    // A malformed frame is skipped, not fatal.
                     Message::Binary(data) => match ClientMessage::deserialize(data.as_ref()) {
                         Ok(parsed) => match channel.handle_incoming(parsed).await {
-                            Ok(true) => return Outcome::Closed,
+                            Ok(true) => return Ok(Outcome::Closed),
                             Ok(false) => {}
-                            Err(e) => {
-                                eprintln!("devbox ssm-proxy: data channel error: {e}");
-                                return Outcome::Dropped;
-                            }
+                            Err(e) => return on_channel_error(e, "data channel"),
                         },
                         Err(e) => eprintln!("devbox ssm-proxy: ignoring malformed frame: {e}"),
                     },
                     Message::Text(text) => {
                         if channel.handle_text(text.as_str()) {
-                            return Outcome::Closed;
+                            return Ok(Outcome::Closed);
                         }
                     }
                     Message::Ping(payload) => {
                         if channel.sink.send(Message::Pong(payload)).await.is_err() {
-                            return Outcome::Dropped;
+                            return Ok(Outcome::Dropped);
                         }
                     }
                     // A transport-level close is a reconnect trigger, not session
                     // end — only the `channel_closed` message ends the session.
                     // The caller's ResumeSession decides if it is truly over
                     // (plugin issues #135 / #47).
-                    Message::Close(_) => return Outcome::Dropped,
+                    Message::Close(_) => return Ok(Outcome::Dropped),
                     _ => {}
                 }
             }
@@ -485,23 +528,22 @@ where
                     Ok(0) => input_eof = true,
                     Ok(n) => {
                         if let Some(chunk) = input_buf.get(..n)
-                            && channel
-                                .send_input(payload_type::OUTPUT, Bytes::copy_from_slice(chunk))
+                            && let Err(e) = channel
+                                .send_input(PayloadType::Output, Bytes::copy_from_slice(chunk))
                                 .await
-                                .is_err()
                         {
-                            return Outcome::Dropped;
+                            return on_channel_error(e, "send stdin");
                         }
                     }
                     Err(e) => {
                         eprintln!("devbox ssm-proxy: stdin read error: {e}");
-                        return Outcome::Closed;
+                        return Ok(Outcome::Closed);
                     }
                 }
             }
             _ = resend.tick() => {
-                if channel.resend_timed_out().await.is_err() {
-                    return Outcome::Dropped;
+                if let Err(e) = channel.resend_timed_out().await {
+                    return on_channel_error(e, "retransmit");
                 }
             }
             _ = keepalive.tick() => {
@@ -509,10 +551,10 @@ where
                     eprintln!(
                         "devbox ssm-proxy: no data received in {LIVENESS_TIMEOUT:?}; reconnecting"
                     );
-                    return Outcome::Dropped;
+                    return Ok(Outcome::Dropped);
                 }
                 if channel.sink.send(Message::Ping(Bytes::new())).await.is_err() {
-                    return Outcome::Dropped;
+                    return Ok(Outcome::Dropped);
                 }
             }
         }
@@ -532,15 +574,15 @@ mod tests {
 
     const BUF: usize = 64 * 1024;
 
-    /// Build an agent->client message of `message_type` with a raw payload.
+    /// Build an agent->client message with a raw payload.
     fn frame(
-        message_type: &str,
+        message_type: MessageType,
         sequence_number: i64,
-        payload_type: u32,
+        payload_type: PayloadType,
         payload: &[u8],
     ) -> Vec<u8> {
         ClientMessage {
-            message_type: message_type.to_string(),
+            message_type,
             sequence_number,
             flags: 0,
             message_id: Uuid::new_v4(),
@@ -551,9 +593,9 @@ mod tests {
         .expect("serialize agent frame")
     }
 
-    fn output_json(seq: i64, payload_type: u32, value: serde_json::Value) -> Vec<u8> {
+    fn output_json(seq: i64, payload_type: PayloadType, value: serde_json::Value) -> Vec<u8> {
         frame(
-            message_type::OUTPUT_STREAM_DATA,
+            MessageType::OutputStreamData,
             seq,
             payload_type,
             &serde_json::to_vec(&value).expect("json"),
@@ -562,9 +604,9 @@ mod tests {
 
     fn output_bytes(seq: i64, payload: &[u8]) -> Vec<u8> {
         frame(
-            message_type::OUTPUT_STREAM_DATA,
+            MessageType::OutputStreamData,
             seq,
-            payload_type::OUTPUT,
+            PayloadType::Output,
             payload,
         )
     }
@@ -578,9 +620,9 @@ mod tests {
             "IsSequentialMessage": true,
         });
         frame(
-            message_type::ACKNOWLEDGE,
+            MessageType::Acknowledge,
             0,
-            0,
+            PayloadType::Other(0),
             &serde_json::to_vec(&content).expect("json"),
         )
     }
@@ -634,42 +676,35 @@ mod tests {
             .expect("server send");
     }
 
-    /// Establish a server-side WebSocket over an in-memory pipe and spawn a
-    /// `run_connection` client driving fresh session state.
-    async fn connect_pair(
-        token: &'static str,
-    ) -> (
-        WebSocketStream<DuplexStream>,
-        DuplexStream,
-        DuplexStream,
-        tokio::task::JoinHandle<Outcome>,
-    ) {
+    /// Establish a client/server WebSocket pair over an in-memory pipe.
+    async fn ws_pair() -> (WebSocketStream<DuplexStream>, WebSocketStream<DuplexStream>) {
         let (client_io, server_io) = tokio::io::duplex(BUF);
         let (client_res, server_res) = tokio::join!(
             tokio_tungstenite::client_async("ws://localhost/", client_io),
             tokio_tungstenite::accept_async(server_io),
         );
-        let (client_ws, _) = client_res.expect("client handshake");
-        let server = server_res.expect("server handshake");
-        let (feed, input_side) = tokio::io::duplex(BUF);
-        let (output_side, capture) = tokio::io::duplex(BUF);
-        let handle = tokio::spawn(async move {
-            let mut state = SessionState::new(output_side);
-            let mut input = input_side;
-            run_connection(client_ws, token, &mut state, &mut input).await
-        });
-        (server, feed, capture, handle)
+        (
+            client_res.expect("client handshake").0,
+            server_res.expect("server handshake"),
+        )
     }
 
     struct Harness {
         server: WebSocketStream<DuplexStream>,
         feed: DuplexStream,
         capture: DuplexStream,
-        handle: tokio::task::JoinHandle<Outcome>,
+        handle: tokio::task::JoinHandle<Result<Outcome>>,
     }
 
     async fn setup() -> Harness {
-        let (server, feed, capture, handle) = connect_pair("test-token").await;
+        let (client_ws, server) = ws_pair().await;
+        let (feed, input_side) = tokio::io::duplex(BUF);
+        let (output_side, capture) = tokio::io::duplex(BUF);
+        let handle = tokio::spawn(async move {
+            let mut state = SessionState::new(output_side);
+            let mut input = input_side;
+            run_connection(client_ws, "test-token", &mut state, &mut input).await
+        });
         Harness {
             server,
             feed,
@@ -692,7 +727,7 @@ mod tests {
             server,
             output_json(
                 0,
-                payload_type::HANDSHAKE_REQUEST,
+                PayloadType::HandshakeRequest,
                 serde_json::json!({
                     "AgentVersion": "1.0",
                     "RequestedClientActions": [
@@ -704,26 +739,26 @@ mod tests {
         .await;
 
         let ack = next_binary(server).await;
-        assert_eq!(ack.message_type, message_type::ACKNOWLEDGE);
+        assert_eq!(ack.message_type, MessageType::Acknowledge);
         let response = next_binary(server).await;
-        assert_eq!(response.message_type, message_type::INPUT_STREAM_DATA);
-        assert_eq!(response.payload_type, payload_type::HANDSHAKE_RESPONSE);
+        assert_eq!(response.message_type, MessageType::InputStreamData);
+        assert_eq!(response.payload_type, PayloadType::HandshakeResponse);
         send(server, agent_ack(response.sequence_number)).await;
 
         send(
             server,
             output_json(
                 1,
-                payload_type::HANDSHAKE_COMPLETE,
+                PayloadType::HandshakeComplete,
                 serde_json::json!({ "HandshakeTimeToComplete": 0, "CustomerMessage": "" }),
             ),
         )
         .await;
         let ack = next_binary(server).await;
-        assert_eq!(ack.message_type, message_type::ACKNOWLEDGE);
+        assert_eq!(ack.message_type, MessageType::Acknowledge);
 
         server
-            .send(Message::text(message_type::START_PUBLICATION))
+            .send(Message::text("start_publication"))
             .await
             .expect("send start_publication");
     }
@@ -736,8 +771,8 @@ mod tests {
         // stdin bytes become input_stream_data (seq 1; the handshake response was seq 0).
         h.feed.write_all(b"to-remote").await.expect("write feed");
         let input = next_binary(&mut h.server).await;
-        assert_eq!(input.message_type, message_type::INPUT_STREAM_DATA);
-        assert_eq!(input.payload_type, payload_type::OUTPUT);
+        assert_eq!(input.message_type, MessageType::InputStreamData);
+        assert_eq!(input.payload_type, PayloadType::Output);
         assert_eq!(input.payload.as_ref(), b"to-remote".as_slice());
         send(&mut h.server, agent_ack(input.sequence_number)).await;
 
@@ -756,10 +791,13 @@ mod tests {
         assert_eq!(buf.as_slice(), b"helloworld".as_slice());
 
         h.server
-            .send(Message::text(message_type::CHANNEL_CLOSED))
+            .send(Message::text("channel_closed"))
             .await
             .expect("send channel_closed");
-        assert_eq!(h.handle.await.expect("join"), Outcome::Closed);
+        assert_eq!(
+            h.handle.await.expect("join").expect("connection"),
+            Outcome::Closed
+        );
     }
 
     #[tokio::test]
@@ -788,10 +826,13 @@ mod tests {
         assert_eq!(buf.as_slice(), b"bcd".as_slice());
 
         h.server
-            .send(Message::text(message_type::CHANNEL_CLOSED))
+            .send(Message::text("channel_closed"))
             .await
             .expect("send channel_closed");
-        assert_eq!(h.handle.await.expect("join"), Outcome::Closed);
+        assert_eq!(
+            h.handle.await.expect("join").expect("connection"),
+            Outcome::Closed
+        );
     }
 
     #[tokio::test]
@@ -804,10 +845,13 @@ mod tests {
             .expect("keepalive ping timed out");
         assert!(pinged, "expected a keepalive ping");
         h.server
-            .send(Message::text(message_type::CHANNEL_CLOSED))
+            .send(Message::text("channel_closed"))
             .await
             .expect("send channel_closed");
-        assert_eq!(h.handle.await.expect("join"), Outcome::Closed);
+        assert_eq!(
+            h.handle.await.expect("join").expect("connection"),
+            Outcome::Closed
+        );
     }
 
     #[tokio::test]
@@ -821,15 +865,18 @@ mod tests {
 
         // Without an ack, the same message is retransmitted after the timeout.
         let resent = next_binary(&mut h.server).await;
-        assert_eq!(resent.message_type, message_type::INPUT_STREAM_DATA);
+        assert_eq!(resent.message_type, MessageType::InputStreamData);
         assert_eq!(resent.sequence_number, first.sequence_number);
         assert_eq!(resent.payload.as_ref(), b"retry-me".as_slice());
 
         h.server
-            .send(Message::text(message_type::CHANNEL_CLOSED))
+            .send(Message::text("channel_closed"))
             .await
             .expect("send channel_closed");
-        assert_eq!(h.handle.await.expect("join"), Outcome::Closed);
+        assert_eq!(
+            h.handle.await.expect("join").expect("connection"),
+            Outcome::Closed
+        );
     }
 
     #[tokio::test]
@@ -838,7 +885,10 @@ mod tests {
         complete_handshake(&mut h.server, "test-token").await;
         // Tear the connection down without a clean close.
         drop(h.server);
-        assert_eq!(h.handle.await.expect("join"), Outcome::Dropped);
+        assert_eq!(
+            h.handle.await.expect("join").expect("connection"),
+            Outcome::Dropped
+        );
     }
 
     #[tokio::test]
@@ -851,7 +901,10 @@ mod tests {
             .send(Message::Close(None))
             .await
             .expect("send close");
-        assert_eq!(h.handle.await.expect("join"), Outcome::Dropped);
+        assert_eq!(
+            h.handle.await.expect("join").expect("connection"),
+            Outcome::Dropped
+        );
     }
 
     #[tokio::test]
@@ -861,14 +914,7 @@ mod tests {
         let (mut feed, mut input) = tokio::io::duplex(BUF);
 
         // --- Connection 1: handshake, send an unacked input, then drop ---
-        let (c1, s1) = tokio::io::duplex(BUF);
-        let (c1_res, s1_res) = tokio::join!(
-            tokio_tungstenite::client_async("ws://localhost/", c1),
-            tokio_tungstenite::accept_async(s1),
-        );
-        let client1 = c1_res.expect("client1").0;
-        let mut server1 = s1_res.expect("server1");
-
+        let (client1, mut server1) = ws_pair().await;
         let conn1 = run_connection(client1, "token-1", &mut state, &mut input);
         let drive1 = async {
             complete_handshake(&mut server1, "token-1").await;
@@ -880,7 +926,7 @@ mod tests {
             seq
         };
         let (outcome1, unacked_seq) = tokio::join!(conn1, drive1);
-        assert_eq!(outcome1, Outcome::Dropped);
+        assert_eq!(outcome1.expect("conn1"), Outcome::Dropped);
         assert_eq!(
             state.outgoing.len(),
             1,
@@ -888,14 +934,7 @@ mod tests {
         );
 
         // --- Connection 2: same state; expect re-open + retransmit of the unacked ---
-        let (c2, s2) = tokio::io::duplex(BUF);
-        let (c2_res, s2_res) = tokio::join!(
-            tokio_tungstenite::client_async("ws://localhost/", c2),
-            tokio_tungstenite::accept_async(s2),
-        );
-        let client2 = c2_res.expect("client2").0;
-        let mut server2 = s2_res.expect("server2");
-
+        let (client2, mut server2) = ws_pair().await;
         let conn2 = run_connection(client2, "token-2", &mut state, &mut input);
         let drive2 = async {
             let open = next_text(&mut server2).await;
@@ -905,15 +944,62 @@ mod tests {
                 Some("token-2"),
             );
             let resent = next_binary(&mut server2).await;
-            assert_eq!(resent.message_type, message_type::INPUT_STREAM_DATA);
+            assert_eq!(resent.message_type, MessageType::InputStreamData);
             assert_eq!(resent.sequence_number, unacked_seq);
             assert_eq!(resent.payload.as_ref(), b"x".as_slice());
             server2
-                .send(Message::text(message_type::CHANNEL_CLOSED))
+                .send(Message::text("channel_closed"))
                 .await
                 .expect("close");
         };
         let (outcome2, ()) = tokio::join!(conn2, drive2);
-        assert_eq!(outcome2, Outcome::Closed);
+        assert_eq!(outcome2.expect("conn2"), Outcome::Closed);
+    }
+
+    #[tokio::test]
+    async fn resume_redelivers_buffered_gap_in_order() {
+        // Connection 1 buffers an out-of-order frame (a gap), then drops.
+        // Connection 2 delivers the missing frame; the buffered successor must be
+        // drained in order to stdout and not lost or double-written.
+        let (output_side, mut capture) = tokio::io::duplex(BUF);
+        let mut state = SessionState::new(output_side);
+        let (_feed, mut input) = tokio::io::duplex(BUF);
+
+        // --- Connection 1: handshake (expected_seq -> 2), buffer seq 3, drop ---
+        let (client1, mut server1) = ws_pair().await;
+        let conn1 = run_connection(client1, "token-1", &mut state, &mut input);
+        let drive1 = async {
+            complete_handshake(&mut server1, "token-1").await;
+            send(&mut server1, output_bytes(3, b"Y")).await; // future gap (expected 2)
+            assert_eq!(acked_seq(&next_binary(&mut server1).await), 3);
+            drop(server1);
+        };
+        let (outcome1, ()) = tokio::join!(conn1, drive1);
+        assert_eq!(outcome1.expect("conn1"), Outcome::Dropped);
+        assert_eq!(
+            state.incoming.len(),
+            1,
+            "buffered gap must survive the drop"
+        );
+
+        // --- Connection 2: deliver seq 2; client writes "X" then drains "Y" ---
+        let (client2, mut server2) = ws_pair().await;
+        let conn2 = run_connection(client2, "token-2", &mut state, &mut input);
+        let drive2 = async {
+            let _open = next_text(&mut server2).await;
+            send(&mut server2, output_bytes(2, b"X")).await;
+            // Acks seq 2; the buffered seq 3 is drained without a fresh ack.
+            assert_eq!(acked_seq(&next_binary(&mut server2).await), 2);
+            server2
+                .send(Message::text("channel_closed"))
+                .await
+                .expect("close");
+        };
+        let (outcome2, ()) = tokio::join!(conn2, drive2);
+        assert_eq!(outcome2.expect("conn2"), Outcome::Closed);
+
+        let mut buf = [0u8; 2];
+        capture.read_exact(&mut buf).await.expect("read output");
+        assert_eq!(buf.as_slice(), b"XY".as_slice());
     }
 }
