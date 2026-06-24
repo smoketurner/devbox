@@ -76,8 +76,16 @@ fn aws_config_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("AWS_CONFIG_FILE").filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(path));
     }
-    let home = std::env::var_os("HOME").filter(|v| !v.is_empty())?;
-    Some(PathBuf::from(home).join(".aws").join("config"))
+    Some(home_dir()?.join(".aws").join("config"))
+}
+
+/// The user's home directory: `$HOME`, falling back to `$USERPROFILE` (set on
+/// Windows, where `HOME` is usually absent).
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
+        .map(PathBuf::from)
 }
 
 /// Read the AWS config file, or `None` when it is absent or unreadable.

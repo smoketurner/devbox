@@ -101,6 +101,7 @@ pub(crate) async fn run_proxy(
     let mut state = channel::SessionState::new(tokio::io::BufWriter::new(tokio::io::stdout()));
     let mut input = tokio::io::stdin();
     let mut attempt: u32 = 0;
+    let mut established = false;
 
     loop {
         if !stream_url.starts_with("wss://") {
@@ -122,13 +123,22 @@ pub(crate) async fn run_proxy(
                 eprintln!("devbox ssm-proxy: failed to open data channel: {e}");
                 match resume_session(&client, &session_id).await? {
                     Some((url, tok)) => (stream_url, token) = (url, tok),
-                    None => return Ok(()),
+                    // An empty ResumeSession after a working connection means the
+                    // session genuinely ended — exit cleanly. But if no data
+                    // channel ever opened, there is no tunnel: fail rather than
+                    // exiting zero, which would mask a broken `devbox ssh`.
+                    None if established => return Ok(()),
+                    None => bail!(
+                        "could not open the SSM data channel and the session could \
+                         not be resumed: {e}"
+                    ),
                 }
                 reconnect_backoff(&mut attempt).await?;
                 continue;
             }
         };
 
+        established = true;
         let started = Instant::now();
         match channel::run_connection(ws, &token, &mut state, &mut input).await? {
             channel::Outcome::Closed => return Ok(()),

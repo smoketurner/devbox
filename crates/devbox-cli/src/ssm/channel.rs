@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
-use futures_util::stream::SplitSink;
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::MissedTickBehavior;
@@ -551,6 +551,30 @@ where
 {
     let (sink, mut stream) = ws.split();
     let mut channel = Channel { sink, state };
+    let outcome = connection_loop(&mut channel, token_value, &mut stream, input).await;
+    // Output frames are acked to the agent before this writer is flushed, so the
+    // agent will not resend them after ResumeSession. Flush on every exit path
+    // (dropped, closed, or error) so acked-but-buffered bytes reach stdout
+    // instead of being discarded when the connection ends.
+    let _flushed = channel.flush_output().await;
+    outcome
+}
+
+/// Open the connection (replaying unacked data) and pump stdin/stdout until the
+/// peer closes ([`Outcome::Closed`]) or the connection drops
+/// ([`Outcome::Dropped`]). Buffered output is flushed by the caller on every
+/// exit path, so the early returns here may leave bytes in the writer.
+async fn connection_loop<S, R, W>(
+    channel: &mut Channel<'_, S, W>,
+    token_value: &str,
+    stream: &mut SplitStream<WebSocketStream<S>>,
+    input: &mut R,
+) -> Result<Outcome>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     if let Err(e) = channel.open_and_resync(token_value).await {
         return on_channel_error(e, "open data channel");
     }
@@ -581,11 +605,7 @@ where
                     };
                     match channel.handle_ws_message(message).await {
                         Ok(Flow::Continue) => {}
-                        Ok(Flow::Close) => {
-                            // Best-effort final flush; the session is ending anyway.
-                            let _flushed = channel.flush_output().await;
-                            return Ok(Outcome::Closed);
-                        }
+                        Ok(Flow::Close) => return Ok(Outcome::Closed),
                         Ok(Flow::Drop) => return Ok(Outcome::Dropped),
                         Err(e) => return on_channel_error(e, "data channel"),
                     }
@@ -1184,6 +1204,37 @@ mod tests {
             h.handle.await.expect("join").expect("connection"),
             Outcome::Dropped
         );
+    }
+
+    #[tokio::test]
+    async fn dropped_connection_flushes_buffered_output() {
+        // Output is buffered in production (BufWriter over stdout). A frame that
+        // is acked but only written into the buffer must still reach the sink
+        // when the connection drops in the same batch as a transport close — the
+        // agent will not resend acked bytes after ResumeSession.
+        let (output_side, mut capture) = tokio::io::duplex(BUF);
+        let mut state = SessionState::new(tokio::io::BufWriter::new(output_side));
+        let (_feed, mut input) = tokio::io::duplex(BUF);
+
+        let (client, mut server) = ws_pair().await;
+        let conn = run_connection(client, "token", &mut state, &mut input);
+        let drive = async {
+            complete_handshake(&mut server, "token").await;
+            // Send the output frame and a transport close back-to-back so they
+            // coalesce into one inbound batch; the drain loop returns Dropped on
+            // the close, leaving the acked payload unflushed in the buffer.
+            send(&mut server, output_bytes(2, b"buffered")).await;
+            server.send(Message::Close(None)).await.expect("send close");
+        };
+        let (outcome, ()) = tokio::join!(conn, drive);
+        assert_eq!(outcome.expect("conn"), Outcome::Dropped);
+
+        let mut buf = [0u8; 8];
+        capture
+            .read_exact(&mut buf)
+            .await
+            .expect("buffered output reaches the sink on drop");
+        assert_eq!(buf.as_slice(), b"buffered".as_slice());
     }
 
     #[tokio::test]
