@@ -5,6 +5,7 @@ mod aws_profile;
 mod format;
 mod session;
 mod ssh;
+mod ssm;
 mod state;
 
 use std::collections::BTreeSet;
@@ -240,6 +241,23 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Internal: native SSM data-channel proxy used as an ssh `ProxyCommand`.
+    /// Not meant to be run directly; `devbox ssh` wires it up automatically.
+    #[command(hide = true)]
+    SsmProxy {
+        /// Target EC2 instance id (ssh substitutes `%h`).
+        #[arg(long)]
+        target: String,
+        /// AWS region the instance runs in.
+        #[arg(long)]
+        region: String,
+        /// SSH port on the instance (ssh substitutes `%p`).
+        #[arg(long, default_value_t = 22)]
+        port: u16,
+        /// AWS profile for SSM credentials.
+        #[arg(long)]
+        profile: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -399,6 +417,15 @@ async fn main() -> Result<()> {
                 extra: args,
             };
             ssh::connect(&devbox, &opts)?;
+        }
+
+        Commands::SsmProxy {
+            target,
+            region,
+            port,
+            profile,
+        } => {
+            ssm::run_proxy(&target, &region, port, profile.as_deref()).await?;
         }
     }
 

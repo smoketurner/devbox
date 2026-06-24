@@ -34,8 +34,32 @@ user defaults to the devbox `owner` (the Vouch certificate principal); the
 connection is authenticated by the caller's Vouch SSH certificate. Trailing args
 after `--` run as a remote command.
 
-Requires the AWS `session-manager-plugin` locally and `ssm:StartSession` on the
-target.
+The SSM Session Manager data-channel protocol is implemented natively in the CLI
+(WebSocket over rustls/aws-lc-rs), so the AWS `session-manager-plugin` and the
+`aws` CLI are **not** required — only the system `ssh` client and
+`ssm:StartSession` on the target. The region and login user are read from the
+devbox record; AWS credentials come from your environment or, when the
+control-plane account can be matched, an auto-selected `~/.aws` profile (override
+with `--region`/`--user`/`--profile`).
+
+### IDE Remote-SSH (VS Code, JetBrains Gateway, Cursor)
+
+These connect with the system `ssh` against a `~/.ssh/config` Host entry. Point
+the `ProxyCommand` at `devbox ssm-proxy` instead of the old `aws ssm
+start-session`:
+
+```sshconfig
+Host devbox-<id>
+    HostName <instance-id>
+    User <principal>
+    ProxyCommand devbox ssm-proxy --target %h --port %p --region <region> [--profile <profile>]
+    # Optional: collapse VS Code's several connections into one SSM session.
+    ControlMaster auto
+    ControlPersist 5m
+```
+
+(`devbox ssm-proxy` is the internal proxy `devbox ssh` wires up automatically; it
+is not meant to be run by hand.)
 
 ```bash
 cargo build -p devbox-cli                 # builds the `devbox` binary

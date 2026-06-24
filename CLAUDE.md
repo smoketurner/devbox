@@ -56,7 +56,14 @@ Machines are **cattle, not pets**: each is used once and terminated on release.
   account: `devbox-agent owner-sync` provisions a Unix account named after the
   `devbox:owner` principal (passwordless sudo, owns `/workspace`). `devbox ssh`
   logs in as that principal over an SSM Session Manager tunnel (no public IP).
-  - *AWS profile auto-selection:* the SSM tunnel (`aws ssm start-session`) needs
+  The SSM data-channel protocol is implemented **natively in-process** (a hidden
+  `devbox ssm-proxy` subcommand used as the ssh `ProxyCommand`): it calls
+  `ssm:StartSession` for `AWS-StartSSHSession`, opens the WebSocket data channel
+  (rustls + aws-lc-rs), and speaks the binary AgentMessage framing + reliable
+  transport itself, so no `session-manager-plugin` binary and no `aws` CLI are
+  required — only the system `ssh` client. See `crates/devbox-cli/src/ssm/`
+  (`message.rs` = wire codec, `channel.rs` = handshake + reliable transport).
+  - *AWS profile auto-selection:* the SSM tunnel's `StartSession` call needs
     AWS credentials for the control-plane account. The server advertises that
     account as an `aws_account_id` extension on the RFC 9728 discovery document
     (`/.well-known/oauth-protected-resource`, set from the `AWS_ACCOUNT_ID` env
@@ -140,7 +147,7 @@ cargo run --bin devbox-server          # serves http://localhost:3000
 | Need | Location |
 |------|----------|
 | Shared types | `crates/devbox-common/src/lib.rs` |
-| CLI (incl. `ssh` over SSM) | `crates/devbox-cli/src/main.rs`, `crates/devbox-cli/src/ssh.rs` |
+| CLI (incl. `ssh` over SSM) | `crates/devbox-cli/src/main.rs`, `crates/devbox-cli/src/ssh.rs`, `crates/devbox-cli/src/ssm.rs` (native data channel) |
 | On-host agent (principals / owner-sync / warmup) | `crates/devbox-agent/src/` |
 | Server entry / config / shutdown | `crates/devbox-server/src/main.rs` |
 | HTTP routes | `crates/devbox-server/src/routes.rs` |
