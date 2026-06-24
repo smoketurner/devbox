@@ -152,3 +152,10 @@ tracing-subscriber = { version = "=0.3.23", default-features = false }
 url = { version = "=2.5.8", default-features = false }
 uuid = { version = "=1.23.3", default-features = false }
 webpki-roots = { version = "=0.26.11", default-features = false }
+
+[profile.release]
+strip = true      # Automatically strip symbols from the binary
+lto = true        # Enable full link time optimization for better size reduction
+codegen-units = 1 # Maximize size reduction optimizations
+panic = "abort"   # Terminate process upon panic
+opt-level = "z"   # Optimize for size (more aggressive than "s")
