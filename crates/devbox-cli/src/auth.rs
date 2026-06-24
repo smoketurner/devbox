@@ -125,11 +125,16 @@ enum PollOutcome {
 // ============================================================================
 
 #[derive(Deserialize)]
-struct ProtectedResourceMeta {
+pub(crate) struct ProtectedResourceMeta {
     #[serde(default)]
     authorization_servers: Vec<String>,
     #[serde(default)]
     scopes_supported: Vec<String>,
+    /// The control plane's AWS account (a vendor extension to the RFC 9728
+    /// document). `devbox ssh` reads it to auto-select the local AWS profile for
+    /// the SSM tunnel; absent when the server has no `AWS_ACCOUNT_ID` configured.
+    #[serde(default)]
+    pub(crate) aws_account_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -163,7 +168,10 @@ fn default_interval() -> u64 {
 // Step implementations
 // ============================================================================
 
-async fn fetch_protected_resource(
+/// Fetch and parse the RFC 9728 discovery document. Public to the crate so the
+/// `ssh` path can read its `aws_account_id` extension; a 404 is a hard error
+/// (the login flow needs it) that `ssh` treats as best-effort and ignores.
+pub(crate) async fn fetch_protected_resource(
     client: &reqwest::Client,
     server: &str,
 ) -> Result<ProtectedResourceMeta> {
@@ -284,10 +292,12 @@ fn print_user_prompt(device: &DeviceAuthResponse) {
     eprintln!();
 
     // Best-effort browser launch, only when stderr is a TTY (skipped in scripts,
-    // CI, headless hosts, and tests). Prefer the one-step link — it carries the
-    // code so Vouch can pre-fill it — and fall back to the plain page. Any
-    // failure is silent: the URL and code are already printed above.
-    if std::io::stderr().is_terminal() {
+    // CI, and headless hosts). The `!cfg!(test)` guard suppresses it under
+    // `cargo test`, which inherits the terminal's stderr and would otherwise
+    // open a real browser. Prefer the one-step link — it carries the code so
+    // Vouch can pre-fill it — and fall back to the plain page. Any failure is
+    // silent: the URL and code are already printed above.
+    if !cfg!(test) && std::io::stderr().is_terminal() {
         let target = device
             .verification_uri_complete
             .as_deref()

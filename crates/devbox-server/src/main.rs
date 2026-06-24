@@ -7,7 +7,9 @@ use anyhow::{Context, Result};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
-use devbox_server::auth::{AuthConfig, Authenticator, OidcConfig};
+use devbox_server::auth::{
+    AuthConfig, AuthError, Authenticator, OidcConfig, OidcEndpoints, discover,
+};
 use devbox_server::compute::ec2::Ec2;
 use devbox_server::db::{DocumentStore, Pool, PoolConfig};
 use devbox_server::reconcile::{ReconcilerConfig, spawn_reconciliation_loop};
@@ -104,11 +106,20 @@ async fn main() -> Result<()> {
         cancel.clone(),
     );
 
+    // The control plane's AWS account, advertised in the discovery document so
+    // `devbox ssh` can auto-select the matching local AWS profile for the SSM
+    // tunnel. Optional: when unset the CLI falls back to the caller's default
+    // credentials, so behaviour is unchanged for deployments that omit it.
+    let aws_account_id = std::env::var("AWS_ACCOUNT_ID")
+        .ok()
+        .filter(|s| !s.is_empty());
+
     // Build router. State is shared as a single Arc<AppState>.
     let app = build_router(Arc::new(AppState {
         store: Arc::clone(&store),
         reconciler_config,
-        auth: build_authenticator(),
+        auth: build_authenticator().await?,
+        aws_account_id,
     }));
 
     // Start server
@@ -130,19 +141,31 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Build the request authenticator from the environment.
+/// Build the request authenticator, resolving OIDC endpoints from the issuer.
 ///
 /// Authentication is always on: every claim/release binds `owner` to the
 /// authenticated principal (the Unix login derived from the token's `email`
-/// claim), so there is no unauthenticated path. OIDC endpoints default to
-/// Vouch; override with `AUTH_OIDC_ISSUER` / `AUTH_OIDC_JWKS_URI`.
-fn build_authenticator() -> Authenticator {
-    let oidc = build_oidc_config();
+/// claim), so there is no unauthenticated path. The only OIDC config knob is
+/// `AUTH_OIDC_ISSUER` (default Vouch); the JWKS URI and the dashboard
+/// authorize / token / end-session endpoints are discovered once at startup
+/// from `{issuer}/.well-known/openid-configuration`.
+///
+/// # Errors
+///
+/// Returns an error when discovery against the issuer fails after a bounded
+/// retry — the server cannot verify any token without the issuer's JWKS, so it
+/// fails fast rather than starting unable to authenticate.
+async fn build_authenticator() -> Result<Authenticator> {
+    let issuer =
+        std::env::var("AUTH_OIDC_ISSUER").unwrap_or_else(|_| "https://us.vouch.sh".to_string());
+
+    let http = reqwest::Client::new();
+    let endpoints = discover_with_retry(&http, &issuer).await?;
+
+    let oidc = build_oidc_config(&endpoints)?;
     let config = AuthConfig {
-        issuer: std::env::var("AUTH_OIDC_ISSUER")
-            .unwrap_or_else(|_| "https://us.vouch.sh".to_string()),
-        jwks_uri: std::env::var("AUTH_OIDC_JWKS_URI")
-            .unwrap_or_else(|_| "https://us.vouch.sh/oauth/jwks".to_string()),
+        issuer,
+        jwks_uri: endpoints.jwks_uri,
         alb_region: std::env::var("AWS_REGION").ok().filter(|s| !s.is_empty()),
         alb_arn: std::env::var("AUTH_ALB_ARN").ok().filter(|s| !s.is_empty()),
         oidc,
@@ -152,34 +175,87 @@ fn build_authenticator() -> Authenticator {
         dashboard_login = config.oidc.is_some(),
         "API authentication enabled (owner = email local part)"
     );
-    Authenticator::new(config)
+    Ok(Authenticator::new(config))
 }
 
-/// Build the dashboard OIDC login config from the environment.
+/// Resolve the issuer's OIDC endpoints, retrying transient failures at boot.
 ///
-/// Returns `Some` only when `AUTH_OIDC_CLIENT_ID`, `AUTH_OIDC_CLIENT_SECRET`,
-/// and `AUTH_OIDC_REDIRECT_URI` are all set; otherwise the login page shows an
-/// error (all dashboard routes require a valid session). Endpoints and scope
-/// default to Vouch.
-fn build_oidc_config() -> Option<OidcConfig> {
+/// Discovery is a hard startup dependency, so a momentary blip must not fail an
+/// otherwise-healthy deploy: retry a few times with a short backoff before
+/// giving up. The document is static and CDN-served, so a handful of attempts
+/// covers real transients without masking a genuine misconfiguration.
+async fn discover_with_retry(http: &reqwest::Client, issuer: &str) -> Result<OidcEndpoints> {
+    const MAX_ATTEMPTS: u32 = 5;
+    const BACKOFF: Duration = Duration::from_secs(1);
+
+    let mut last_err: Option<AuthError> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match discover(http, issuer).await {
+            Ok(endpoints) => return Ok(endpoints),
+            Err(e) => {
+                tracing::warn!(attempt, max = MAX_ATTEMPTS, error = %e, "OIDC discovery failed");
+                last_err = Some(e);
+            }
+        }
+        if attempt < MAX_ATTEMPTS {
+            tokio::time::sleep(BACKOFF).await;
+        }
+    }
+
+    let detail = last_err.map_or_else(|| "unknown error".to_string(), |e| e.to_string());
+    Err(anyhow::anyhow!(
+        "OIDC discovery against {issuer}/.well-known/openid-configuration failed \
+         after {MAX_ATTEMPTS} attempts: {detail}"
+    ))
+}
+
+/// Build the dashboard OIDC login config from the environment and discovered
+/// endpoints.
+///
+/// Returns `Ok(Some)` only when `AUTH_OIDC_CLIENT_ID`, `AUTH_OIDC_CLIENT_SECRET`,
+/// and `AUTH_OIDC_REDIRECT_URI` are all set; otherwise `Ok(None)` (the login page
+/// shows an error — all dashboard routes require a valid session). The endpoints
+/// come from discovery; only `AUTH_OIDC_SCOPE` is read here, defaulting to
+/// `openid email`.
+///
+/// # Errors
+///
+/// Returns an error when the dashboard env vars are set but the issuer's
+/// discovery document omits an endpoint the login flow needs
+/// (`authorization_endpoint`, `token_endpoint`, or `end_session_endpoint`).
+/// These are optional in [`OidcEndpoints`] so an API-only deployment boots
+/// without them; once the dashboard is configured they become required, so a
+/// missing one is a misconfiguration that fails fast with an actionable message.
+fn build_oidc_config(endpoints: &OidcEndpoints) -> Result<Option<OidcConfig>> {
     let nonempty = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
 
-    let client_id = nonempty("AUTH_OIDC_CLIENT_ID")?;
-    let client_secret = nonempty("AUTH_OIDC_CLIENT_SECRET")?;
-    let redirect_uri = nonempty("AUTH_OIDC_REDIRECT_URI")?;
+    let (Some(client_id), Some(client_secret), Some(redirect_uri)) = (
+        nonempty("AUTH_OIDC_CLIENT_ID"),
+        nonempty("AUTH_OIDC_CLIENT_SECRET"),
+        nonempty("AUTH_OIDC_REDIRECT_URI"),
+    ) else {
+        return Ok(None);
+    };
 
-    Some(OidcConfig {
+    let require = |name: &str, value: &Option<String>| -> Result<String> {
+        value.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "dashboard OIDC is configured (AUTH_OIDC_* set) but the issuer's discovery \
+                 document omits {name}; unset the AUTH_OIDC_* dashboard vars or use an issuer \
+                 that publishes it"
+            )
+        })
+    };
+
+    Ok(Some(OidcConfig {
         client_id,
         client_secret: SecretString::from(client_secret),
         redirect_uri,
-        authorize_endpoint: nonempty("AUTH_OIDC_AUTHORIZATION_ENDPOINT")
-            .unwrap_or_else(|| "https://us.vouch.sh/oauth/authorize".to_string()),
-        token_endpoint: nonempty("AUTH_OIDC_TOKEN_ENDPOINT")
-            .unwrap_or_else(|| "https://us.vouch.sh/oauth/token".to_string()),
-        end_session_endpoint: nonempty("AUTH_OIDC_END_SESSION_ENDPOINT")
-            .unwrap_or_else(|| "https://us.vouch.sh/oauth/logout".to_string()),
+        authorize_endpoint: require("authorization_endpoint", &endpoints.authorization_endpoint)?,
+        token_endpoint: require("token_endpoint", &endpoints.token_endpoint)?,
+        end_session_endpoint: require("end_session_endpoint", &endpoints.end_session_endpoint)?,
         scope: nonempty("AUTH_OIDC_SCOPE").unwrap_or_else(|| "openid email".to_string()),
-    })
+    }))
 }
 
 /// Wait for a shutdown signal (Ctrl+C or SIGTERM).

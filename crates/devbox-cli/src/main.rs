@@ -1,9 +1,11 @@
 //! Devbox CLI client.
 
 mod auth;
+mod aws_profile;
 mod format;
 mod session;
 mod ssh;
+mod ssm;
 mod state;
 
 use std::collections::BTreeSet;
@@ -111,6 +113,31 @@ fn resolve_id(explicit: Option<String>, server: &str) -> Result<String> {
     }
 }
 
+/// Auto-select the AWS profile for the SSM tunnel by matching the control
+/// plane's account, unless the caller already pins credentials via the
+/// environment. Returns `None` (use the caller's default credentials) when the
+/// environment is already set, the server advertises no account, or it is
+/// unreachable — so behaviour is never worse than passing no `--profile`.
+async fn resolve_aws_profile(http: &reqwest::Client, server: &str) -> Result<Option<String>> {
+    // Respect an explicit AWS environment — never override the caller's creds.
+    let env_set = |key: &str| std::env::var_os(key).is_some_and(|v| !v.is_empty());
+    if env_set("AWS_PROFILE") || env_set("AWS_ACCESS_KEY_ID") {
+        return Ok(None);
+    }
+
+    // The account the control plane advertises in its discovery document. A
+    // missing field, or an unreachable/out-of-date server, means no auto-select.
+    let Some(account_id) = auth::fetch_protected_resource(http, server)
+        .await
+        .ok()
+        .and_then(|prm| prm.aws_account_id)
+    else {
+        return Ok(None);
+    };
+
+    aws_profile::select_profile(&account_id, is_interactive())
+}
+
 /// The cached session's bearer token, or an error directing the user to log in.
 ///
 /// Authentication is mandatory: the server binds `owner` to the authenticated
@@ -200,10 +227,11 @@ enum Commands {
         /// Login user (defaults to the devbox owner / certificate principal).
         #[arg(long)]
         user: Option<String>,
-        /// AWS region for the SSM tunnel (defaults to your aws CLI config).
+        /// AWS region for the SSM tunnel (defaults to the devbox's region).
         #[arg(long)]
         region: Option<String>,
-        /// AWS profile for the SSM tunnel.
+        /// AWS profile for the SSM tunnel (auto-selected by the control-plane
+        /// account when omitted).
         #[arg(long)]
         profile: Option<String>,
         /// Print the ssh command instead of running it.
@@ -212,6 +240,23 @@ enum Commands {
         /// Arguments passed through to ssh (e.g. a remote command after `--`).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// Internal: native SSM data-channel proxy used as an ssh `ProxyCommand`.
+    /// Not meant to be run directly; `devbox ssh` wires it up automatically.
+    #[command(hide = true)]
+    SsmProxy {
+        /// Target EC2 instance id (ssh substitutes `%h`).
+        #[arg(long)]
+        target: String,
+        /// AWS region the instance runs in.
+        #[arg(long)]
+        region: String,
+        /// SSH port on the instance (ssh substitutes `%p`).
+        #[arg(long, default_value_t = 22)]
+        port: u16,
+        /// AWS profile for SSM credentials.
+        #[arg(long)]
+        profile: Option<String>,
     },
 }
 
@@ -358,6 +403,12 @@ async fn main() -> Result<()> {
             }
 
             let devbox: DevboxResponse = resp.json().await.context("failed to parse response")?;
+            // With no explicit --profile, auto-select the AWS profile that
+            // matches the control plane's account so the SSM tunnel "just works".
+            let profile = match profile {
+                Some(profile) => Some(profile),
+                None => resolve_aws_profile(&http, &server).await?,
+            };
             let opts = ssh::SshOptions {
                 user,
                 region,
@@ -366,6 +417,15 @@ async fn main() -> Result<()> {
                 extra: args,
             };
             ssh::connect(&devbox, &opts)?;
+        }
+
+        Commands::SsmProxy {
+            target,
+            region,
+            port,
+            profile,
+        } => {
+            ssm::run_proxy(&target, &region, port, profile.as_deref()).await?;
         }
     }
 

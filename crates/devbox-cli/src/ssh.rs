@@ -61,22 +61,32 @@ fn build_args(devbox: &DevboxResponse, opts: &SshOptions) -> Result<Vec<String>>
     };
 
     // The devbox always carries the region it runs in; an explicit `--region`
-    // overrides it. Either way the ProxyCommand is fully specified, so `ssh`
-    // never depends on the caller's ambient AWS region config.
+    // overrides it. The region is baked into the ProxyCommand because `ssh` only
+    // substitutes its own tokens (`%h`, `%p`) — it cannot supply a region or
+    // profile — so `ssh` never depends on the caller's ambient AWS config.
     let region = opts.region.as_deref().unwrap_or(devbox.region.as_str());
 
-    let mut session = format!(
-        "aws ssm start-session --target {instance_id} \
-         --document-name AWS-StartSSHSession --parameters portNumber=%p \
-         --region {region}"
+    // `ssh` runs the ProxyCommand via `/bin/sh -c`, so shell-quote the executable
+    // path (it may contain spaces) and the baked-in values. `%h`/`%p` stay
+    // unquoted so `ssh` substitutes the instance id and port. The native proxy
+    // replaces the external `aws ssm start-session` / `session-manager-plugin`.
+    let exe = std::env::current_exe().context("failed to locate the devbox executable")?;
+    let exe = exe
+        .to_str()
+        .context("devbox executable path is not valid UTF-8")?;
+
+    let mut proxy = format!(
+        "{} ssm-proxy --target %h --port %p --region {}",
+        shell_quote(exe),
+        shell_quote(region),
     );
     if let Some(profile) = opts.profile.as_deref() {
-        session.push_str(&format!(" --profile {profile}"));
+        proxy.push_str(&format!(" --profile {}", shell_quote(profile)));
     }
 
     let mut args = vec![
         "-o".to_string(),
-        format!("ProxyCommand={session}"),
+        format!("ProxyCommand={proxy}"),
         format!("{user}@{instance_id}"),
     ];
     args.extend(opts.extra.iter().cloned());
@@ -166,11 +176,12 @@ mod tests {
         let args = build_args(&devbox, &opts()).expect("args");
         assert_eq!(args.first().map(String::as_str), Some("-o"));
         assert!(args.iter().any(|a| a == "jdoe@i-0abc"));
-        assert!(
-            args.iter()
-                .any(|a| a.contains("aws ssm start-session --target i-0abc")
-                    && a.contains("AWS-StartSSHSession"))
-        );
+        // The ProxyCommand runs the native proxy; `ssh` substitutes %h/%p.
+        assert!(args.iter().any(|a| {
+            a.starts_with("ProxyCommand=")
+                && a.contains("ssm-proxy --target %h --port %p")
+                && a.contains("--region us-west-2")
+        }));
     }
 
     #[test]

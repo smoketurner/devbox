@@ -15,16 +15,28 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true, features = ["std"] }
+aws-config = { workspace = true, features = ["rt-tokio", "default-https-client", "behavior-version-latest", "credentials-process", "sso"] }
+aws-credential-types = { workspace = true }
+aws-lc-rs = { workspace = true }
+aws-sdk-ssm = { workspace = true, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
+bytes = { workspace = true }
 clap = { workspace = true, features = ["std", "help", "usage", "error-context", "suggestions", "derive", "env"] }
 devbox-common = { path = "../devbox-common" }
 dialoguer = { workspace = true }
+futures-util = { workspace = true, features = ["std", "sink"] }
 jsonwebtoken = { workspace = true, features = ["aws_lc_rs"] }
 open = { workspace = true }
 reqwest = { workspace = true, features = ["json", "form", "rustls"] }
+rust-ini = { workspace = true, features = ["inline-comment"] }
+rustls = { workspace = true, features = ["aws_lc_rs", "std", "tls12"] }
 serde = { workspace = true, features = ["std", "derive"] }
 serde_json = { workspace = true, features = ["std"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "io-util", "io-std"] }
+tokio-tungstenite = { workspace = true, features = ["connect", "rustls-tls-webpki-roots"] }
+uuid = { workspace = true, features = ["v7"] }
+webpki-roots = { workspace = true }
 
 [dev-dependencies]
 # In-process mock HTTP server for auth.rs poll-loop tests (axum already in workspace).
 axum = { workspace = true, features = ["http1", "json", "tokio"] }
+proptest = { workspace = true, features = ["std"] }

@@ -56,6 +56,23 @@ Machines are **cattle, not pets**: each is used once and terminated on release.
   account: `devbox-agent owner-sync` provisions a Unix account named after the
   `devbox:owner` principal (passwordless sudo, owns `/workspace`). `devbox ssh`
   logs in as that principal over an SSM Session Manager tunnel (no public IP).
+  The SSM data-channel protocol is implemented **natively in-process** (a hidden
+  `devbox ssm-proxy` subcommand used as the ssh `ProxyCommand`): it calls
+  `ssm:StartSession` for `AWS-StartSSHSession`, opens the WebSocket data channel
+  (rustls + aws-lc-rs), and speaks the binary AgentMessage framing + reliable
+  transport itself, so no `session-manager-plugin` binary and no `aws` CLI are
+  required — only the system `ssh` client. See `crates/devbox-cli/src/ssm/`
+  (`message.rs` = wire codec, `channel.rs` = handshake + reliable transport).
+  - *AWS profile auto-selection:* the SSM tunnel's `StartSession` call needs
+    AWS credentials for the control-plane account. The server advertises that
+    account as an `aws_account_id` extension on the RFC 9728 discovery document
+    (`/.well-known/oauth-protected-resource`, set from the `AWS_ACCOUNT_ID` env
+    var). When `--profile` is omitted and neither `AWS_PROFILE` nor
+    `AWS_ACCESS_KEY_ID` is set, `devbox ssh` reads that account and picks the
+    local `~/.aws/config` profile whose `role_arn` / `credential_process --role`
+    targets it (`crates/devbox-cli/src/aws_profile.rs`), so the user never has to
+    remember which profile is the devbox account. No match / no account / old
+    server falls back to the caller's default credentials.
 - **Integration contract:** the `owner` derived from the authenticated token's
   `email` claim MUST equal the certificate principal Vouch issues (same identity
   namespace for humans and agents). The principal is not secret; security lives
@@ -130,7 +147,7 @@ cargo run --bin devbox-server          # serves http://localhost:3000
 | Need | Location |
 |------|----------|
 | Shared types | `crates/devbox-common/src/lib.rs` |
-| CLI (incl. `ssh` over SSM) | `crates/devbox-cli/src/main.rs`, `crates/devbox-cli/src/ssh.rs` |
+| CLI (incl. `ssh` over SSM) | `crates/devbox-cli/src/main.rs`, `crates/devbox-cli/src/ssh.rs`, `crates/devbox-cli/src/ssm.rs` (native data channel) |
 | On-host agent (principals / owner-sync / warmup) | `crates/devbox-agent/src/` |
 | Server entry / config / shutdown | `crates/devbox-server/src/main.rs` |
 | HTTP routes | `crates/devbox-server/src/routes.rs` |
@@ -168,7 +185,11 @@ the ASG relaunches them. **SSH/Vouch-CA path:** `devbox-agent` (principals resol
 + per-principal account provisioning + warmup) baked into the AMI; Terraform `pool`
 module provides the host instance profile (SSM core + `ec2:CreateTags` for
 `devbox:ready`), `InstanceMetadataTags=enabled`, and sshd `AuthorizedPrincipalsCommand`
-config. **AMI rotation:** the Launch Template resolves
+config. The CLI auto-selects the AWS profile for the SSM tunnel by matching the
+control-plane account it reads from the discovery document's `aws_account_id`
+extension (server env `AWS_ACCOUNT_ID`); see "AWS profile auto-selection" under
+the access model. The companion `control-plane` Terraform sets `AWS_ACCOUNT_ID`
+on the ECS task. **AMI rotation:** the Launch Template resolves
 `resolve:ssm:/devbox/ami/latest`, and the `pool` module's EventBridge → SSM
 Automation rolls unclaimed warm hosts onto a new AMI via an ASG instance refresh
 (`ScaleInProtectedInstances = Ignore`, so Claimed hosts are skipped). **Deployment:**
@@ -214,11 +235,17 @@ Unix login is rejected with a 401, so a misconfigured principal fails at claim
 time rather than as a broken SSH login. The dashboard is a separate path:
 optional app-side OIDC login (`AUTH_OIDC_CLIENT_ID`, `AUTH_OIDC_CLIENT_SECRET`,
 `AUTH_OIDC_REDIRECT_URI`) with a session cookie, deriving the same email-based
-owner. Logout uses **OIDC RP-Initiated Logout**: `/logout` clears the session
-cookie and redirects to Vouch's `end_session_endpoint`
-(`AUTH_OIDC_END_SESSION_ENDPOINT`, default `https://us.vouch.sh/oauth/logout`)
-with the cached id_token as `id_token_hint`, so the SSO session is terminated too
-(not just the local cookie). Vouch redirects back to `/signed-out` — derived from
+owner. **OIDC endpoints are discovered, not configured:** the only OIDC knob is
+`AUTH_OIDC_ISSUER` (default `https://us.vouch.sh`); the JWKS URI and the dashboard
+authorize / token / end-session endpoints are resolved once at startup from
+`{AUTH_OIDC_ISSUER}/.well-known/openid-configuration` (bounded retry, fail-fast if
+unreachable; the document's `issuer` is checked against the configured one). This
+mirrors the CLI's discovery (`crates/devbox-cli/src/auth.rs`) — see
+`crates/devbox-server/src/auth/discovery.rs`. Logout uses **OIDC RP-Initiated
+Logout**: `/logout` clears the session cookie and redirects to the discovered
+`end_session_endpoint` (`https://us.vouch.sh/oauth/logout` for Vouch) with the
+cached id_token as `id_token_hint`, so the SSO session is terminated too (not just
+the local cookie). Vouch redirects back to `/signed-out` — derived from
 `AUTH_OIDC_REDIRECT_URI`'s origin, no separate env var — which must be registered
 in the Vouch client's `post_logout_redirect_uris` (an unregistered URI falls back
 to Vouch's own done page). Read endpoints (list/get/health/pool metrics) stay
