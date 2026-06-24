@@ -42,10 +42,17 @@ async fn get_devbox(...) -> Result<Json<DevboxResponse>, StatusCode> { ... }
 ```rust
 // Prefer struct literals for data types
 let doc = DevboxDoc {
-    instance_id: None,
-    state: DevboxState::Launching,
-    instance_type: "m5.large".to_string(),
-    ..
+    instance_id: "i-1234567890abcdef0".to_string(),
+    state: DevboxState::Ready,
+    instance_type: InstanceType("m5.large".to_string()),
+    ami_id: AmiId("ami-12345678".to_string()),
+    subnet_id: SubnetId("subnet-abc".to_string()),
+    region: "us-east-1".to_string(),
+    ebs_volume_id: None,
+    owner: None,
+    claimed_at: None,
+    created_at: Timestamp::now(),
+    owner_tag_applied: false,
 };
 
 // Prefer builders for complex configuration
