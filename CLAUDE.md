@@ -56,6 +56,16 @@ Machines are **cattle, not pets**: each is used once and terminated on release.
   account: `devbox-agent owner-sync` provisions a Unix account named after the
   `devbox:owner` principal (passwordless sudo, owns `/workspace`). `devbox ssh`
   logs in as that principal over an SSM Session Manager tunnel (no public IP).
+  - *AWS profile auto-selection:* the SSM tunnel (`aws ssm start-session`) needs
+    AWS credentials for the control-plane account. The server advertises that
+    account as an `aws_account_id` extension on the RFC 9728 discovery document
+    (`/.well-known/oauth-protected-resource`, set from the `AWS_ACCOUNT_ID` env
+    var). When `--profile` is omitted and neither `AWS_PROFILE` nor
+    `AWS_ACCESS_KEY_ID` is set, `devbox ssh` reads that account and picks the
+    local `~/.aws/config` profile whose `role_arn` / `credential_process --role`
+    targets it (`crates/devbox-cli/src/aws_profile.rs`), so the user never has to
+    remember which profile is the devbox account. No match / no account / old
+    server falls back to the caller's default credentials.
 - **Integration contract:** the `owner` derived from the authenticated token's
   `email` claim MUST equal the certificate principal Vouch issues (same identity
   namespace for humans and agents). The principal is not secret; security lives
@@ -168,7 +178,11 @@ the ASG relaunches them. **SSH/Vouch-CA path:** `devbox-agent` (principals resol
 + per-principal account provisioning + warmup) baked into the AMI; Terraform `pool`
 module provides the host instance profile (SSM core + `ec2:CreateTags` for
 `devbox:ready`), `InstanceMetadataTags=enabled`, and sshd `AuthorizedPrincipalsCommand`
-config. **AMI rotation:** the Launch Template resolves
+config. The CLI auto-selects the AWS profile for the SSM tunnel by matching the
+control-plane account it reads from the discovery document's `aws_account_id`
+extension (server env `AWS_ACCOUNT_ID`); see "AWS profile auto-selection" under
+the access model. The companion `control-plane` Terraform sets `AWS_ACCOUNT_ID`
+on the ECS task. **AMI rotation:** the Launch Template resolves
 `resolve:ssm:/devbox/ami/latest`, and the `pool` module's EventBridge → SSM
 Automation rolls unclaimed warm hosts onto a new AMI via an ASG instance refresh
 (`ScaleInProtectedInstances = Ignore`, so Claimed hosts are skipped). **Deployment:**

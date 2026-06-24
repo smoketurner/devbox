@@ -281,6 +281,12 @@ pub struct ProtectedResourceMetadata {
     /// Scopes supported by this resource (the `email` scope is required for
     /// `devbox`; `openid` is required to obtain an ID token).
     pub scopes_supported: Vec<String>,
+    /// AWS account the control plane (and its devbox pool) runs in. A vendor
+    /// extension to the RFC 9728 document (RFC 9728 §3.1 permits additional
+    /// members): `devbox ssh` reads it to auto-select the local AWS profile for
+    /// the SSM tunnel. Absent when the server has no `AWS_ACCOUNT_ID` configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws_account_id: Option<String>,
 }
 
 // ============================================================================
@@ -661,6 +667,7 @@ mod tests {
             resource: "https://cp.example".to_string(),
             authorization_servers: vec!["https://us.vouch.sh".to_string()],
             scopes_supported: vec!["openid".to_string(), "email".to_string()],
+            aws_account_id: Some("123456789012".to_string()),
         };
         let json = serde_json::to_string(&meta).unwrap();
         let parsed: ProtectedResourceMetadata = serde_json::from_str(&json).unwrap();
@@ -671,5 +678,20 @@ mod tests {
             Some("https://us.vouch.sh")
         );
         assert_eq!(parsed.scopes_supported, ["openid", "email"]);
+        assert_eq!(parsed.aws_account_id.as_deref(), Some("123456789012"));
+    }
+
+    #[test]
+    fn protected_resource_metadata_omits_absent_account_id() {
+        // No AWS_ACCOUNT_ID configured: the field must not appear in the JSON,
+        // so the standard RFC 9728 document is unchanged for such deployments.
+        let meta = ProtectedResourceMetadata {
+            resource: "https://cp.example".to_string(),
+            authorization_servers: vec!["https://us.vouch.sh".to_string()],
+            scopes_supported: vec!["openid".to_string(), "email".to_string()],
+            aws_account_id: None,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(!json.contains("aws_account_id"), "got: {json}");
     }
 }

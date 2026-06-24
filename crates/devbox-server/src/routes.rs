@@ -32,6 +32,10 @@ pub struct AppState {
     /// Claim/release always require an authenticated principal and bind `owner`
     /// to it — the Unix login derived from the token's `email` claim.
     pub auth: Authenticator,
+    /// AWS account the pool runs in (`AWS_ACCOUNT_ID`), advertised in the RFC
+    /// 9728 discovery document so `devbox ssh` can auto-select the local AWS
+    /// profile for the SSM tunnel. `None` leaves the field out of the document.
+    pub aws_account_id: Option<String>,
 }
 
 /// Handle to the shared application state, passed to every handler.
@@ -90,6 +94,7 @@ async fn protected_resource_metadata(
         resource,
         authorization_servers: vec![state.auth.issuer().to_string()],
         scopes_supported: vec!["openid".into(), "email".into()],
+        aws_account_id: state.aws_account_id.clone(),
     })
 }
 
@@ -296,6 +301,7 @@ mod tests {
             store: Arc::new(test_store().await),
             reconciler_config: test_config(),
             auth: Authenticator::with_test_owner(owner),
+            aws_account_id: None,
         })
     }
 
@@ -320,6 +326,7 @@ mod tests {
             store: Arc::new(test_store().await),
             reconciler_config: test_config(),
             auth,
+            aws_account_id: None,
         })
     }
 
@@ -459,6 +466,21 @@ mod tests {
         );
         assert_eq!(meta.scopes_supported, ["openid", "email"]);
         assert_eq!(meta.resource, "https://cp.example");
+        // No AWS_ACCOUNT_ID configured for the default test state.
+        assert_eq!(meta.aws_account_id, None);
+    }
+
+    #[tokio::test]
+    async fn protected_resource_metadata_includes_aws_account_id_when_set() {
+        let state = Arc::new(AppState {
+            store: Arc::new(test_store().await),
+            reconciler_config: test_config(),
+            auth: Authenticator::with_test_owner("jdoe"),
+            aws_account_id: Some("123456789012".to_string()),
+        });
+
+        let Json(meta) = protected_resource_metadata(State(state), HeaderMap::new()).await;
+        assert_eq!(meta.aws_account_id.as_deref(), Some("123456789012"));
     }
 
     #[tokio::test]

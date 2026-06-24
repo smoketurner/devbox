@@ -104,11 +104,20 @@ async fn main() -> Result<()> {
         cancel.clone(),
     );
 
+    // The control plane's AWS account, advertised in the discovery document so
+    // `devbox ssh` can auto-select the matching local AWS profile for the SSM
+    // tunnel. Optional: when unset the CLI falls back to the caller's default
+    // credentials, so behaviour is unchanged for deployments that omit it.
+    let aws_account_id = std::env::var("AWS_ACCOUNT_ID")
+        .ok()
+        .filter(|s| !s.is_empty());
+
     // Build router. State is shared as a single Arc<AppState>.
     let app = build_router(Arc::new(AppState {
         store: Arc::clone(&store),
         reconciler_config,
         auth: build_authenticator(),
+        aws_account_id,
     }));
 
     // Start server
