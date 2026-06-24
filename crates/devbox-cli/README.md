@@ -12,7 +12,7 @@ devbox claim   [--instance-type <t>]                 # claim a Ready devbox
 devbox release [--id <id>]                           # release a claimed devbox
 devbox list                                          # list all devboxes (table)
 devbox status  [--id <id>]                           # one devbox, key/value
-devbox ssh     [--id <id>] [--user <u>] [-- <cmd...>] # SSH in over an SSM tunnel
+devbox ssh     [--id <id>] [-- <cmd...>]             # SSH in over an SSM tunnel
 ```
 
 Global flag: `--server` (env `DEVBOX_SERVER`). Defaults to the server from your
@@ -40,9 +40,9 @@ The SSM Session Manager data-channel protocol is implemented natively in the CLI
 (WebSocket over rustls/aws-lc-rs), so the AWS `session-manager-plugin` and the
 `aws` CLI are **not** required — only the system `ssh` client and
 `ssm:StartSession` on the target. The region and login user are read from the
-devbox record; AWS credentials come from your environment or, when the
-control-plane account can be matched, an auto-selected `~/.aws` profile (override
-with `--region`/`--user`/`--profile`).
+devbox record and are not overridable; AWS credentials come from your environment
+or, when the control-plane account can be matched, an auto-selected `~/.aws`
+profile (override with `--profile`).
 
 ### IDE Remote-SSH (VS Code, JetBrains Gateway, Cursor)
 

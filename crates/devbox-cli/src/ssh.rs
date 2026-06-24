@@ -6,17 +6,12 @@
 //! Authentication is the caller's Vouch SSH certificate; the login user is the
 //! certificate principal, which is the same `owner` the box was claimed with.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 
 use devbox_common::DevboxResponse;
 
 /// Options controlling how the SSH session is opened.
 pub(crate) struct SshOptions {
-    /// Override the login user (defaults to the devbox owner / cert principal).
-    pub user: Option<String>,
-    /// Override the AWS region for the SSM tunnel (defaults to the devbox's
-    /// region as reported by the server).
-    pub region: Option<String>,
     /// AWS profile for the SSM tunnel.
     pub profile: Option<String>,
     /// Print the ssh command instead of executing it.
@@ -30,19 +25,14 @@ pub(crate) struct SshOptions {
 ///
 /// # Errors
 ///
-/// Returns an error if the devbox has no instance or login user, or if `ssh`
-/// cannot be launched.
+/// Returns an error if the devbox is not claimed (no owner) or if `ssh` cannot
+/// be launched.
 pub(crate) fn connect(devbox: &DevboxResponse, opts: &SshOptions) -> Result<()> {
     let args = build_args(devbox, opts)?;
 
     if opts.print {
         println!("ssh {}", shell_join(&args));
         return Ok(());
-    }
-
-    if devbox.owner.is_none() && opts.user.is_none() {
-        // Unreachable given build_args, but keep the guard explicit.
-        bail!("devbox {} is not claimed; pass --user", devbox.id);
     }
 
     exec_ssh(&args)
@@ -52,19 +42,18 @@ pub(crate) fn connect(devbox: &DevboxResponse, opts: &SshOptions) -> Result<()> 
 fn build_args(devbox: &DevboxResponse, opts: &SshOptions) -> Result<Vec<String>> {
     let instance_id = devbox.instance_id.as_str();
 
-    let user = match opts.user.as_deref() {
-        Some(user) => user.to_string(),
-        None => devbox
-            .owner
-            .clone()
-            .with_context(|| format!("devbox {} has no owner; pass --user", devbox.id))?,
-    };
+    // The login user is the certificate principal, which is the `owner` the box
+    // was claimed with — never a caller override.
+    let user = devbox
+        .owner
+        .clone()
+        .with_context(|| format!("devbox {} is not claimed", devbox.id))?;
 
-    // The devbox always carries the region it runs in; an explicit `--region`
-    // overrides it. The region is baked into the ProxyCommand because `ssh` only
-    // substitutes its own tokens (`%h`, `%p`) — it cannot supply a region or
-    // profile — so `ssh` never depends on the caller's ambient AWS config.
-    let region = opts.region.as_deref().unwrap_or(devbox.region.as_str());
+    // The devbox always carries the region it runs in. The region is baked into
+    // the ProxyCommand because `ssh` only substitutes its own tokens (`%h`,
+    // `%p`) — it cannot supply a region or profile — so `ssh` never depends on
+    // the caller's ambient AWS config.
+    let region = devbox.region.as_str();
 
     // `ssh` runs the ProxyCommand via `/bin/sh -c`, so shell-quote the executable
     // path (it may contain spaces) and the baked-in values. `%h`/`%p` stay
@@ -110,7 +99,7 @@ fn exec_ssh(args: &[String]) -> Result<()> {
         .status()
         .context("failed to run ssh")?;
     if !status.success() {
-        bail!("ssh exited with status {:?}", status.code());
+        anyhow::bail!("ssh exited with status {:?}", status.code());
     }
     Ok(())
 }
@@ -162,8 +151,6 @@ mod tests {
 
     fn opts() -> SshOptions {
         SshOptions {
-            user: None,
-            region: None,
             profile: None,
             print: false,
             extra: Vec::new(),
@@ -185,27 +172,15 @@ mod tests {
     }
 
     #[test]
-    fn user_override_takes_precedence() {
+    fn profile_is_forwarded() {
         let devbox = claimed("i-0abc", Some("jdoe"));
         let mut o = opts();
-        o.user = Some("root".to_string());
-        let args = build_args(&devbox, &o).expect("args");
-        assert!(args.iter().any(|a| a == "root@i-0abc"));
-    }
-
-    #[test]
-    fn region_and_profile_are_forwarded() {
-        let devbox = claimed("i-0abc", Some("jdoe"));
-        let mut o = opts();
-        o.region = Some("us-east-1".to_string());
         o.profile = Some("dev".to_string());
         let args = build_args(&devbox, &o).expect("args");
         let proxy = args
             .iter()
             .find(|a| a.starts_with("ProxyCommand="))
             .expect("proxy");
-        // The explicit --region flag overrides the devbox's own region.
-        assert!(proxy.contains("--region us-east-1"));
         assert!(proxy.contains("--profile dev"));
     }
 
@@ -232,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn errors_without_owner_or_user() {
+    fn errors_without_owner() {
         let devbox = claimed("i-0abc", None);
         assert!(build_args(&devbox, &opts()).is_err());
     }

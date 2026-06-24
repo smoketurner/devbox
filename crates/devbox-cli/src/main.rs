@@ -224,12 +224,6 @@ enum Commands {
         /// Devbox ID to connect to (defaults to your active claim).
         #[arg(long)]
         id: Option<String>,
-        /// Login user (defaults to the devbox owner / certificate principal).
-        #[arg(long)]
-        user: Option<String>,
-        /// AWS region for the SSM tunnel (defaults to the devbox's region).
-        #[arg(long)]
-        region: Option<String>,
         /// AWS profile for the SSM tunnel (auto-selected by the control-plane
         /// account when omitted).
         #[arg(long)]
@@ -379,8 +373,6 @@ async fn main() -> Result<()> {
 
         Commands::Ssh {
             id,
-            user,
-            region,
             profile,
             print,
             args,
@@ -410,8 +402,6 @@ async fn main() -> Result<()> {
                 None => resolve_aws_profile(&http, &server).await?,
             };
             let opts = ssh::SshOptions {
-                user,
-                region,
                 profile,
                 print,
                 extra: args,

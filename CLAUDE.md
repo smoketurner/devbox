@@ -121,10 +121,20 @@ and the ASG relaunches a replacement.
 make build      # release build (includes CSS)
 make fmt        # cargo fmt --all
 make lint       # cargo clippy --all-targets --all-features -- -D warnings
-make test       # unit tests (in-memory SQLite; no AWS needed)
+make test       # unit tests, --all-features (in-memory SQLite; no AWS needed)
 make check      # cargo check
+make help       # list every target with its description
 
-# Run the server locally against SQLite:
+# Run a single test (substring-matches the test path):
+cargo test -p devbox-cli ssh::tests::profile_is_forwarded
+cargo test -p devbox-server claim_marks_box_claimed   # any module/test substring
+
+# Run components locally (ARGS is passed through; defaults to --help):
+make run-server                        # devbox-server, loads .env, serves :3000
+make run        ARGS="list"            # the `devbox` CLI
+make run-agent  ARGS="principals dev"  # the on-host agent
+
+# Server against an explicit SQLite file instead of .env:
 DATABASE_URL="sqlite:devbox-dev.db?mode=rwc" \
 RUST_LOG=info,devbox_server=debug \
 cargo run --bin devbox-server          # serves http://localhost:3000
