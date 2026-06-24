@@ -235,11 +235,17 @@ Unix login is rejected with a 401, so a misconfigured principal fails at claim
 time rather than as a broken SSH login. The dashboard is a separate path:
 optional app-side OIDC login (`AUTH_OIDC_CLIENT_ID`, `AUTH_OIDC_CLIENT_SECRET`,
 `AUTH_OIDC_REDIRECT_URI`) with a session cookie, deriving the same email-based
-owner. Logout uses **OIDC RP-Initiated Logout**: `/logout` clears the session
-cookie and redirects to Vouch's `end_session_endpoint`
-(`AUTH_OIDC_END_SESSION_ENDPOINT`, default `https://us.vouch.sh/oauth/logout`)
-with the cached id_token as `id_token_hint`, so the SSO session is terminated too
-(not just the local cookie). Vouch redirects back to `/signed-out` — derived from
+owner. **OIDC endpoints are discovered, not configured:** the only OIDC knob is
+`AUTH_OIDC_ISSUER` (default `https://us.vouch.sh`); the JWKS URI and the dashboard
+authorize / token / end-session endpoints are resolved once at startup from
+`{AUTH_OIDC_ISSUER}/.well-known/openid-configuration` (bounded retry, fail-fast if
+unreachable; the document's `issuer` is checked against the configured one). This
+mirrors the CLI's discovery (`crates/devbox-cli/src/auth.rs`) — see
+`crates/devbox-server/src/auth/discovery.rs`. Logout uses **OIDC RP-Initiated
+Logout**: `/logout` clears the session cookie and redirects to the discovered
+`end_session_endpoint` (`https://us.vouch.sh/oauth/logout` for Vouch) with the
+cached id_token as `id_token_hint`, so the SSO session is terminated too (not just
+the local cookie). Vouch redirects back to `/signed-out` — derived from
 `AUTH_OIDC_REDIRECT_URI`'s origin, no separate env var — which must be registered
 in the Vouch client's `post_logout_redirect_uris` (an unregistered URI falls back
 to Vouch's own done page). Read endpoints (list/get/health/pool metrics) stay
