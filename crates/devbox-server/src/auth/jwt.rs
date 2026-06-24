@@ -47,6 +47,9 @@ pub struct OidcConfig {
     pub authorize_endpoint: String,
     /// Token endpoint (e.g. `https://us.vouch.sh/oauth/token`).
     pub token_endpoint: String,
+    /// RP-Initiated Logout end-session endpoint (e.g. `https://us.vouch.sh/oauth/logout`).
+    /// Redirecting here terminates the IdP's SSO session, not just the local cookie.
+    pub end_session_endpoint: String,
     /// Redirect URI registered with the IdP (e.g. `https://<host>/oauth2/idpresponse`).
     pub redirect_uri: String,
     /// Scopes to request (e.g. `openid email`).
@@ -308,6 +311,35 @@ impl Authenticator {
             .append_pair("redirect_uri", &oidc.redirect_uri)
             .append_pair("scope", &oidc.scope)
             .append_pair("state", state);
+        Some(url.to_string())
+    }
+
+    /// Build the RP-Initiated Logout URL for the dashboard sign-out redirect.
+    ///
+    /// Redirecting here terminates the IdP's SSO session, not just devbox's local
+    /// session cookie — without it, returning to `/` would silently re-establish a
+    /// session from the still-live SSO session. `id_token` (the cached session
+    /// cookie) is sent as `id_token_hint` so the IdP can identify the client and
+    /// honor the post-logout redirect.
+    ///
+    /// The post-logout landing (`/signed-out`) is derived from `redirect_uri`
+    /// rather than configured separately — it is another path on the same,
+    /// already-registered origin. It must still be registered in the client's
+    /// `post_logout_redirect_uris`; an unregistered URI is ignored by the IdP,
+    /// which then shows its own done page (no error).
+    ///
+    /// Returns `None` when OIDC login is not configured or a URL is unparseable.
+    #[must_use]
+    pub fn end_session_url(&self, id_token: &str) -> Option<String> {
+        let oidc = self.config.oidc.as_ref()?;
+        let mut post_logout = url::Url::parse(&oidc.redirect_uri).ok()?;
+        post_logout.set_path("/signed-out");
+
+        let mut url = url::Url::parse(&oidc.end_session_endpoint).ok()?;
+        url.query_pairs_mut()
+            .append_pair("id_token_hint", id_token)
+            .append_pair("client_id", &oidc.client_id)
+            .append_pair("post_logout_redirect_uri", post_logout.as_str());
         Some(url.to_string())
     }
 
@@ -625,6 +657,7 @@ mod tests {
             client_secret: SecretString::from("s3cr3t-do-not-leak".to_string()),
             authorize_endpoint: "https://us.vouch.sh/oauth/authorize".to_string(),
             token_endpoint: "https://us.vouch.sh/oauth/token".to_string(),
+            end_session_endpoint: "https://us.vouch.sh/oauth/logout".to_string(),
             redirect_uri: "https://cp.example/oauth2/idpresponse".to_string(),
             scope: "openid email".to_string(),
         }
@@ -647,6 +680,23 @@ mod tests {
         let auth = Authenticator::new(base_config(None));
         assert!(auth.authorize_url("abc123").is_none());
         assert!(auth.oidc().is_none());
+    }
+
+    #[test]
+    fn end_session_url_includes_hint_and_derived_post_logout() {
+        let auth = Authenticator::new(base_config(Some(test_oidc())));
+        let url = auth.end_session_url("the-id-token").unwrap();
+        assert!(url.starts_with("https://us.vouch.sh/oauth/logout?"));
+        assert!(url.contains("id_token_hint=the-id-token"));
+        assert!(url.contains("client_id=client-123"));
+        // post_logout_redirect_uri is /signed-out on the redirect_uri's origin.
+        assert!(url.contains("post_logout_redirect_uri=https%3A%2F%2Fcp.example%2Fsigned-out"));
+    }
+
+    #[test]
+    fn end_session_url_none_without_oidc() {
+        let auth = Authenticator::new(base_config(None));
+        assert!(auth.end_session_url("the-id-token").is_none());
     }
 
     #[test]

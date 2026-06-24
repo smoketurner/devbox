@@ -327,18 +327,32 @@ async fn login_error_page() -> Response {
     .into_response()
 }
 
-/// Clear the session cookie.
+/// Begin RP-Initiated Logout.
+///
+/// Clears the local session cookie and, when OIDC is configured, redirects to the
+/// IdP's end-session endpoint so the SSO session is terminated too — otherwise
+/// returning to `/` would silently re-establish a session from the still-live SSO
+/// session. The IdP redirects back to `/signed-out` (see [`signed_out_page`]).
+/// Falls back to rendering the signed-out page locally when OIDC is unconfigured
+/// or there is no session token to use as `id_token_hint`.
 ///
 /// GET /logout
-async fn logout() -> Response {
-    // Clear the session and land on a "signed out" page rather than redirecting
-    // to "/", which would bounce through /login and silently re-establish the
-    // session from the still-live Vouch SSO session.
-    (
-        AppendHeaders([(header::SET_COOKIE, set_cookie(SESSION_COOKIE, "", 0))]),
-        SignedOutTemplate {},
-    )
-        .into_response()
+async fn logout(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    let clear = (header::SET_COOKIE, set_cookie(SESSION_COOKIE, "", 0));
+    match cookie_value(&headers, SESSION_COOKIE)
+        .and_then(|token| state.auth.end_session_url(&token))
+    {
+        Some(url) => (AppendHeaders([clear]), Redirect::to(&url)).into_response(),
+        None => (AppendHeaders([clear]), SignedOutTemplate {}).into_response(),
+    }
+}
+
+/// Landing page after the IdP completes RP-Initiated Logout — the
+/// `post_logout_redirect_uri` target. Public: the visitor is already signed out.
+///
+/// GET /signed-out
+async fn signed_out_page() -> Response {
+    SignedOutTemplate {}.into_response()
 }
 
 // ============================================================================
@@ -353,6 +367,7 @@ pub fn build_ui_router() -> Router<SharedState> {
         .route("/login/error", get(login_error_page))
         .route("/oauth2/idpresponse", get(oauth_callback))
         .route("/logout", get(logout))
+        .route("/signed-out", get(signed_out_page))
         .route("/devboxes/claim", get(claim_form).post(submit_claim))
         .route("/devboxes/{id}", get(devbox_detail))
         .route("/devboxes/{id}/release", post(submit_release))

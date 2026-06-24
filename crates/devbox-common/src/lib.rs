@@ -314,7 +314,9 @@ impl std::fmt::Display for DevboxState {
             Self::Claimed => "claimed",
             Self::Terminating => "terminating",
         };
-        write!(f, "{s}")
+        // `f.pad` (not `write!`) so format width/alignment like `{:<12}` is
+        // honored — column-aligned tables (e.g. `devbox list`) depend on it.
+        f.pad(s)
     }
 }
 
@@ -452,6 +454,13 @@ mod tests {
             let parsed: DevboxState = serde_json::from_str(&json).unwrap();
             assert_eq!(state, parsed);
         }
+    }
+
+    #[test]
+    fn devbox_state_display_honors_width() {
+        // `Display` must use `f.pad`, so width/alignment specs work in tables.
+        assert_eq!(format!("{:<12}", DevboxState::Claimed), "claimed     ");
+        assert_eq!(format!("{:>7}", DevboxState::Ready), "  ready");
     }
 
     #[test]

@@ -176,6 +176,8 @@ fn build_oidc_config() -> Option<OidcConfig> {
             .unwrap_or_else(|| "https://us.vouch.sh/oauth/authorize".to_string()),
         token_endpoint: nonempty("AUTH_OIDC_TOKEN_ENDPOINT")
             .unwrap_or_else(|| "https://us.vouch.sh/oauth/token".to_string()),
+        end_session_endpoint: nonempty("AUTH_OIDC_END_SESSION_ENDPOINT")
+            .unwrap_or_else(|| "https://us.vouch.sh/oauth/logout".to_string()),
         scope: nonempty("AUTH_OIDC_SCOPE").unwrap_or_else(|| "openid email".to_string()),
     })
 }
