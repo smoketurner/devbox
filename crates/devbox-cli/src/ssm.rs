@@ -17,9 +17,17 @@ use aws_credential_types::provider::ProvideCredentials;
 /// Maximum consecutive reconnect attempts before giving up on a session.
 const MAX_RECONNECT_ATTEMPTS: u32 = 10;
 /// Base delay for reconnect backoff.
+#[cfg(not(test))]
 const RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(1);
+/// Tiny base delay under test so the budget path is cheap to exercise.
+#[cfg(test)]
+const RECONNECT_INITIAL_DELAY: Duration = Duration::from_millis(1);
 /// Cap on the reconnect backoff delay.
+#[cfg(not(test))]
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
+/// Tiny cap under test.
+#[cfg(test)]
+const RECONNECT_MAX_DELAY: Duration = Duration::from_millis(2);
 /// A connection that stays up at least this long resets the reconnect budget,
 /// so a long-lived session survives any number of well-spaced blips.
 const HEALTHY_CONNECTION: Duration = Duration::from_secs(60);
@@ -157,7 +165,10 @@ async fn preflight_credentials(
     profile: Option<&str>,
 ) -> Result<()> {
     let Some(provider) = config.credentials_provider() else {
-        bail!("no AWS credentials provider is configured for the SSM tunnel");
+        bail!(
+            "no AWS credentials are configured for the SSM tunnel; \
+             pass `--profile <name>`, set `AWS_PROFILE`, or refresh your AWS login"
+        );
     };
     provider.provide_credentials().await.map_err(|e| {
         let source = profile.map_or_else(
@@ -170,4 +181,25 @@ async fn preflight_credentials(
         )
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "test code: panic on assertion failure is acceptable"
+)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reconnect_backoff_exhausts_budget() {
+        let mut attempt = 0u32;
+        for _ in 0..MAX_RECONNECT_ATTEMPTS {
+            reconnect_backoff(&mut attempt)
+                .await
+                .expect("within budget");
+        }
+        // The next attempt exceeds the budget and must fail rather than loop.
+        assert!(reconnect_backoff(&mut attempt).await.is_err());
+    }
 }

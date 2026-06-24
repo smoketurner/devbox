@@ -209,7 +209,7 @@ pub(crate) fn input_data(
         message_type: MessageType::InputStreamData,
         sequence_number,
         flags: 0,
-        message_id: Uuid::new_v4(),
+        message_id: Uuid::now_v7(),
         payload_type,
         payload,
     }
@@ -227,19 +227,25 @@ pub(crate) fn acknowledge(incoming: &ClientMessage, is_sequential: bool) -> Resu
         message_type: MessageType::Acknowledge,
         sequence_number: 0,
         flags: FLAGS_ACK,
-        message_id: Uuid::new_v4(),
+        message_id: Uuid::now_v7(),
         payload_type: PayloadType::Other(0),
         payload: Bytes::from(serde_json::to_vec(&content).context("serialize acknowledge")?),
     })
 }
 
+/// A client identifier for a session, generated once and reused across
+/// reconnects so a resumed data channel presents the same `ClientId`.
+pub(crate) fn new_client_id() -> String {
+    Uuid::now_v7().to_string()
+}
+
 /// The JSON for the initial OpenDataChannel WebSocket text frame.
-pub(crate) fn open_data_channel_json(token_value: &str) -> Result<String> {
+pub(crate) fn open_data_channel_json(token_value: &str, client_id: &str) -> Result<String> {
     let open = OpenDataChannelInput {
         message_schema_version: "1.0".to_string(),
-        request_id: Uuid::new_v4().to_string(),
+        request_id: Uuid::now_v7().to_string(),
         token_value: token_value.to_string(),
-        client_id: Uuid::new_v4().to_string(),
+        client_id: client_id.to_string(),
         client_version: CLIENT_VERSION.to_string(),
     };
     serde_json::to_string(&open).context("serialize OpenDataChannel")

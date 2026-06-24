@@ -132,6 +132,8 @@ struct Outgoing {
 /// All data-channel state that must persist across reconnects.
 pub(crate) struct SessionState<W> {
     output: W,
+    /// Stable per-session client id, reused across reconnects.
+    client_id: String,
     expected_seq: i64,
     out_seq: i64,
     outgoing: Vec<Outgoing>,
@@ -150,6 +152,7 @@ impl<W> SessionState<W> {
     pub(crate) fn new(output: W) -> Self {
         Self {
             output,
+            client_id: message::new_client_id(),
             expected_seq: 0,
             out_seq: 0,
             outgoing: Vec::new(),
@@ -171,7 +174,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin, W: AsyncWrite + Unpin> Channel<'_, S, W>
     /// Send the OpenDataChannel frame and replay any still-unacked outgoing
     /// messages (the resume path), resetting their timers.
     async fn open_and_resync(&mut self, token_value: &str) -> ChannelResult<()> {
-        let json = message::open_data_channel_json(token_value).map_err(ChannelError::Protocol)?;
+        let json = message::open_data_channel_json(token_value, &self.state.client_id)
+            .map_err(ChannelError::Protocol)?;
         self.send(Message::text(json), "send OpenDataChannel")
             .await?;
         let pending: Vec<Bytes> = self
@@ -251,6 +255,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin, W: AsyncWrite + Unpin> Channel<'_, S, W>
             }
         };
         let acked = content.acknowledged_message_sequence_number;
+        // Linear scan; the unacked buffer stays tiny at interactive SSH volumes.
         if let Some(pos) = self
             .state
             .outgoing
@@ -289,17 +294,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin, W: AsyncWrite + Unpin> Channel<'_, S, W>
                 Ok(false)
             }
             PayloadType::HandshakeRequest => {
-                match serde_json::from_slice::<message::HandshakeRequestPayload>(&msg.payload) {
-                    Ok(request) => {
-                        let payload = message::handshake_response_payload(&request)
-                            .map_err(ChannelError::Protocol)?;
-                        self.send_input(PayloadType::HandshakeResponse, payload)
-                            .await?;
-                    }
-                    Err(e) => {
-                        eprintln!("devbox ssm-proxy: ignoring malformed handshake request: {e}");
-                    }
-                }
+                // A malformed handshake is deterministic (a reconnect gets the same
+                // bytes) and would leave the session ungated, so fail fast rather
+                // than silently stalling stdin forever.
+                let request =
+                    serde_json::from_slice::<message::HandshakeRequestPayload>(&msg.payload)
+                        .map_err(|e| {
+                            ChannelError::Protocol(anyhow!(
+                                "agent sent a malformed handshake request: {e}"
+                            ))
+                        })?;
+                let payload = message::handshake_response_payload(&request)
+                    .map_err(ChannelError::Protocol)?;
+                self.send_input(PayloadType::HandshakeResponse, payload)
+                    .await?;
                 Ok(false)
             }
             PayloadType::HandshakeComplete => {
@@ -419,8 +427,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin, W: AsyncWrite + Unpin> Channel<'_, S, W>
         for out in &mut self.state.outgoing {
             if out.last_sent.elapsed() > rto {
                 if out.attempts >= MAX_RESEND_ATTEMPTS {
-                    return Err(ChannelError::Transport(anyhow!(
-                        "retransmission limit reached for sequence {}",
+                    // Deterministic failure: a fresh connection would inherit the
+                    // same exhausted attempt count, so fail fast rather than
+                    // burning the reconnect budget on a retry that cannot succeed.
+                    return Err(ChannelError::Protocol(anyhow!(
+                        "data channel stopped acknowledging input after {MAX_RESEND_ATTEMPTS} \
+                         retransmissions of sequence {}; the connection is unrecoverable",
                         out.sequence_number
                     )));
                 }
@@ -519,6 +531,8 @@ where
                     _ => {}
                 }
             }
+            // `AsyncReadExt::read` is cancellation-safe: if another branch wins,
+            // no bytes are consumed from stdin, so nothing is lost.
             read = input.read(&mut input_buf),
                 if channel.state.can_send && channel.state.handshake_done && !input_eof =>
             {
@@ -585,7 +599,7 @@ mod tests {
             message_type,
             sequence_number,
             flags: 0,
-            message_id: Uuid::new_v4(),
+            message_id: Uuid::now_v7(),
             payload_type,
             payload: Bytes::copy_from_slice(payload),
         }
