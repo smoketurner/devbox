@@ -8,16 +8,17 @@
 //! advertises (in its RFC 9728 discovery document) and pick the local
 //! `~/.aws/config` profile whose role targets it.
 //!
-//! Parsing the config ourselves (rather than shelling out to `aws configure`)
-//! keeps the matching logic pure and unit-testable and avoids a per-profile
-//! subprocess fan-out. We recognise the two ways a profile encodes its account:
-//! an assume-role `role_arn`, or a `credential_process` that carries a
-//! `--role <arn>` (how `vouch setup aws` writes profiles).
+//! Parsing the config with `rust-ini` (rather than shelling out to `aws
+//! configure`) keeps the matching logic pure and unit-testable and avoids a
+//! per-profile subprocess fan-out. We recognise the two ways a profile encodes
+//! its account: an assume-role `role_arn`, or a `credential_process` that
+//! carries a `--role <arn>` (how `vouch setup aws` writes profiles).
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use dialoguer::Select;
+use ini::Ini;
 
 /// Pick the AWS profile that targets `account_id`, or `None` to fall back to the
 /// caller's default credentials.
@@ -84,64 +85,36 @@ fn read_aws_config() -> Option<String> {
     std::fs::read_to_string(aws_config_path()?).ok()
 }
 
-/// A parsed `[profile NAME]` / `[default]` section — only the keys that carry an
-/// account.
-struct ProfileSection {
-    name: String,
-    role_arn: Option<String>,
-    credential_process: Option<String>,
-}
-
 /// Profile names from `config_text` whose role targets `account_id`, sorted and
-/// de-duplicated. Recognises `[profile NAME]` and `[default]` headers; ignores
-/// every other section (e.g. `[sso-session …]`, `[services …]`).
+/// de-duplicated. Recognises `[profile NAME]` and `[default]` sections; ignores
+/// every other section (e.g. `[sso-session …]`, `[services …]`). An unparseable
+/// config warns and yields no matches (auto-select falls back to default creds).
 fn profiles_for_account(config_text: &str, account_id: &str) -> Vec<String> {
+    let ini = match Ini::load_from_str(config_text) {
+        Ok(ini) => ini,
+        Err(e) => {
+            eprintln!("warning: could not parse AWS config: {e}");
+            return Vec::new();
+        }
+    };
+
     let mut matches: Vec<String> = Vec::new();
-    let mut current: Option<ProfileSection> = None;
-
-    for raw in config_text.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
-            continue;
-        }
-
-        if let Some(header) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-            push_if_match(current.take(), account_id, &mut matches);
-            current = profile_name(header).map(|name| ProfileSection {
-                name,
-                role_arn: None,
-                credential_process: None,
-            });
-            continue;
-        }
-
-        let Some(section) = current.as_mut() else {
+    for (section, properties) in ini.iter() {
+        let Some(name) = section.and_then(profile_name) else {
             continue;
         };
-        if let Some((key, value)) = line.split_once('=') {
-            match key.trim() {
-                "role_arn" => section.role_arn = Some(value.trim().to_string()),
-                "credential_process" => {
-                    section.credential_process = Some(value.trim().to_string());
-                }
-                _ => {}
-            }
+        let account = account_of_profile(
+            properties.get("role_arn"),
+            properties.get("credential_process"),
+        );
+        if account.as_deref() == Some(account_id) {
+            matches.push(name);
         }
     }
-    push_if_match(current.take(), account_id, &mut matches);
 
     matches.sort();
     matches.dedup();
     matches
-}
-
-/// Record the section's name in `out` when its role targets `account_id`.
-fn push_if_match(section: Option<ProfileSection>, account_id: &str, out: &mut Vec<String>) {
-    if let Some(section) = section
-        && account_of_profile(&section).as_deref() == Some(account_id)
-    {
-        out.push(section.name);
-    }
 }
 
 /// The profile name a `[…]` header denotes: `default` for `[default]`, the
@@ -160,15 +133,15 @@ fn profile_name(header: &str) -> Option<String> {
     }
 }
 
-/// The account a profile targets, via `role_arn` or a `credential_process`
+/// The account a profile targets, via its `role_arn` or a `credential_process`
 /// `--role <arn>`.
-fn account_of_profile(section: &ProfileSection) -> Option<String> {
-    if let Some(arn) = section.role_arn.as_deref()
+fn account_of_profile(role_arn: Option<&str>, credential_process: Option<&str>) -> Option<String> {
+    if let Some(arn) = role_arn
         && let Some(account) = account_of_arn(arn)
     {
         return Some(account.to_string());
     }
-    if let Some(cmd) = section.credential_process.as_deref()
+    if let Some(cmd) = credential_process
         && let Some(arn) = role_arg(cmd)
         && let Some(account) = account_of_arn(arn)
     {
@@ -278,5 +251,22 @@ sso_account_id = 111111111111
 sso_account_id = 333333333333
 ";
         assert!(profiles_for_account(text, "333333333333").is_empty());
+    }
+
+    #[test]
+    fn profiles_for_account_tolerates_inline_comments_and_matches_default() {
+        // Inline comments on values and section headers must not break parsing,
+        // and `[default]` is a valid, matchable profile.
+        let text = "\
+[default]
+role_arn = arn:aws:iam::444444444444:role/Base  # primary
+region = us-east-1
+
+[profile work] ; work account
+credential_process = vouch credential aws --role arn:aws:iam::444444444444:role/Work
+";
+        let mut profiles = profiles_for_account(text, "444444444444");
+        profiles.sort();
+        assert_eq!(profiles, ["default", "work"]);
     }
 }
