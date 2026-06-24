@@ -162,7 +162,7 @@ async fn build_authenticator() -> Result<Authenticator> {
     let http = reqwest::Client::new();
     let endpoints = discover_with_retry(&http, &issuer).await?;
 
-    let oidc = build_oidc_config(&endpoints);
+    let oidc = build_oidc_config(&endpoints)?;
     let config = AuthConfig {
         issuer,
         jwks_uri: endpoints.jwks_uri,
@@ -212,27 +212,50 @@ async fn discover_with_retry(http: &reqwest::Client, issuer: &str) -> Result<Oid
 /// Build the dashboard OIDC login config from the environment and discovered
 /// endpoints.
 ///
-/// Returns `Some` only when `AUTH_OIDC_CLIENT_ID`, `AUTH_OIDC_CLIENT_SECRET`,
-/// and `AUTH_OIDC_REDIRECT_URI` are all set; otherwise the login page shows an
-/// error (all dashboard routes require a valid session). The endpoints come
-/// from discovery; only `AUTH_OIDC_SCOPE` is read here, defaulting to
+/// Returns `Ok(Some)` only when `AUTH_OIDC_CLIENT_ID`, `AUTH_OIDC_CLIENT_SECRET`,
+/// and `AUTH_OIDC_REDIRECT_URI` are all set; otherwise `Ok(None)` (the login page
+/// shows an error — all dashboard routes require a valid session). The endpoints
+/// come from discovery; only `AUTH_OIDC_SCOPE` is read here, defaulting to
 /// `openid email`.
-fn build_oidc_config(endpoints: &OidcEndpoints) -> Option<OidcConfig> {
+///
+/// # Errors
+///
+/// Returns an error when the dashboard env vars are set but the issuer's
+/// discovery document omits an endpoint the login flow needs
+/// (`authorization_endpoint`, `token_endpoint`, or `end_session_endpoint`).
+/// These are optional in [`OidcEndpoints`] so an API-only deployment boots
+/// without them; once the dashboard is configured they become required, so a
+/// missing one is a misconfiguration that fails fast with an actionable message.
+fn build_oidc_config(endpoints: &OidcEndpoints) -> Result<Option<OidcConfig>> {
     let nonempty = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
 
-    let client_id = nonempty("AUTH_OIDC_CLIENT_ID")?;
-    let client_secret = nonempty("AUTH_OIDC_CLIENT_SECRET")?;
-    let redirect_uri = nonempty("AUTH_OIDC_REDIRECT_URI")?;
+    let (Some(client_id), Some(client_secret), Some(redirect_uri)) = (
+        nonempty("AUTH_OIDC_CLIENT_ID"),
+        nonempty("AUTH_OIDC_CLIENT_SECRET"),
+        nonempty("AUTH_OIDC_REDIRECT_URI"),
+    ) else {
+        return Ok(None);
+    };
 
-    Some(OidcConfig {
+    let require = |name: &str, value: &Option<String>| -> Result<String> {
+        value.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "dashboard OIDC is configured (AUTH_OIDC_* set) but the issuer's discovery \
+                 document omits {name}; unset the AUTH_OIDC_* dashboard vars or use an issuer \
+                 that publishes it"
+            )
+        })
+    };
+
+    Ok(Some(OidcConfig {
         client_id,
         client_secret: SecretString::from(client_secret),
         redirect_uri,
-        authorize_endpoint: endpoints.authorization_endpoint.clone(),
-        token_endpoint: endpoints.token_endpoint.clone(),
-        end_session_endpoint: endpoints.end_session_endpoint.clone(),
+        authorize_endpoint: require("authorization_endpoint", &endpoints.authorization_endpoint)?,
+        token_endpoint: require("token_endpoint", &endpoints.token_endpoint)?,
+        end_session_endpoint: require("end_session_endpoint", &endpoints.end_session_endpoint)?,
         scope: nonempty("AUTH_OIDC_SCOPE").unwrap_or_else(|| "openid email".to_string()),
-    })
+    }))
 }
 
 /// Wait for a shutdown signal (Ctrl+C or SIGTERM).

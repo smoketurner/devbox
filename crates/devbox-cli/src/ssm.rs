@@ -9,19 +9,32 @@
 mod channel;
 mod message;
 
+use std::time::{Duration, Instant};
+
 use anyhow::{Context, Result, anyhow, bail};
 use aws_credential_types::provider::ProvideCredentials;
 
+/// Maximum consecutive reconnect attempts before giving up on a session.
+const MAX_RECONNECT_ATTEMPTS: u32 = 10;
+/// Base delay for reconnect backoff.
+const RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(1);
+/// Cap on the reconnect backoff delay.
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
+/// A connection that stays up at least this long resets the reconnect budget,
+/// so a long-lived session survives any number of well-spaced blips.
+const HEALTHY_CONNECTION: Duration = Duration::from_secs(60);
+
 /// Open a native SSM `AWS-StartSSHSession` tunnel to `target` and pipe
-/// stdin/stdout through it, returning once either side closes.
+/// stdin/stdout through it, transparently resuming across transient connection
+/// drops so a live SSH session is never lost to a network blip.
 ///
 /// `region` is the instance's region; `profile` selects AWS credentials when one
 /// was resolved (otherwise the default credential chain is used).
 ///
 /// # Errors
 ///
-/// Returns an error if credentials cannot be loaded, `StartSession` fails, the
-/// WebSocket cannot be opened, or the data channel errors.
+/// Returns an error if credentials cannot be loaded, `StartSession` fails, or the
+/// session cannot be resumed after [`MAX_RECONNECT_ATTEMPTS`] reconnect attempts.
 pub(crate) async fn run_proxy(
     target: &str,
     region: &str,
@@ -49,18 +62,91 @@ pub(crate) async fn run_proxy(
         .await
         .context("ssm StartSession failed")?;
 
-    let stream_url = session
+    let session_id = session
+        .session_id()
+        .context("StartSession response missing session_id")?
+        .to_string();
+    let mut stream_url = session
         .stream_url()
-        .context("StartSession response missing stream_url")?;
-    let token_value = session
+        .context("StartSession response missing stream_url")?
+        .to_string();
+    let mut token = session
         .token_value()
-        .context("StartSession response missing token_value")?;
+        .context("StartSession response missing token_value")?
+        .to_string();
 
-    let (ws, _response) = tokio_tungstenite::connect_async(stream_url)
+    let mut state = channel::SessionState::new(tokio::io::stdout());
+    let mut input = tokio::io::stdin();
+    let mut attempt: u32 = 0;
+
+    loop {
+        let ws = match tokio_tungstenite::connect_async(stream_url.as_str()).await {
+            Ok((ws, _response)) => ws,
+            Err(e) => {
+                eprintln!("devbox ssm-proxy: failed to open data channel: {e}");
+                match resume_session(&client, &session_id).await? {
+                    Some((url, tok)) => (stream_url, token) = (url, tok),
+                    None => return Ok(()),
+                }
+                reconnect_backoff(&mut attempt).await?;
+                continue;
+            }
+        };
+
+        let started = Instant::now();
+        match channel::run_connection(ws, &token, &mut state, &mut input).await {
+            channel::Outcome::Closed => return Ok(()),
+            channel::Outcome::Dropped => {
+                eprintln!("devbox ssm-proxy: connection dropped; resuming session");
+                if started.elapsed() >= HEALTHY_CONNECTION {
+                    attempt = 0;
+                }
+                match resume_session(&client, &session_id).await? {
+                    Some((url, tok)) => (stream_url, token) = (url, tok),
+                    // An empty ResumeSession means the session genuinely ended
+                    // (e.g. a normal logout that closed the WebSocket) — exit
+                    // cleanly rather than reporting an error.
+                    None => return Ok(()),
+                }
+                reconnect_backoff(&mut attempt).await?;
+            }
+        }
+    }
+}
+
+/// Fetch a fresh stream URL and token for an existing session via
+/// `ssm:ResumeSession`. `Ok(None)` means the session has ended (empty response).
+async fn resume_session(
+    client: &aws_sdk_ssm::Client,
+    session_id: &str,
+) -> Result<Option<(String, String)>> {
+    let resumed = client
+        .resume_session()
+        .session_id(session_id)
+        .send()
         .await
-        .context("failed to open the SSM WebSocket data channel")?;
+        .context("ssm ResumeSession failed")?;
+    let stream_url = resumed.stream_url().unwrap_or_default();
+    let token = resumed.token_value().unwrap_or_default();
+    if stream_url.is_empty() || token.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((stream_url.to_string(), token.to_string())))
+}
 
-    channel::run(ws, token_value, tokio::io::stdin(), tokio::io::stdout()).await
+/// Sleep with exponential backoff before the next reconnect; error out once the
+/// attempt budget is exhausted.
+async fn reconnect_backoff(attempt: &mut u32) -> Result<()> {
+    *attempt = attempt.saturating_add(1);
+    if *attempt > MAX_RECONNECT_ATTEMPTS {
+        bail!("gave up after {MAX_RECONNECT_ATTEMPTS} reconnect attempts");
+    }
+    let shift = attempt.saturating_sub(1).min(5);
+    let delay = RECONNECT_INITIAL_DELAY
+        .saturating_mul(2u32.saturating_pow(shift))
+        .min(RECONNECT_MAX_DELAY);
+    tokio::time::sleep(delay).await;
+    Ok(())
 }
 
 /// Resolve AWS credentials before `StartSession` so a missing/expired profile

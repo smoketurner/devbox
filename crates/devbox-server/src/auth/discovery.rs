@@ -14,20 +14,26 @@ use super::AuthError;
 
 /// The endpoints the server consumes from the OIDC discovery document.
 ///
-/// All four are required: Vouch publishes them, the server uses `jwks_uri` on
-/// every token verification, and the other three drive the dashboard login flow.
+/// Only `issuer` and `jwks_uri` are required: the server verifies every bearer
+/// token against `jwks_uri`, so API auth (the always-on path) cannot work
+/// without it. The other three drive the dashboard login flow and are optional
+/// here — `end_session_endpoint` is itself optional in the OIDC spec (it comes
+/// from RP-Initiated Logout, not Core discovery), and an API-only deployment
+/// never needs any of them. They are validated when the dashboard OIDC config is
+/// actually built (see `build_oidc_config`), so a missing field fails the
+/// dashboard rather than blocking server boot.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OidcEndpoints {
     /// The issuer identifier; must equal the issuer the document was fetched from.
     pub issuer: String,
-    /// OAuth authorization endpoint (dashboard login redirect).
-    pub authorization_endpoint: String,
-    /// OAuth token endpoint (dashboard authorization-code exchange).
-    pub token_endpoint: String,
     /// JWKS URI for the signing keys that verify Vouch tokens.
     pub jwks_uri: String,
+    /// OAuth authorization endpoint (dashboard login redirect).
+    pub authorization_endpoint: Option<String>,
+    /// OAuth token endpoint (dashboard authorization-code exchange).
+    pub token_endpoint: Option<String>,
     /// RP-Initiated Logout end-session endpoint (dashboard sign-out).
-    pub end_session_endpoint: String,
+    pub end_session_endpoint: Option<String>,
 }
 
 /// Fetch and validate the issuer's OIDC discovery document.
@@ -35,8 +41,9 @@ pub struct OidcEndpoints {
 /// # Errors
 ///
 /// Returns [`AuthError::Invalid`] when the request fails, the response is not
-/// 2xx, the body cannot be parsed into [`OidcEndpoints`], or the document's
-/// `issuer` does not match `issuer` (an OIDC issuer mix-up guard).
+/// 2xx, the body cannot be parsed into [`OidcEndpoints`] (e.g. it omits the
+/// required `issuer` or `jwks_uri`), or the document's `issuer` does not match
+/// `issuer` (an OIDC issuer mix-up guard).
 pub async fn discover(client: &reqwest::Client, issuer: &str) -> Result<OidcEndpoints, AuthError> {
     let url = format!("{issuer}/.well-known/openid-configuration");
 
@@ -136,15 +143,44 @@ mod tests {
         let endpoints = discover(&reqwest::Client::new(), &base).await.unwrap();
         assert_eq!(endpoints.issuer, base);
         assert_eq!(
-            endpoints.authorization_endpoint,
-            format!("{base}/oauth/authorize")
+            endpoints.authorization_endpoint.as_deref(),
+            Some(format!("{base}/oauth/authorize").as_str())
         );
-        assert_eq!(endpoints.token_endpoint, format!("{base}/oauth/token"));
+        assert_eq!(
+            endpoints.token_endpoint.as_deref(),
+            Some(format!("{base}/oauth/token").as_str())
+        );
         assert_eq!(endpoints.jwks_uri, format!("{base}/oauth/jwks"));
         assert_eq!(
-            endpoints.end_session_endpoint,
-            format!("{base}/oauth/logout")
+            endpoints.end_session_endpoint.as_deref(),
+            Some(format!("{base}/oauth/logout").as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn discover_allows_missing_optional_endpoints() {
+        // A minimal document with only the required fields parses: API bearer
+        // auth needs `jwks_uri`, and the dashboard endpoints are optional so an
+        // issuer that omits `end_session_endpoint` does not block server boot.
+        let (listener, base) = bind().await;
+        let doc = json!({
+            "issuer": base,
+            "jwks_uri": format!("{base}/oauth/jwks"),
+        });
+        let router = axum::Router::new().route(
+            "/.well-known/openid-configuration",
+            get(move || {
+                let doc = doc.clone();
+                async move { Json(doc) }
+            }),
+        );
+        spawn(listener, router);
+
+        let endpoints = discover(&reqwest::Client::new(), &base).await.unwrap();
+        assert_eq!(endpoints.jwks_uri, format!("{base}/oauth/jwks"));
+        assert!(endpoints.authorization_endpoint.is_none());
+        assert!(endpoints.token_endpoint.is_none());
+        assert!(endpoints.end_session_endpoint.is_none());
     }
 
     #[tokio::test]
@@ -178,13 +214,14 @@ mod tests {
 
     #[tokio::test]
     async fn discover_rejects_missing_field() {
-        // A document lacking end_session_endpoint must fail to parse rather than
-        // silently producing a half-built config.
+        // A document lacking the required jwks_uri must fail to parse rather than
+        // silently producing a half-built config (without it no bearer token can
+        // be verified).
         let base = serve_doc(json!({
             "issuer": "PLACEHOLDER",
             "authorization_endpoint": "x/authorize",
             "token_endpoint": "x/token",
-            "jwks_uri": "x/jwks",
+            "end_session_endpoint": "x/logout",
         }))
         .await;
 
