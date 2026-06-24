@@ -1082,6 +1082,7 @@ dependencies = [
  "futures-util",
  "jsonwebtoken",
  "open",
+ "proptest",
  "reqwest",
  "rust-ini",
  "rustls",
@@ -1090,6 +1091,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "uuid",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

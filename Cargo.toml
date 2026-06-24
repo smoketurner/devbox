@@ -151,3 +151,4 @@ tracing = { version = "=0.1.44", default-features = false }
 tracing-subscriber = { version = "=0.3.23", default-features = false }
 url = { version = "=2.5.8", default-features = false }
 uuid = { version = "=1.23.3", default-features = false }
+webpki-roots = { version = "=0.26.11", default-features = false }

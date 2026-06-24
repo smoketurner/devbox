@@ -9,11 +9,24 @@
 mod channel;
 mod message;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use aws_credential_types::provider::ProvideCredentials;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
+/// Cap on a single inbound WebSocket message; SSH frames are tiny, so this
+/// bounds the memory a malicious agent can force the client to buffer.
+const MAX_WS_MESSAGE_SIZE: usize = 256 * 1024;
+/// Times an empty `ResumeSession` is retried before concluding the session has
+/// genuinely ended — guards a live session against a transient empty response.
+const EMPTY_RESUME_RETRIES: u32 = 3;
+/// Delay between empty-`ResumeSession` retries.
+#[cfg(not(test))]
+const EMPTY_RESUME_DELAY: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const EMPTY_RESUME_DELAY: Duration = Duration::from_millis(1);
 /// Maximum consecutive reconnect attempts before giving up on a session.
 const MAX_RECONNECT_ATTEMPTS: u32 = 10;
 /// Base delay for reconnect backoff.
@@ -49,8 +62,9 @@ pub(crate) async fn run_proxy(
     port: u16,
     profile: Option<&str>,
 ) -> Result<()> {
-    // Ensure rustls uses the aws-lc-rs provider (no-op if already installed).
-    let _provider = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    // Pin the WebSocket TLS to the aws-lc-rs provider explicitly, rather than
+    // relying on the ambient process-default crypto provider.
+    let connector = aws_lc_rs_connector()?;
 
     let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(aws_config::Region::new(region.to_string()));
@@ -83,12 +97,26 @@ pub(crate) async fn run_proxy(
         .context("StartSession response missing token_value")?
         .to_string();
 
-    let mut state = channel::SessionState::new(tokio::io::stdout());
+    // Buffer stdout so a burst of small agent frames coalesces into few writes.
+    let mut state = channel::SessionState::new(tokio::io::BufWriter::new(tokio::io::stdout()));
     let mut input = tokio::io::stdin();
     let mut attempt: u32 = 0;
 
     loop {
-        let ws = match tokio_tungstenite::connect_async(stream_url.as_str()).await {
+        if !stream_url.starts_with("wss://") {
+            bail!("refusing to open a non-TLS SSM stream URL");
+        }
+        let mut ws_config = WebSocketConfig::default();
+        ws_config.max_message_size = Some(MAX_WS_MESSAGE_SIZE);
+        ws_config.max_frame_size = Some(MAX_WS_MESSAGE_SIZE);
+        let connect = tokio_tungstenite::connect_async_tls_with_config(
+            stream_url.as_str(),
+            Some(ws_config),
+            false,
+            Some(connector.clone()),
+        )
+        .await;
+        let ws = match connect {
             Ok((ws, _response)) => ws,
             Err(e) => {
                 eprintln!("devbox ssm-proxy: failed to open data channel: {e}");
@@ -122,24 +150,46 @@ pub(crate) async fn run_proxy(
     }
 }
 
+/// Build a tokio-tungstenite TLS connector pinned to the aws-lc-rs rustls
+/// provider and the webpki root store, so the data channel never depends on the
+/// ambient process-default crypto provider.
+fn aws_lc_rs_connector() -> Result<tokio_tungstenite::Connector> {
+    let roots = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .context("configure rustls protocol versions")?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Ok(tokio_tungstenite::Connector::Rustls(Arc::new(config)))
+}
+
 /// Fetch a fresh stream URL and token for an existing session via
-/// `ssm:ResumeSession`. `Ok(None)` means the session has ended (empty response).
+/// `ssm:ResumeSession`. An empty response is retried a bounded number of times
+/// (it can be transient); `Ok(None)` is returned only if it stays empty, meaning
+/// the session has genuinely ended.
 async fn resume_session(
     client: &aws_sdk_ssm::Client,
     session_id: &str,
 ) -> Result<Option<(String, String)>> {
-    let resumed = client
-        .resume_session()
-        .session_id(session_id)
-        .send()
-        .await
-        .context("ssm ResumeSession failed")?;
-    let stream_url = resumed.stream_url().unwrap_or_default();
-    let token = resumed.token_value().unwrap_or_default();
-    if stream_url.is_empty() || token.is_empty() {
-        return Ok(None);
+    for _ in 0..EMPTY_RESUME_RETRIES {
+        let resumed = client
+            .resume_session()
+            .session_id(session_id)
+            .send()
+            .await
+            .context("ssm ResumeSession failed")?;
+        let stream_url = resumed.stream_url().unwrap_or_default();
+        let token = resumed.token_value().unwrap_or_default();
+        if !stream_url.is_empty() && !token.is_empty() {
+            return Ok(Some((stream_url.to_string(), token.to_string())));
+        }
+        tokio::time::sleep(EMPTY_RESUME_DELAY).await;
     }
-    Ok(Some((stream_url.to_string(), token.to_string())))
+    Ok(None)
 }
 
 /// Sleep with exponential backoff before the next reconnect; error out once the

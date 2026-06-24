@@ -34,7 +34,9 @@ serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "io-util", "io-std"] }
 tokio-tungstenite = { workspace = true, features = ["connect", "rustls-tls-webpki-roots"] }
 uuid = { workspace = true, features = ["v7"] }
+webpki-roots = { workspace = true }
 
 [dev-dependencies]
 # In-process mock HTTP server for auth.rs poll-loop tests (axum already in workspace).
 axum = { workspace = true, features = ["http1", "json", "tokio"] }
+proptest = { workspace = true, features = ["std"] }

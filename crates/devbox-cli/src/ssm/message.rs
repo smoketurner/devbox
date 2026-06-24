@@ -170,10 +170,10 @@ impl ClientMessage {
         if buf.len() < HEADER_LEN {
             bail!("data-channel message too short: {} bytes", buf.len());
         }
-        let message_type = MessageType::from_wire(&read_string(
+        let message_type = read_message_type(
             buf.get(OFF_MESSAGE_TYPE..OFF_SCHEMA_VERSION)
                 .context("message_type field")?,
-        ));
+        );
         let sequence_number = i64::from_be_bytes(read_array(buf, OFF_SEQUENCE)?);
         let flags = u64::from_be_bytes(read_array(buf, OFF_FLAGS)?);
         let message_id = decode_uuid(
@@ -338,11 +338,13 @@ fn read_array<const N: usize>(buf: &[u8], offset: usize) -> Result<[u8; N]> {
         .context("field size mismatch")
 }
 
-/// Read the space/null-padded `MessageType` field as a trimmed string.
-fn read_string(field: &[u8]) -> String {
-    String::from_utf8_lossy(field)
-        .trim_matches(|c| c == ' ' || c == '\0')
-        .to_string()
+/// Parse the space/null-padded `MessageType` field without allocating for the
+/// known types (only an unknown type allocates, via `MessageType::Other`).
+fn read_message_type(field: &[u8]) -> MessageType {
+    let text = std::str::from_utf8(field)
+        .unwrap_or_default()
+        .trim_matches([' ', '\0']);
+    MessageType::from_wire(text)
 }
 
 #[derive(Serialize)]
@@ -558,5 +560,28 @@ mod tests {
     #[test]
     fn deserialize_rejects_short_buffer() {
         assert!(ClientMessage::deserialize(&[0u8; 10]).is_err());
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn codec_roundtrips_arbitrary_messages(
+            seq in proptest::prelude::any::<i64>(),
+            payload in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..2048),
+        ) {
+            let msg = input_data(seq, PayloadType::Output, Bytes::copy_from_slice(&payload));
+            let wire = msg.serialize().expect("serialize");
+            let back = ClientMessage::deserialize(&wire).expect("deserialize");
+            proptest::prop_assert_eq!(back.sequence_number, seq);
+            proptest::prop_assert_eq!(back.payload.as_ref(), payload.as_slice());
+            proptest::prop_assert_eq!(back.payload_type, PayloadType::Output);
+        }
+
+        #[test]
+        fn deserialize_never_panics_on_arbitrary_bytes(
+            bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..512),
+        ) {
+            // Must return Ok or Err on any input, but never panic.
+            ClientMessage::deserialize(&bytes).ok();
+        }
     }
 }

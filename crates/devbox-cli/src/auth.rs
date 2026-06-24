@@ -292,10 +292,12 @@ fn print_user_prompt(device: &DeviceAuthResponse) {
     eprintln!();
 
     // Best-effort browser launch, only when stderr is a TTY (skipped in scripts,
-    // CI, headless hosts, and tests). Prefer the one-step link — it carries the
-    // code so Vouch can pre-fill it — and fall back to the plain page. Any
-    // failure is silent: the URL and code are already printed above.
-    if std::io::stderr().is_terminal() {
+    // CI, and headless hosts). The `!cfg!(test)` guard suppresses it under
+    // `cargo test`, which inherits the terminal's stderr and would otherwise
+    // open a real browser. Prefer the one-step link — it carries the code so
+    // Vouch can pre-fill it — and fall back to the plain page. Any failure is
+    // silent: the URL and code are already printed above.
+    if !cfg!(test) && std::io::stderr().is_terminal() {
         let target = device
             .verification_uri_complete
             .as_deref()
