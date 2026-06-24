@@ -26,7 +26,11 @@ const MAX_RESEND_ATTEMPTS: u32 = 3000;
 /// stdin read-buffer size; a heap buffer keeps the event-loop future small.
 const STDIN_BUF: usize = 32_768;
 /// Cap on buffered out-of-order incoming messages.
+#[cfg(not(test))]
 const INCOMING_BUFFER_CAP: usize = 10_000;
+/// A small cap under test so the buffer-full path is cheap to exercise.
+#[cfg(test)]
+const INCOMING_BUFFER_CAP: usize = 2;
 
 /// An unacknowledged outgoing message held for possible retransmission.
 struct Outgoing {
@@ -150,9 +154,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin, W: AsyncWrite + Unpin> Channel<S, W> {
                 }
                 Ok(close)
             }
+            // Future sequence: buffer and ack only if there is room. When the
+            // buffer is full we neither store nor ack, so the agent retransmits
+            // once we catch up and free space. Acking then dropping would make
+            // the agent treat it as received and never resend, stalling the stream.
+            // Future sequence: buffer and ack only if there is room. When the
+            // buffer is full we neither store nor ack, so the agent retransmits
+            // once we catch up and free space. Acking then dropping would make
+            // the agent treat it as received and never resend, stalling the stream.
             Ordering::Greater => {
-                self.send_ack(&msg, false).await?;
                 if self.incoming.len() < INCOMING_BUFFER_CAP {
+                    self.send_ack(&msg, false).await?;
                     self.incoming.insert(msg.sequence_number, msg);
                 }
                 Ok(false)
@@ -524,6 +536,38 @@ mod tests {
         let mut buf = [0u8; 10];
         h.capture.read_exact(&mut buf).await.expect("read output");
         assert_eq!(buf.as_slice(), b"helloworld".as_slice());
+
+        h.server
+            .send(Message::text(message_type::CHANNEL_CLOSED))
+            .await
+            .expect("send channel_closed");
+        h.handle.await.expect("join").expect("run ok");
+    }
+
+    #[tokio::test]
+    async fn full_reorder_buffer_drops_without_acking() {
+        // INCOMING_BUFFER_CAP is 2 under cfg(test). Fill it with two future
+        // frames, then an overflow frame must be neither buffered nor acked, so
+        // the agent will retransmit it rather than treat it as delivered.
+        let mut h = setup().await;
+        complete_handshake(&mut h).await;
+
+        // expected_seq == 2 after the handshake. Buffer seq 3 and 4 (fills cap).
+        send(&mut h.server, output_bytes(3, b"c")).await;
+        assert_eq!(acked_seq(&next_binary(&mut h.server).await), 3);
+        send(&mut h.server, output_bytes(4, b"d")).await;
+        assert_eq!(acked_seq(&next_binary(&mut h.server).await), 4);
+
+        // Overflow frame (seq 5) must be dropped silently, then deliver seq 2.
+        send(&mut h.server, output_bytes(5, b"e")).await;
+        send(&mut h.server, output_bytes(2, b"b")).await;
+
+        // The next ack must be for seq 2 — proving seq 5 was never acknowledged.
+        assert_eq!(acked_seq(&next_binary(&mut h.server).await), 2);
+
+        let mut buf = [0u8; 3];
+        h.capture.read_exact(&mut buf).await.expect("read output");
+        assert_eq!(buf.as_slice(), b"bcd".as_slice());
 
         h.server
             .send(Message::text(message_type::CHANNEL_CLOSED))
