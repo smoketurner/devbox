@@ -1,21 +1,28 @@
-//! Mint a short-lived, read-only GitHub App installation token at warm-up.
+//! Mint short-lived, read-only GitHub App installation tokens at warm-up.
 //!
 //! The warming fetch needs a credential, but an installation token lives only an
 //! hour, so it can't be baked into the AMI or an env var. Instead the agent reads
 //! the GitHub App private key from an **SSM SecureString** parameter (via the host
-//! instance profile — no static secret on the box), signs a short JWT, and
+//! instance profile — no static secret on the box), signs a short App JWT, and
 //! exchanges it for a fresh `contents:read` installation token. The token is used
 //! only for the fetch and never persisted.
+//!
+//! The installation is **discovered per repository**, not configured: for each
+//! repo the agent reads its `origin` remote, derives `owner/repo`, and asks GitHub
+//! which installation covers it (`GET /repos/{owner}/{repo}/installation`). One App
+//! therefore freshens repos in **any** org that has installed it — there are no
+//! installation IDs to track. Tokens are cached per owner (N repos in one org cost
+//! one discovery and one mint).
 //!
 //! Configuration is non-secret and supplied via the environment (set by the
 //! systemd unit / instance metadata), so an unconfigured box simply skips minting
 //! and fetches unauthenticated:
 //!
 //! - `DEVBOX_GITHUB_APP_ID` — the App ID or Client ID (the JWT issuer).
-//! - `DEVBOX_GITHUB_INSTALLATION_ID` — the installation to mint against.
 //! - `DEVBOX_GITHUB_KEY_PARAM` — SSM SecureString parameter holding the RSA PEM.
 //! - `DEVBOX_GITHUB_API_BASE` — optional; defaults to `https://api.github.com`.
 
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -23,9 +30,9 @@ use aws_config::BehaviorVersion;
 use aws_sdk_ssm::config::Region;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 const APP_ID_ENV: &str = "DEVBOX_GITHUB_APP_ID";
-const INSTALLATION_ENV: &str = "DEVBOX_GITHUB_INSTALLATION_ID";
 const KEY_PARAM_ENV: &str = "DEVBOX_GITHUB_KEY_PARAM";
 const API_BASE_ENV: &str = "DEVBOX_GITHUB_API_BASE";
 const DEFAULT_API_BASE: &str = "https://api.github.com";
@@ -35,11 +42,11 @@ const JWT_TTL: Duration = Duration::from_secs(540);
 /// Back-date `iat` to tolerate clock skew between the box and GitHub.
 const JWT_BACKDATE: Duration = Duration::from_secs(60);
 
-/// Overall bound on the mint (SSM read + JWT + HTTP) so a stall can't block warm-up.
-const MINT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Per-request timeout for the GitHub API call.
+/// Bound on the one-time SSM key read so a stall can't block warm-up.
+const KEY_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Per-request timeout for the GitHub API calls.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
-/// Connect timeout for the GitHub API call.
+/// Connect timeout for the GitHub API calls.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Serialize)]
@@ -65,37 +72,140 @@ struct TokenResponse {
     token: String,
 }
 
+#[derive(Deserialize)]
+struct Installation {
+    id: u64,
+}
+
 /// Non-secret minting configuration, or `None` when the box is not set up for
 /// GitHub App auth (the caller then fetches unauthenticated).
 struct Config {
     issuer: String,
-    installation_id: String,
     key_param: String,
     api_base: String,
 }
 
-/// Mint a read-only installation token, or `Ok(None)` when the box is not
-/// configured for GitHub App auth.
-///
-/// # Errors
-///
-/// Returns an error if the box is configured but the SSM key fetch, JWT signing,
-/// or token exchange fails.
-pub(crate) async fn installation_token(region: &str) -> Result<Option<String>> {
-    let Some(cfg) = config() else {
-        return Ok(None);
-    };
-    let token = tokio::time::timeout(MINT_TIMEOUT, mint(region, &cfg))
-        .await
-        .context("GitHub token mint timed out")??;
-    Ok(Some(token))
+/// Mints read-only installation tokens, discovering the installation per repo so a
+/// single App serves every org that installed it. Built once per warm-up; caches a
+/// token per owner.
+pub(crate) struct TokenMinter {
+    client: reqwest::Client,
+    api_base: String,
+    issuer: String,
+    key: EncodingKey,
+    cache: HashMap<String, String>,
 }
 
-/// Read the key, sign the JWT, and exchange it for an installation token.
-async fn mint(region: &str, cfg: &Config) -> Result<String> {
-    let pem = read_key(region, &cfg.key_param).await?;
-    let jwt = sign_jwt(&cfg.issuer, &pem)?;
-    exchange(cfg, &jwt).await
+impl TokenMinter {
+    /// Build a minter, or `Ok(None)` when the box is not configured for GitHub App
+    /// auth.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the box is configured but the SSM key fetch, key
+    /// parsing, or HTTP client construction fails.
+    pub(crate) async fn new(region: &str) -> Result<Option<Self>> {
+        let Some(cfg) = config() else {
+            return Ok(None);
+        };
+        let pem = tokio::time::timeout(KEY_READ_TIMEOUT, read_key(region, &cfg.key_param))
+            .await
+            .context("GitHub App key read timed out")??;
+        let key = EncodingKey::from_rsa_pem(pem.as_bytes())
+            .context("parse GitHub App private key (expected an RSA PEM)")?;
+        let client = reqwest::Client::builder()
+            .user_agent("devbox-agent")
+            .timeout(HTTP_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+            .context("build HTTP client")?;
+        Ok(Some(Self {
+            client,
+            api_base: cfg.api_base,
+            issuer: cfg.issuer,
+            key,
+            cache: HashMap::new(),
+        }))
+    }
+
+    /// A read-only installation token for `owner/repo`, cached per owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the App is not installed on `owner` (or the repo is not
+    /// granted to it) or a GitHub API call fails.
+    pub(crate) async fn token_for(&mut self, owner: &str, repo: &str) -> Result<String> {
+        if let Some(token) = self.cache.get(owner) {
+            return Ok(token.clone());
+        }
+        let jwt = sign_jwt(&self.issuer, &self.key)?;
+        let installation_id = self.resolve_installation(&jwt, owner, repo).await?;
+        let token = self.exchange(&jwt, installation_id).await?;
+        self.cache.insert(owner.to_string(), token.clone());
+        Ok(token)
+    }
+
+    /// Resolve the installation id covering `owner/repo` via the App JWT.
+    async fn resolve_installation(&self, jwt: &str, owner: &str, repo: &str) -> Result<u64> {
+        let url = format!(
+            "{}/repos/{owner}/{repo}/installation",
+            self.api_base.trim_end_matches('/')
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .bearer_auth(jwt)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "GitHub installation lookup for {owner}/{repo} failed ({status}): {body}"
+            );
+        }
+        Ok(resp
+            .json::<Installation>()
+            .await
+            .context("parse installation response")?
+            .id)
+    }
+
+    /// Exchange the App JWT for a `contents:read` token on `installation_id`.
+    async fn exchange(&self, jwt: &str, installation_id: u64) -> Result<String> {
+        let url = format!(
+            "{}/app/installations/{installation_id}/access_tokens",
+            self.api_base.trim_end_matches('/')
+        );
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(jwt)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .json(&TokenRequest {
+                permissions: Permissions {
+                    contents: "read",
+                    metadata: "read",
+                },
+            })
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("GitHub installation-token request failed ({status}): {body}");
+        }
+        Ok(resp
+            .json::<TokenResponse>()
+            .await
+            .context("parse installation-token response")?
+            .token)
+    }
 }
 
 /// Read minting configuration from the environment; `None` if any required value
@@ -103,7 +213,6 @@ async fn mint(region: &str, cfg: &Config) -> Result<String> {
 fn config() -> Option<Config> {
     Some(Config {
         issuer: non_empty(APP_ID_ENV)?,
-        installation_id: non_empty(INSTALLATION_ENV)?,
         key_param: non_empty(KEY_PARAM_ENV)?,
         api_base: non_empty(API_BASE_ENV).unwrap_or_else(|| DEFAULT_API_BASE.to_string()),
     })
@@ -138,8 +247,9 @@ async fn read_key(region: &str, param: &str) -> Result<String> {
         .with_context(|| format!("SSM parameter {param} has no value"))
 }
 
-/// Sign the GitHub App JWT (RS256; jsonwebtoken on the aws-lc-rs backend).
-fn sign_jwt(issuer: &str, pem: &str) -> Result<String> {
+/// Sign a GitHub App JWT (RS256; jsonwebtoken on the aws-lc-rs backend). Cheap, so
+/// signed fresh per mint to sidestep the 10-minute App-JWT expiry on long runs.
+fn sign_jwt(issuer: &str, key: &EncodingKey) -> Result<String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before the unix epoch")?
@@ -149,46 +259,112 @@ fn sign_jwt(issuer: &str, pem: &str) -> Result<String> {
         exp: now.saturating_add(JWT_TTL.as_secs()),
         iss: issuer.to_string(),
     };
-    let key = EncodingKey::from_rsa_pem(pem.as_bytes())
-        .context("parse GitHub App private key (expected an RSA PEM)")?;
-    encode(&Header::new(Algorithm::RS256), &claims, &key).context("sign GitHub App JWT")
+    encode(&Header::new(Algorithm::RS256), &claims, key).context("sign GitHub App JWT")
 }
 
-/// Exchange the App JWT for a `contents:read` installation token.
-async fn exchange(cfg: &Config, jwt: &str) -> Result<String> {
-    let url = format!(
-        "{}/app/installations/{}/access_tokens",
-        cfg.api_base.trim_end_matches('/'),
-        cfg.installation_id
-    );
-    let client = reqwest::Client::builder()
-        .user_agent("devbox-agent")
-        .timeout(HTTP_TIMEOUT)
-        .connect_timeout(CONNECT_TIMEOUT)
-        .build()
-        .context("build HTTP client")?;
-    let resp = client
-        .post(&url)
-        .bearer_auth(jwt)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .json(&TokenRequest {
-            permissions: Permissions {
-                contents: "read",
-                metadata: "read",
-            },
-        })
-        .send()
-        .await
-        .with_context(|| format!("POST {url}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("GitHub installation-token request failed ({status}): {body}");
+/// Parse `owner` and `repo` from a git remote URL.
+///
+/// Parses the standard `scheme://[user@]host[:port]/owner/repo[.git]` forms with a
+/// real URL parser, after normalizing git's scp-like `user@host:owner/repo[.git]`
+/// shorthand (which is not a valid URL) into an `ssh://` URL. Returns `None` for a
+/// remote with no `owner/repo` path (e.g. a local path), so the caller fetches
+/// unauthenticated.
+pub(crate) fn owner_repo_from_remote(remote: &str) -> Option<(String, String)> {
+    let url = parse_git_url(remote.trim())?;
+    let mut segments = url.path_segments()?.filter(|segment| !segment.is_empty());
+    let owner = segments.next()?;
+    let repo = segments.next()?;
+    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    Some((owner.to_string(), repo.to_string()))
+}
+
+/// Parse a git remote into a [`Url`], first normalizing git's scp-like shorthand
+/// (`[user@]host:owner/repo`) into `ssh://[user@]host/owner/repo`. Per git, a remote
+/// is scp-like only when the first colon precedes the first slash; anything else with
+/// no `://` (e.g. a local path) is rejected.
+fn parse_git_url(remote: &str) -> Option<Url> {
+    if remote.contains("://") {
+        return Url::parse(remote).ok();
     }
-    Ok(resp
-        .json::<TokenResponse>()
-        .await
-        .context("parse installation-token response")?
-        .token)
+    let (authority, path) = remote.split_once(':')?;
+    if authority.is_empty() || authority.contains('/') {
+        return None;
+    }
+    Url::parse(&format!("ssh://{authority}/{path}")).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::owner_repo_from_remote;
+
+    #[test]
+    fn parses_https_with_git_suffix() {
+        assert_eq!(
+            owner_repo_from_remote("https://github.com/smoketurner/devbox.git"),
+            Some(("smoketurner".to_string(), "devbox".to_string()))
+        );
+    }
+
+    #[test]
+    fn parses_https_without_git_suffix() {
+        assert_eq!(
+            owner_repo_from_remote("https://github.com/smoketurner/devbox"),
+            Some(("smoketurner".to_string(), "devbox".to_string()))
+        );
+    }
+
+    #[test]
+    fn parses_https_with_trailing_slash() {
+        assert_eq!(
+            owner_repo_from_remote("https://github.com/smoketurner/devbox/"),
+            Some(("smoketurner".to_string(), "devbox".to_string()))
+        );
+    }
+
+    #[test]
+    fn parses_scp_like_form() {
+        assert_eq!(
+            owner_repo_from_remote("git@github.com:smoketurner/devbox.git"),
+            Some(("smoketurner".to_string(), "devbox".to_string()))
+        );
+    }
+
+    #[test]
+    fn parses_ssh_scheme_with_user() {
+        assert_eq!(
+            owner_repo_from_remote("ssh://git@github.com/smoketurner/devbox.git"),
+            Some(("smoketurner".to_string(), "devbox".to_string()))
+        );
+    }
+
+    #[test]
+    fn parses_ssh_scheme_with_port() {
+        assert_eq!(
+            owner_repo_from_remote("ssh://git@github.com:22/smoketurner/devbox.git"),
+            Some(("smoketurner".to_string(), "devbox".to_string()))
+        );
+    }
+
+    #[test]
+    fn query_string_does_not_leak_into_repo() {
+        assert_eq!(
+            owner_repo_from_remote("https://github.com/smoketurner/devbox.git?ref=main"),
+            Some(("smoketurner".to_string(), "devbox".to_string()))
+        );
+    }
+
+    #[test]
+    fn rejects_url_without_owner_repo() {
+        assert_eq!(owner_repo_from_remote("https://github.com/"), None);
+        assert_eq!(
+            owner_repo_from_remote("https://github.com/owner-only"),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_non_url_path() {
+        assert_eq!(owner_repo_from_remote("smoketurner/devbox"), None);
+        assert_eq!(owner_repo_from_remote(""), None);
+    }
 }

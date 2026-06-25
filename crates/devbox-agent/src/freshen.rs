@@ -7,7 +7,8 @@
 //! gets a near-HEAD checkout without paying a full clone at launch.
 //!
 //! The fetch is **read-only** — the agent mints a short-lived GitHub App
-//! installation token at warm-up (see [`crate::github_token`]) — and
+//! installation token per repo, discovering the installation from each repo's
+//! `origin` (see [`crate::github_token`]) — and
 //! **time-budgeted**: if the delta is too large to land within the budget, the box
 //! still becomes Ready serving the snapshot-age checkout (degrade, don't reap) — a
 //! slightly-stale box beats no box, and the claimant can fetch HEAD themselves. An
@@ -20,6 +21,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::process::Command;
+
+use crate::github_token::{TokenMinter, owner_repo_from_remote};
 
 /// Where the snapshot-seeded repositories live.
 const WORKSPACE: &str = "/workspace";
@@ -65,7 +68,7 @@ pub(crate) async fn freshen_workspace(region: &str) {
         return;
     }
 
-    let token = mint_token(region).await;
+    let mut minter = build_minter(region).await;
     // One shared budget. Each git op is given the time *left* in it (see `run_git`),
     // so once it's spent the remaining repos serve their snapshot-age checkout
     // (already near-HEAD) and the box still goes Ready — better than hanging warm-up
@@ -73,6 +76,7 @@ pub(crate) async fn freshen_workspace(region: &str) {
     let start = Instant::now();
     let budget = fetch_budget();
     for repo in &repos {
+        let token = repo_token(minter.as_mut(), repo).await;
         match freshen_repo(repo, token.as_deref(), start, budget).await {
             Ok(()) => tracing::info!(repo = %repo.display(), "freshened to upstream HEAD"),
             Err(e) => tracing::warn!(
@@ -232,12 +236,12 @@ fn remove_lock_files(dir: &Path, recurse: bool) {
     }
 }
 
-/// Mint the read-only GitHub token for the fetch, degrading to unauthenticated
-/// (`None`) when the box isn't configured for it or minting fails — a private repo
-/// then fails to freshen and serves its snapshot-age checkout.
-async fn mint_token(region: &str) -> Option<String> {
-    match crate::github_token::installation_token(region).await {
-        Ok(Some(token)) => Some(token),
+/// Build the GitHub App token minter, degrading to `None` (unauthenticated fetch)
+/// when the box isn't configured for it or construction fails — private repos then
+/// serve their snapshot-age checkout.
+async fn build_minter(region: &str) -> Option<TokenMinter> {
+    match TokenMinter::new(region).await {
+        Ok(Some(minter)) => Some(minter),
         Ok(None) => {
             tracing::warn!(
                 "GitHub App not configured; fetching without credentials (private repos won't freshen)"
@@ -247,11 +251,55 @@ async fn mint_token(region: &str) -> Option<String> {
         Err(e) => {
             tracing::warn!(
                 error = %format!("{e:#}"),
-                "failed to mint GitHub token; fetching without credentials"
+                "failed to build GitHub token minter; fetching without credentials"
             );
             None
         }
     }
+}
+
+/// A read-only token for `repo`'s `origin` owner, or `None` to fetch unauthenticated
+/// (no minter, no/unsupported remote, or the App isn't installed on the owner).
+async fn repo_token(minter: Option<&mut TokenMinter>, repo: &Path) -> Option<String> {
+    let minter = minter?;
+    let url = repo_origin_url(repo).await?;
+    let Some((owner, name)) = owner_repo_from_remote(&url) else {
+        tracing::debug!(
+            repo = %repo.display(),
+            remote = %url,
+            "origin is not a github owner/repo; fetching unauthenticated"
+        );
+        return None;
+    };
+    match minter.token_for(&owner, &name).await {
+        Ok(token) => Some(token),
+        Err(e) => {
+            tracing::warn!(
+                repo = %repo.display(),
+                owner = %owner,
+                error = %format!("{e:#}"),
+                "could not mint GitHub token; fetching unauthenticated"
+            );
+            None
+        }
+    }
+}
+
+/// The `origin` remote URL for `repo`, or `None` if it has no `origin`.
+async fn repo_origin_url(repo: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8(output.stdout).ok()?;
+    let url = url.trim();
+    (!url.is_empty()).then(|| url.to_string())
 }
 
 /// The overall fetch budget from the environment, or the default.
