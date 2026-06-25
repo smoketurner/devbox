@@ -58,9 +58,78 @@ jobs:
           path: dist/*
           retention-days: 7
 
+  build-macos:
+    name: Build signed CLI (macos-arm64)
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    env:
+      TARGET: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Install build dependencies
+        run: brew install go cmake
+      - name: Setup Rust toolchain
+        run: |
+          rustup show
+          rustup target add aarch64-apple-darwin
+      - name: Build CLI
+        run: cargo build --release --locked --target "${TARGET}" -p devbox-cli
+      - name: Import Apple Developer Certificate
+        env:
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+        run: |
+          echo "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode > certificate.p12
+          security create-keychain -p "$MACOS_KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$MACOS_KEYCHAIN_PASSWORD" build.keychain
+          security import certificate.p12 -k build.keychain \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$MACOS_KEYCHAIN_PASSWORD" build.keychain
+          rm certificate.p12
+      - name: Code sign CLI
+        env:
+          APPLE_CERTIFICATE_NAME: ${{ secrets.APPLE_CERTIFICATE_NAME }}
+        run: |
+          /usr/bin/codesign --force --sign "$APPLE_CERTIFICATE_NAME" \
+            --options runtime --timestamp "target/${TARGET}/release/devbox"
+          /usr/bin/codesign --verify --verbose "target/${TARGET}/release/devbox"
+      - name: Notarize CLI
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          xcrun notarytool store-credentials "notarytool-profile" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_ID_PASSWORD"
+          ditto -c -k --keepParent "target/${TARGET}/release/devbox" devbox-notarize.zip
+          xcrun notarytool submit devbox-notarize.zip \
+            --keychain-profile "notarytool-profile" --wait
+          rm -f devbox-notarize.zip
+      - name: Assemble release artifact
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${TARGET}/release/devbox" "dist/devbox-cli-${TARGET}"
+      - name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binaries-${{ env.TARGET }}
+          path: dist/*
+          retention-days: 7
+      - name: Cleanup macOS keychain
+        if: always()
+        run: security delete-keychain build.keychain 2>/dev/null || true
+
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, build-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
