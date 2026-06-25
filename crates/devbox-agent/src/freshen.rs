@@ -10,10 +10,10 @@
 //! installation token at warm-up (see [`crate::github_token`]) — and
 //! **time-budgeted**: if the delta is too large to land within the budget, the box
 //! still becomes Ready serving the snapshot-age checkout (degrade, don't reap) — a
-//! slightly-stale box beats no box, and the claimant can fetch HEAD themselves. The
-//! one hard failure is a workspace that was *required* (snapshot expected) but is
-//! absent: that means the snapshot failed to attach, so the box is left un-tagged
-//! for the reconciler to reap.
+//! slightly-stale box beats no box, and the claimant can fetch HEAD themselves. An
+//! absent or empty `/workspace` (e.g. the EBS volume didn't mount, so the directory
+//! falls back to the root disk) simply skips freshening and the box still becomes
+//! Ready — there is no reap path.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -27,11 +27,6 @@ const WORKSPACE: &str = "/workspace";
 /// Env var the credential helper reads the token from; the agent sets it on the
 /// git child from the freshly minted token (it is never baked or inherited).
 const TOKEN_ENV: &str = "DEVBOX_GITHUB_TOKEN";
-
-/// Environment variable that, when truthy, makes an empty `/workspace` a hard
-/// failure (the deployment seeds repos via snapshot, so empty means the snapshot
-/// did not attach). Unset/false preserves the no-snapshot behaviour: skip freshen.
-const REQUIRE_ENV: &str = "DEVBOX_REQUIRE_WORKSPACE";
 
 /// Environment variable overriding the overall fetch time budget, in seconds.
 const BUDGET_ENV: &str = "WARMUP_FETCH_TIMEOUT_SECS";
@@ -55,39 +50,19 @@ const LOCAL_GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const CREDENTIAL_HELPER: &str =
     "!f() { echo username=x-access-token; echo \"password=$DEVBOX_GITHUB_TOKEN\"; }; f";
 
-/// What warm-up should do after attempting to freshen the workspace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReadyDecision {
-    /// Tag the box ready: workspace is fresh, acceptably stale, or not seeded.
-    TagReady,
-    /// Leave the box un-tagged so the reconciler reaps it: a required workspace is
-    /// absent, so the snapshot almost certainly failed to attach.
-    FailAndReap,
-}
-
-/// Freshen every repository under `/workspace`, returning the readiness decision.
+/// Freshen every repository under `/workspace`.
 ///
 /// Each repo is fetched and hard-reset to its upstream HEAD within the shared time
 /// budget; a repo that errors or times out is left at its snapshot-age state and
-/// logged. The only outcome that withholds readiness is a required-but-empty
-/// workspace.
-pub(crate) async fn freshen_workspace(region: &str) -> ReadyDecision {
+/// logged. An absent or empty `/workspace` simply skips freshening.
+pub(crate) async fn freshen_workspace(region: &str) {
     let repos = repos_under(Path::new(WORKSPACE));
-    let decision = classify(&repos, require_workspace());
     if repos.is_empty() {
-        match decision {
-            ReadyDecision::FailAndReap => tracing::error!(
-                workspace = WORKSPACE,
-                "workspace required but no repositories present; snapshot likely failed to attach"
-            ),
-            ReadyDecision::TagReady => {
-                tracing::info!(
-                    workspace = WORKSPACE,
-                    "no repositories to freshen; skipping"
-                );
-            }
-        }
-        return decision;
+        tracing::info!(
+            workspace = WORKSPACE,
+            "no repositories to freshen; skipping"
+        );
+        return;
     }
 
     let token = mint_token(region).await;
@@ -107,7 +82,6 @@ pub(crate) async fn freshen_workspace(region: &str) -> ReadyDecision {
             ),
         }
     }
-    ReadyDecision::TagReady
 }
 
 /// Git repositories directly under `root`: `root` itself if it is a repo, otherwise
@@ -126,16 +100,6 @@ fn repos_under(root: &Path) -> Vec<PathBuf> {
         .collect();
     repos.sort();
     repos
-}
-
-/// Decide readiness from what was discovered. An empty, *required* workspace is the
-/// sole hard failure; everything else proceeds (degrade over reap).
-fn classify(repos: &[PathBuf], require_workspace: bool) -> ReadyDecision {
-    if repos.is_empty() && require_workspace {
-        ReadyDecision::FailAndReap
-    } else {
-        ReadyDecision::TagReady
-    }
 }
 
 /// Freshen one repo, clearing lock files a killed git op may leave so the box
@@ -290,11 +254,6 @@ async fn mint_token(region: &str) -> Option<String> {
     }
 }
 
-/// Whether an empty `/workspace` should fail warm-up (snapshot deployments).
-fn require_workspace() -> bool {
-    parse_require(std::env::var(REQUIRE_ENV).ok().as_deref())
-}
-
 /// The overall fetch budget from the environment, or the default.
 fn fetch_budget() -> Duration {
     parse_budget(std::env::var(BUDGET_ENV).ok().as_deref())
@@ -308,20 +267,11 @@ fn parse_budget(value: Option<&str>) -> Duration {
         .map_or(DEFAULT_BUDGET, Duration::from_secs)
 }
 
-/// Parse the require flag; only `1`/`true` (case-insensitive) are truthy.
-fn parse_require(value: Option<&str>) -> bool {
-    let Some(value) = value else {
-        return false;
-    };
-    let value = value.trim();
-    value == "1" || value.eq_ignore_ascii_case("true")
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_BUDGET, Duration, Instant, Path, PathBuf, ReadyDecision, classify,
-        clear_stale_locks, parse_budget, parse_require, repos_under, step_timeout,
+        DEFAULT_BUDGET, Duration, Instant, Path, PathBuf, clear_stale_locks, parse_budget,
+        repos_under, step_timeout,
     };
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -424,15 +374,6 @@ mod tests {
     }
 
     #[test]
-    fn classify_fails_only_when_required_and_empty() {
-        assert_eq!(classify(&[], true), ReadyDecision::FailAndReap);
-        assert_eq!(classify(&[], false), ReadyDecision::TagReady);
-        let repos = vec![PathBuf::from("/workspace/repo")];
-        assert_eq!(classify(&repos, true), ReadyDecision::TagReady);
-        assert_eq!(classify(&repos, false), ReadyDecision::TagReady);
-    }
-
-    #[test]
     fn parse_budget_handles_overrides_and_fallbacks() {
         assert_eq!(parse_budget(Some("300")), Duration::from_secs(300));
         assert_eq!(parse_budget(Some("  60 ")), Duration::from_secs(60));
@@ -448,15 +389,5 @@ mod tests {
         assert!(step_timeout(Instant::now(), Duration::from_millis(500)).is_none());
         // A fresh budget grants ~the whole thing.
         assert!(step_timeout(Instant::now(), Duration::from_secs(120)).is_some());
-    }
-
-    #[test]
-    fn parse_require_only_truthy_for_one_or_true() {
-        assert!(parse_require(Some("1")));
-        assert!(parse_require(Some("true")));
-        assert!(parse_require(Some(" TRUE ")));
-        assert!(!parse_require(Some("0")));
-        assert!(!parse_require(Some("no")));
-        assert!(!parse_require(None));
     }
 }

@@ -296,9 +296,10 @@ are tagged inline):
   `DEVBOX_GITHUB_KEY_PARAM` / optional `DEVBOX_GITHUB_API_BASE`). Nothing baked, no
   off-box broker, no control-plane callback — the only stored secret is the App key
   in SSM (IAM + KMS gated). The fetch is time-budgeted (`WARMUP_FETCH_TIMEOUT_SECS`,
-  default 120 s) and **degrades, does not reap** — a too-large delta or a mint/fetch
-  failure still becomes Ready on the snapshot-age checkout, while an empty
-  `/workspace` under `DEVBOX_REQUIRE_WORKSPACE` fails warm-up so the box is reaped.
+  default 120 s) and **degrades, does not reap** — a too-large delta, a mint/fetch
+  failure, or an absent/empty `/workspace` (e.g. the EBS volume didn't mount, so the
+  directory falls back to the root disk) still becomes Ready on whatever checkout is
+  present.
   Freshness is **warming-time only** (no claim-time fetch / lazy write-gating — the
   claimant fetches HEAD themselves post-claim). *Still in `devbox-infra`:* the
   periodic snapshot-builder pipeline + `/devbox/workspace-snapshot/latest` SSM param

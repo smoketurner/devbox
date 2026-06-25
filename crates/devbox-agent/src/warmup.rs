@@ -16,7 +16,7 @@ use aws_config::BehaviorVersion;
 use aws_sdk_ec2::config::Region;
 use aws_sdk_ec2::types::Tag;
 
-use crate::freshen::{self, ReadyDecision};
+use crate::freshen;
 use crate::imds;
 
 /// Run warm-up and self-tag the instance `devbox:ready=true`.
@@ -28,9 +28,8 @@ use crate::imds;
 ///
 /// # Errors
 ///
-/// Returns an error if Docker fails to start, a required workspace is absent
-/// (snapshot failed to attach), instance identity cannot be read from IMDS, or
-/// the `ec2:CreateTags` call fails.
+/// Returns an error if Docker fails to start, instance identity cannot be read
+/// from IMDS, or the `ec2:CreateTags` call fails.
 pub(crate) async fn run() -> Result<()> {
     ensure_docker_running()?;
 
@@ -42,12 +41,7 @@ pub(crate) async fn run() -> Result<()> {
         .await?
         .context("region unavailable from IMDS")?;
 
-    if freshen::freshen_workspace(&region).await == ReadyDecision::FailAndReap {
-        anyhow::bail!(
-            "workspace required but empty; snapshot likely failed to attach — leaving box \
-             un-tagged so the reconciler reaps it"
-        );
-    }
+    freshen::freshen_workspace(&region).await;
 
     let ec2_client = ec2_client(region).await;
     tag_ready(&ec2_client, &instance_id).await?;

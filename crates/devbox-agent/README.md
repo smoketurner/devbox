@@ -94,9 +94,9 @@ Other knobs:
   under `POOL_READY_TIMEOUT_SECS`). If the delta can't land in time the box still
   becomes Ready on the snapshot-age checkout (**degrade, not reap**); a git child
   that overruns is killed so nothing mutates `/workspace` after readiness.
-- `DEVBOX_REQUIRE_WORKSPACE` — when truthy, an empty `/workspace` (snapshot failed
-  to attach) is a hard failure: the box is left un-tagged for the reaper. Unset
-  preserves the no-snapshot behaviour (skip freshening).
+
+An absent or empty `/workspace` (e.g. the EBS volume didn't mount, so the directory
+falls back to the root disk) simply skips freshening — the box still becomes Ready.
 
 The minted token is read-only; the claimant's per-claim write credential is a
 separate concern. Warming build/dependency caches into the snapshot is on the
