@@ -185,11 +185,25 @@ fn budget_remaining(start: Instant, budget: Duration, repo: &Path, step: &str) -
     Ok(remaining)
 }
 
-/// Run `git -C <repo> <args>` with at most `timeout`, killing the child if it
-/// overruns so no background mutation outlives warm-up.
-async fn run_git(repo: &Path, token: Option<&str>, args: &[&str], timeout: Duration) -> Result<()> {
-    let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(repo);
+/// Run `git -C <repo> <args>` under GNU `timeout` so the whole process group dies
+/// on overrun, not just the top-level `git`.
+///
+/// `git fetch` spawns helpers (`git-remote-https`, …) in its process group; a
+/// parent-only kill would orphan them to keep doing network I/O and writing under
+/// `.git`. GNU `timeout` (AL2023 coreutils, like the `git`/`useradd`/`chown` the
+/// agent already shells out to) runs `git` in its own group and signals the whole
+/// group on expiry — SIGTERM first so `git` removes its own locks, then SIGKILL
+/// (`-k`) for stragglers. An outer tokio deadline guards against `timeout` itself
+/// misbehaving.
+async fn run_git(repo: &Path, token: Option<&str>, args: &[&str], budget: Duration) -> Result<()> {
+    let secs = budget.as_secs().max(1);
+    let mut cmd = Command::new("timeout");
+    cmd.arg("-k")
+        .arg("5")
+        .arg(secs.to_string())
+        .arg("git")
+        .arg("-C")
+        .arg(repo);
     if let Some(token) = token {
         cmd.arg("-c")
             .arg(format!("credential.helper={CREDENTIAL_HELPER}"))
@@ -200,30 +214,58 @@ async fn run_git(repo: &Path, token: Option<&str>, args: &[&str], timeout: Durat
         .args(args)
         .kill_on_drop(true);
 
+    let backstop = budget.saturating_add(Duration::from_secs(10));
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("spawn git {}", args.join(" ")))?;
-    match tokio::time::timeout(timeout, child.wait()).await {
+        .with_context(|| format!("spawn timeout git {}", args.join(" ")))?;
+    match tokio::time::timeout(backstop, child.wait()).await {
         Ok(Ok(status)) if status.success() => Ok(()),
         Ok(Ok(status)) => anyhow::bail!("git {} exited with {:?}", args.join(" "), status.code()),
         Ok(Err(e)) => Err(e).with_context(|| format!("wait on git {}", args.join(" "))),
         Err(_) => {
             child.start_kill().ok();
             child.wait().await.ok();
-            anyhow::bail!("git {} timed out after {timeout:?}", args.join(" "))
+            anyhow::bail!("git {} exceeded backstop {backstop:?}", args.join(" "))
         }
     }
 }
 
-/// Remove stale git lock files left by an interrupted prior pass so the fetch is
-/// re-entrant across warm-up restarts.
+/// Remove git `*.lock` files an interrupted or killed op may leave, so the fetch is
+/// re-entrant and the claimant never inherits a wedged repo.
+///
+/// Sweeps the top level of `.git` (`index.lock`, `packed-refs.lock`, `config.lock`,
+/// `FETCH_HEAD.lock`, `shallow.lock`, …) and recurses through `.git/refs` for
+/// per-ref locks. `.git/objects` is intentionally skipped — it holds no lock files
+/// and is the one subtree large enough to be worth not walking.
 fn clear_stale_locks(repo: &Path) {
     let git_dir = repo.join(".git");
-    for lock in ["index.lock", "shallow.lock", "HEAD.lock"] {
-        match std::fs::remove_file(git_dir.join(lock)) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => tracing::debug!(lock, error = %e, "could not remove stale git lock"),
+    remove_lock_files(&git_dir, false);
+    remove_lock_files(&git_dir.join("refs"), true);
+}
+
+/// Remove every `*.lock` file directly in `dir`, recursing into subdirectories when
+/// `recurse` is set. Missing directories and individual removal errors are ignored
+/// (best-effort cleanup); only unexpected errors are logged.
+fn remove_lock_files(dir: &Path, recurse: bool) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            if recurse {
+                remove_lock_files(&path, true);
+            }
+            continue;
+        }
+        if path.extension().is_some_and(|ext| ext == "lock") {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::debug!(path = %path.display(), error = %e, "could not remove stale git lock");
+                }
+            }
         }
     }
 }
@@ -266,7 +308,7 @@ fn parse_require(value: Option<&str>) -> bool {
 mod tests {
     use super::{
         DEFAULT_BUDGET, Duration, Instant, Path, PathBuf, ReadyDecision, budget_remaining,
-        classify, parse_budget, parse_require, repos_under,
+        classify, clear_stale_locks, parse_budget, parse_require, repos_under,
     };
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -327,6 +369,45 @@ mod tests {
     fn repos_under_missing_directory_is_empty() {
         let missing = Path::new("/no/such/devbox/workspace/path");
         assert!(repos_under(missing).is_empty());
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test setup; a failure should fail the test"
+    )]
+    fn clear_stale_locks_sweeps_top_level_and_refs_but_keeps_real_files() {
+        let root = temp_root();
+        let git = root.join(".git");
+        std::fs::create_dir_all(git.join("refs/remotes/origin")).unwrap();
+        std::fs::create_dir_all(git.join("objects")).unwrap();
+        for lock in [
+            "index.lock",
+            "packed-refs.lock",
+            "config.lock",
+            "FETCH_HEAD.lock",
+        ] {
+            std::fs::write(git.join(lock), b"").unwrap();
+        }
+        std::fs::write(git.join("refs/remotes/origin/main.lock"), b"").unwrap();
+        // Non-lock files must survive — including one named like a lock under objects.
+        std::fs::write(git.join("config"), b"[core]\n").unwrap();
+        std::fs::write(git.join("objects/pack-abc.idx"), b"x").unwrap();
+
+        clear_stale_locks(&root);
+
+        for lock in [
+            "index.lock",
+            "packed-refs.lock",
+            "config.lock",
+            "FETCH_HEAD.lock",
+        ] {
+            assert!(!git.join(lock).exists(), "{lock} should be removed");
+        }
+        assert!(!git.join("refs/remotes/origin/main.lock").exists());
+        assert!(git.join("config").exists());
+        assert!(git.join("objects/pack-abc.idx").exists());
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
