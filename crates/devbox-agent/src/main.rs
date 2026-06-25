@@ -9,6 +9,7 @@
 //!   marks the `DevboxDoc` Ready; boxes that never tag ready are reaped.
 
 mod freshen;
+mod github_token;
 mod imds;
 mod owner_sync;
 mod principals;

@@ -34,13 +34,6 @@ use crate::imds;
 pub(crate) async fn run() -> Result<()> {
     ensure_docker_running()?;
 
-    if freshen::freshen_workspace().await == ReadyDecision::FailAndReap {
-        anyhow::bail!(
-            "workspace required but empty; snapshot likely failed to attach — leaving box \
-             un-tagged so the reconciler reaps it"
-        );
-    }
-
     let imds_client = imds::client();
     let instance_id = imds::get(&imds_client, "/latest/meta-data/instance-id")
         .await?
@@ -48,6 +41,13 @@ pub(crate) async fn run() -> Result<()> {
     let region = imds::get(&imds_client, "/latest/meta-data/placement/region")
         .await?
         .context("region unavailable from IMDS")?;
+
+    if freshen::freshen_workspace(&region).await == ReadyDecision::FailAndReap {
+        anyhow::bail!(
+            "workspace required but empty; snapshot likely failed to attach — leaving box \
+             un-tagged so the reconciler reaps it"
+        );
+    }
 
     let ec2_client = ec2_client(region).await;
     tag_ready(&ec2_client, &instance_id).await?;

@@ -284,17 +284,24 @@ are tagged inline):
 - **Workspace freshening (snapshot-seeded EBS workspace)** — *Agent half
   implemented:* `devbox-agent warmup` discovers git repos under `/workspace` and
   `git fetch` + hard-resets each to upstream HEAD before tagging ready
-  (`crates/devbox-agent/src/freshen.rs`). Read-only credential via
-  `DEVBOX_GITHUB_TOKEN` (a GitHub App installation token minted off-box); the fetch
-  is time-budgeted (`WARMUP_FETCH_TIMEOUT_SECS`, default 120 s) and **degrades, does
-  not reap** — a too-large delta still becomes Ready on the snapshot-age checkout,
-  while an empty `/workspace` under `DEVBOX_REQUIRE_WORKSPACE` fails warm-up so the
-  box is reaped. Freshness is **warming-time only** (no claim-time fetch / lazy
-  write-gating — the claimant fetches HEAD themselves post-claim). *Still in
-  `devbox-infra`:* the periodic snapshot-builder pipeline + `/devbox/workspace-snapshot/latest`
-  SSM param + Launch Template block-device-mapping (per-instance volume, encrypted,
-  `DeleteOnTermination=true`) that seeds the volume, the off-box token broker, and the
-  GitHub egress allowlist. _(cf. Ramp Inspect)_
+  (`crates/devbox-agent/src/freshen.rs`). The read-only credential is **minted
+  in-agent** (`crates/devbox-agent/src/github_token.rs`): the agent reads the GitHub
+  App private key from an **SSM SecureString** via the host instance profile, signs
+  an RS256 JWT, and exchanges it for a fresh 1 h `contents:read` installation token
+  (config via `DEVBOX_GITHUB_APP_ID` / `DEVBOX_GITHUB_INSTALLATION_ID` /
+  `DEVBOX_GITHUB_KEY_PARAM` / optional `DEVBOX_GITHUB_API_BASE`). Nothing baked, no
+  off-box broker, no control-plane callback — the only stored secret is the App key
+  in SSM (IAM + KMS gated). The fetch is time-budgeted (`WARMUP_FETCH_TIMEOUT_SECS`,
+  default 120 s) and **degrades, does not reap** — a too-large delta or a mint/fetch
+  failure still becomes Ready on the snapshot-age checkout, while an empty
+  `/workspace` under `DEVBOX_REQUIRE_WORKSPACE` fails warm-up so the box is reaped.
+  Freshness is **warming-time only** (no claim-time fetch / lazy write-gating — the
+  claimant fetches HEAD themselves post-claim). *Still in `devbox-infra`:* the
+  periodic snapshot-builder pipeline + `/devbox/workspace-snapshot/latest` SSM param
+  + Launch Template block-device-mapping (per-instance volume, encrypted,
+  `DeleteOnTermination=true`) that seeds the volume, the App-key SSM SecureString +
+  `ssm:GetParameter`/`kms:Decrypt` on the host instance profile, and the GitHub
+  egress allowlist (`api.github.com` + the git host). _(cf. Ramp Inspect)_
 - **Warm dependency/build caches** — warm language caches (Rust `target/` +
   `CARGO_HOME`, Go/Node/Python equivalents) into the snapshot via a per-repo
   `.devbox/warm.sh` hook run by the snapshot-builder, with shared caches on the data

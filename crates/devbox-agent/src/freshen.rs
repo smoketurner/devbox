@@ -6,13 +6,14 @@
 //! the snapshot was cut and resets each repo to its upstream HEAD, so a claimant
 //! gets a near-HEAD checkout without paying a full clone at launch.
 //!
-//! The fetch is **read-only** (a GitHub App installation token supplied off-box via
-//! `DEVBOX_GITHUB_TOKEN`) and **time-budgeted**: if the delta is too large to land
-//! within the budget, the box still becomes Ready serving the snapshot-age checkout
-//! (degrade, don't reap) — a slightly-stale box beats no box, and the claimant can
-//! fetch HEAD themselves. The one hard failure is a workspace that was *required*
-//! (snapshot expected) but is absent: that means the snapshot failed to attach, so
-//! the box is left un-tagged for the reconciler to reap.
+//! The fetch is **read-only** — the agent mints a short-lived GitHub App
+//! installation token at warm-up (see [`crate::github_token`]) — and
+//! **time-budgeted**: if the delta is too large to land within the budget, the box
+//! still becomes Ready serving the snapshot-age checkout (degrade, don't reap) — a
+//! slightly-stale box beats no box, and the claimant can fetch HEAD themselves. The
+//! one hard failure is a workspace that was *required* (snapshot expected) but is
+//! absent: that means the snapshot failed to attach, so the box is left un-tagged
+//! for the reconciler to reap.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -23,7 +24,8 @@ use tokio::process::Command;
 /// Where the snapshot-seeded repositories live.
 const WORKSPACE: &str = "/workspace";
 
-/// Environment variable carrying the read-only GitHub credential for the fetch.
+/// Env var the credential helper reads the token from; the agent sets it on the
+/// git child from the freshly minted token (it is never baked or inherited).
 const TOKEN_ENV: &str = "DEVBOX_GITHUB_TOKEN";
 
 /// Environment variable that, when truthy, makes an empty `/workspace` a hard
@@ -62,7 +64,7 @@ pub(crate) enum ReadyDecision {
 /// budget; a repo that errors or times out is left at its snapshot-age state and
 /// logged. The only outcome that withholds readiness is a required-but-empty
 /// workspace.
-pub(crate) async fn freshen_workspace() -> ReadyDecision {
+pub(crate) async fn freshen_workspace(region: &str) -> ReadyDecision {
     let repos = repos_under(Path::new(WORKSPACE));
     let decision = classify(&repos, require_workspace());
     if repos.is_empty() {
@@ -81,12 +83,7 @@ pub(crate) async fn freshen_workspace() -> ReadyDecision {
         return decision;
     }
 
-    let token = github_token();
-    if token.is_none() {
-        tracing::warn!(
-            "{TOKEN_ENV} unset; fetching without credentials (private repos will fail to freshen)"
-        );
-    }
+    let token = mint_token(region).await;
     let start = Instant::now();
     let budget = fetch_budget();
     for repo in &repos {
@@ -270,11 +267,26 @@ fn remove_lock_files(dir: &Path, recurse: bool) {
     }
 }
 
-/// The read-only GitHub token, if present and non-empty.
-fn github_token() -> Option<String> {
-    std::env::var(TOKEN_ENV)
-        .ok()
-        .filter(|token| !token.trim().is_empty())
+/// Mint the read-only GitHub token for the fetch, degrading to unauthenticated
+/// (`None`) when the box isn't configured for it or minting fails — a private repo
+/// then fails to freshen and serves its snapshot-age checkout.
+async fn mint_token(region: &str) -> Option<String> {
+    match crate::github_token::installation_token(region).await {
+        Ok(Some(token)) => Some(token),
+        Ok(None) => {
+            tracing::warn!(
+                "GitHub App not configured; fetching without credentials (private repos won't freshen)"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "failed to mint GitHub token; fetching without credentials"
+            );
+            None
+        }
+    }
 }
 
 /// Whether an empty `/workspace` should fail warm-up (snapshot deployments).
