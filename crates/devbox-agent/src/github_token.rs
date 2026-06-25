@@ -88,10 +88,15 @@ struct Config {
 /// Mints read-only installation tokens, discovering the installation per repo so a
 /// single App serves every org that installed it. Built once per warm-up; caches a
 /// token per owner.
+///
+/// Minting is gated on the remote's host matching `git_host` (the App's GitHub
+/// host), so a non-GitHub `origin` never drives a lookup and a GitHub token is never
+/// handed to another host's fetch.
 pub(crate) struct TokenMinter {
     client: reqwest::Client,
     api_base: String,
     issuer: String,
+    git_host: String,
     key: EncodingKey,
     cache: HashMap<String, String>,
 }
@@ -119,30 +124,42 @@ impl TokenMinter {
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .context("build HTTP client")?;
+        let git_host = git_host_from_api_base(&cfg.api_base);
         Ok(Some(Self {
             client,
             api_base: cfg.api_base,
             issuer: cfg.issuer,
+            git_host,
             key,
             cache: HashMap::new(),
         }))
     }
 
-    /// A read-only installation token for `owner/repo`, cached per owner.
+    /// A read-only installation token for `remote`'s owner, cached per owner, or
+    /// `Ok(None)` when `remote` is not a repo on the App's GitHub host (the caller
+    /// then fetches unauthenticated).
     ///
     /// # Errors
     ///
-    /// Returns an error if the App is not installed on `owner` (or the repo is not
+    /// Returns an error if the App is not installed on the owner (or the repo is not
     /// granted to it) or a GitHub API call fails.
-    pub(crate) async fn token_for(&mut self, owner: &str, repo: &str) -> Result<String> {
-        if let Some(token) = self.cache.get(owner) {
-            return Ok(token.clone());
+    pub(crate) async fn token_for(&mut self, remote: &str) -> Result<Option<String>> {
+        let Some(parsed) = parse_remote(remote) else {
+            return Ok(None);
+        };
+        if parsed.host != self.git_host {
+            return Ok(None);
+        }
+        if let Some(token) = self.cache.get(&parsed.owner) {
+            return Ok(Some(token.clone()));
         }
         let jwt = sign_jwt(&self.issuer, &self.key)?;
-        let installation_id = self.resolve_installation(&jwt, owner, repo).await?;
+        let installation_id = self
+            .resolve_installation(&jwt, &parsed.owner, &parsed.repo)
+            .await?;
         let token = self.exchange(&jwt, installation_id).await?;
-        self.cache.insert(owner.to_string(), token.clone());
-        Ok(token)
+        self.cache.insert(parsed.owner, token.clone());
+        Ok(Some(token))
     }
 
     /// Resolve the installation id covering `owner/repo` via the App JWT.
@@ -262,20 +279,43 @@ fn sign_jwt(issuer: &str, key: &EncodingKey) -> Result<String> {
     encode(&Header::new(Algorithm::RS256), &claims, key).context("sign GitHub App JWT")
 }
 
-/// Parse `owner` and `repo` from a git remote URL.
+/// A git remote decomposed into the pieces needed to mint a token: the `host` (so
+/// minting can be gated on the App's GitHub host) and the `owner`/`repo`.
+struct RemoteRef {
+    host: String,
+    owner: String,
+    repo: String,
+}
+
+/// Parse `host`, `owner`, and `repo` from a git remote URL.
 ///
 /// Parses the standard `scheme://[user@]host[:port]/owner/repo[.git]` forms with a
 /// real URL parser, after normalizing git's scp-like `user@host:owner/repo[.git]`
 /// shorthand (which is not a valid URL) into an `ssh://` URL. Returns `None` for a
-/// remote with no `owner/repo` path (e.g. a local path), so the caller fetches
-/// unauthenticated.
-pub(crate) fn owner_repo_from_remote(remote: &str) -> Option<(String, String)> {
+/// remote with no host or no `owner/repo` path (e.g. a local path).
+fn parse_remote(remote: &str) -> Option<RemoteRef> {
     let url = parse_git_url(remote.trim())?;
+    let host = url.host_str()?.to_string();
     let mut segments = url.path_segments()?.filter(|segment| !segment.is_empty());
-    let owner = segments.next()?;
+    let owner = segments.next()?.to_string();
     let repo = segments.next()?;
-    let repo = repo.strip_suffix(".git").unwrap_or(repo);
-    Some((owner.to_string(), repo.to_string()))
+    let repo = repo.strip_suffix(".git").unwrap_or(repo).to_string();
+    Some(RemoteRef { host, owner, repo })
+}
+
+/// The git host whose remotes this App serves, derived from the API base: public
+/// GitHub's API lives at `api.github.com` but its remotes at `github.com`, while a
+/// GHES install shares one host for both (`https://HOST/api/v3` ↔ `HOST`).
+fn git_host_from_api_base(api_base: &str) -> String {
+    match Url::parse(api_base)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .as_deref()
+    {
+        Some("api.github.com") => "github.com".to_string(),
+        Some(host) => host.to_string(),
+        None => "github.com".to_string(),
+    }
 }
 
 /// Parse a git remote into a [`Url`], first normalizing git's scp-like shorthand
@@ -295,76 +335,121 @@ fn parse_git_url(remote: &str) -> Option<Url> {
 
 #[cfg(test)]
 mod tests {
-    use super::owner_repo_from_remote;
+    use super::{git_host_from_api_base, parse_remote};
+
+    /// `(host, owner, repo)` for a remote, or `None`.
+    fn parsed(remote: &str) -> Option<(String, String, String)> {
+        parse_remote(remote).map(|r| (r.host, r.owner, r.repo))
+    }
+
+    fn github(owner: &str, repo: &str) -> Option<(String, String, String)> {
+        Some((
+            "github.com".to_string(),
+            owner.to_string(),
+            repo.to_string(),
+        ))
+    }
 
     #[test]
     fn parses_https_with_git_suffix() {
         assert_eq!(
-            owner_repo_from_remote("https://github.com/smoketurner/devbox.git"),
-            Some(("smoketurner".to_string(), "devbox".to_string()))
+            parsed("https://github.com/smoketurner/devbox.git"),
+            github("smoketurner", "devbox")
         );
     }
 
     #[test]
     fn parses_https_without_git_suffix() {
         assert_eq!(
-            owner_repo_from_remote("https://github.com/smoketurner/devbox"),
-            Some(("smoketurner".to_string(), "devbox".to_string()))
+            parsed("https://github.com/smoketurner/devbox"),
+            github("smoketurner", "devbox")
         );
     }
 
     #[test]
     fn parses_https_with_trailing_slash() {
         assert_eq!(
-            owner_repo_from_remote("https://github.com/smoketurner/devbox/"),
-            Some(("smoketurner".to_string(), "devbox".to_string()))
+            parsed("https://github.com/smoketurner/devbox/"),
+            github("smoketurner", "devbox")
         );
     }
 
     #[test]
     fn parses_scp_like_form() {
         assert_eq!(
-            owner_repo_from_remote("git@github.com:smoketurner/devbox.git"),
-            Some(("smoketurner".to_string(), "devbox".to_string()))
+            parsed("git@github.com:smoketurner/devbox.git"),
+            github("smoketurner", "devbox")
         );
     }
 
     #[test]
     fn parses_ssh_scheme_with_user() {
         assert_eq!(
-            owner_repo_from_remote("ssh://git@github.com/smoketurner/devbox.git"),
-            Some(("smoketurner".to_string(), "devbox".to_string()))
+            parsed("ssh://git@github.com/smoketurner/devbox.git"),
+            github("smoketurner", "devbox")
         );
     }
 
     #[test]
     fn parses_ssh_scheme_with_port() {
         assert_eq!(
-            owner_repo_from_remote("ssh://git@github.com:22/smoketurner/devbox.git"),
-            Some(("smoketurner".to_string(), "devbox".to_string()))
+            parsed("ssh://git@github.com:22/smoketurner/devbox.git"),
+            github("smoketurner", "devbox")
         );
     }
 
     #[test]
     fn query_string_does_not_leak_into_repo() {
         assert_eq!(
-            owner_repo_from_remote("https://github.com/smoketurner/devbox.git?ref=main"),
-            Some(("smoketurner".to_string(), "devbox".to_string()))
+            parsed("https://github.com/smoketurner/devbox.git?ref=main"),
+            github("smoketurner", "devbox")
+        );
+    }
+
+    #[test]
+    fn captures_non_github_host_so_minting_can_be_gated() {
+        // A non-GitHub remote parses, but its host won't match the App's git host,
+        // so `token_for` returns it unauthenticated rather than minting.
+        assert_eq!(
+            parsed("https://gitlab.com/smoketurner/devbox.git"),
+            Some((
+                "gitlab.com".to_string(),
+                "smoketurner".to_string(),
+                "devbox".to_string()
+            ))
         );
     }
 
     #[test]
     fn rejects_url_without_owner_repo() {
-        assert_eq!(owner_repo_from_remote("https://github.com/"), None);
-        assert_eq!(
-            owner_repo_from_remote("https://github.com/owner-only"),
-            None
-        );
+        assert_eq!(parsed("https://github.com/"), None);
+        assert_eq!(parsed("https://github.com/owner-only"), None);
     }
 
     #[test]
     fn rejects_non_url_path() {
-        assert_eq!(owner_repo_from_remote("smoketurner/devbox"), None);
-        assert_eq!(owner_repo_from_remote(""), None);
+        assert_eq!(parsed("smoketurner/devbox"), None);
+        assert_eq!(parsed(""), None);
+    }
+
+    #[test]
+    fn git_host_maps_public_api_to_github_com() {
+        assert_eq!(
+            git_host_from_api_base("https://api.github.com"),
+            "github.com"
+        );
+    }
+
+    #[test]
+    fn git_host_uses_ghes_host_directly() {
+        assert_eq!(
+            git_host_from_api_base("https://ghe.example.com/api/v3"),
+            "ghe.example.com"
+        );
+    }
+
+    #[test]
+    fn git_host_falls_back_to_github_com() {
+        assert_eq!(git_host_from_api_base("not-a-url"), "github.com");
     }
 }

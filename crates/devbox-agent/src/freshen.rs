@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use tokio::process::Command;
 
-use crate::github_token::{TokenMinter, owner_repo_from_remote};
+use crate::github_token::TokenMinter;
 
 /// Where the snapshot-seeded repositories live.
 const WORKSPACE: &str = "/workspace";
@@ -259,24 +259,23 @@ async fn build_minter(region: &str) -> Option<TokenMinter> {
 }
 
 /// A read-only token for `repo`'s `origin` owner, or `None` to fetch unauthenticated
-/// (no minter, no/unsupported remote, or the App isn't installed on the owner).
+/// (no minter, no/non-GitHub remote, or the App isn't installed on the owner).
 async fn repo_token(minter: Option<&mut TokenMinter>, repo: &Path) -> Option<String> {
     let minter = minter?;
     let url = repo_origin_url(repo).await?;
-    let Some((owner, name)) = owner_repo_from_remote(&url) else {
-        tracing::debug!(
-            repo = %repo.display(),
-            remote = %url,
-            "origin is not a github owner/repo; fetching unauthenticated"
-        );
-        return None;
-    };
-    match minter.token_for(&owner, &name).await {
-        Ok(token) => Some(token),
+    match minter.token_for(&url).await {
+        Ok(Some(token)) => Some(token),
+        Ok(None) => {
+            tracing::debug!(
+                repo = %repo.display(),
+                remote = %url,
+                "origin is not a repo on the App's GitHub host; fetching unauthenticated"
+            );
+            None
+        }
         Err(e) => {
             tracing::warn!(
                 repo = %repo.display(),
-                owner = %owner,
                 error = %format!("{e:#}"),
                 "could not mint GitHub token; fetching unauthenticated"
             );
@@ -285,12 +284,18 @@ async fn repo_token(minter: Option<&mut TokenMinter>, repo: &Path) -> Option<Str
     }
 }
 
-/// The `origin` remote URL for `repo`, or `None` if it has no `origin`.
+/// The `origin` remote URL for `repo`, or `None` if it has no `origin`. Run under
+/// GNU `timeout` like the other git ops here, so a wedged `git` can't stall warm-up.
 async fn repo_origin_url(repo: &Path) -> Option<String> {
-    let output = Command::new("git")
+    let output = Command::new("timeout")
+        .arg("-k")
+        .arg("5")
+        .arg(LOCAL_GIT_TIMEOUT.as_secs().max(1).to_string())
+        .arg("git")
         .arg("-C")
         .arg(repo)
         .args(["remote", "get-url", "origin"])
+        .kill_on_drop(true)
         .output()
         .await
         .ok()?;
