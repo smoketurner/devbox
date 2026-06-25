@@ -193,6 +193,13 @@ async fn sync_docs_with_asg(
         }
     }
 
+    // Names already in use, so generation never collides within this tick.
+    let mut used_names: HashSet<String> = docs
+        .iter()
+        .map(|d| d.data.name.clone())
+        .filter(|n| !n.is_empty())
+        .collect();
+
     // Build set of instance_ids that already have docs
     let doc_instance_ids: HashSet<String> =
         docs.iter().map(|d| d.data.instance_id.clone()).collect();
@@ -221,11 +228,26 @@ async fn sync_docs_with_asg(
             continue;
         };
 
+        // Give the box a unique friendly name up front. Generation effectively
+        // never fails; if it somehow does, fall back to the instance id (itself
+        // unique and a valid name) so the box is still created and named.
+        let name = crate::naming::generate_unique_name(store, &used_names)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(
+                    error = %e,
+                    instance_id = %inst.instance_id,
+                    "name generation failed; falling back to instance id"
+                );
+                inst.instance_id.clone()
+            });
+
         // Always create Warming: readiness is gated on devbox:ready tag, never
         // on lifecycle state alone. handle_warming_instances will flip to Ready
         // on the next tick once the tag is seen.
         let new_doc = DevboxDoc {
             instance_id: inst.instance_id.clone(),
+            name: name.clone(),
             state: DevboxState::Warming,
             instance_type: InstanceType(info.instance_type.clone()),
             ami_id: AmiId(info.ami_id.clone()),
@@ -239,12 +261,17 @@ async fn sync_docs_with_asg(
         };
 
         let doc_id = uuid::Uuid::now_v7().to_string();
-        if let Err(e) = store.insert_with_id(&doc_id, &new_doc).await {
-            tracing::error!(
-                error = %e,
-                instance_id = %inst.instance_id,
-                "failed to create doc for ASG instance"
-            );
+        match store.insert_with_id(&doc_id, &new_doc).await {
+            Ok(_) => {
+                used_names.insert(name);
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    instance_id = %inst.instance_id,
+                    "failed to create doc for ASG instance"
+                );
+            }
         }
     }
 }
@@ -414,6 +441,8 @@ pub(super) async fn reap_unready_instances(
         // the AWS call and retry next tick without having touched AWS.
         let mut updated_doc = doc.data.clone();
         updated_doc.state = DevboxState::Terminating;
+        // Free the name immediately so it can be reused on a fresh claim.
+        updated_doc.name = String::new();
 
         match store
             .compare_and_update(&doc.id, doc.version, &updated_doc)

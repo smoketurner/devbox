@@ -5,8 +5,8 @@ use devbox_common::{DevboxListResponse, DevboxResponse, format_timestamp_str};
 /// Format a list of devboxes as a column-aligned table.
 pub(crate) fn format_list_table(list: &DevboxListResponse) -> String {
     let header = format!(
-        "{:<20}  {:<12}  {:<12}  {}",
-        "INSTANCE ID", "STATE", "TYPE", "OWNER"
+        "{:<18}  {:<20}  {:<12}  {:<12}  {}",
+        "NAME", "INSTANCE ID", "STATE", "TYPE", "OWNER"
     );
     let separator = "-".repeat(header.len());
     let mut lines = vec![header, separator];
@@ -14,7 +14,8 @@ pub(crate) fn format_list_table(list: &DevboxListResponse) -> String {
     for d in &list.devboxes {
         let owner = d.owner.as_deref().unwrap_or("-");
         lines.push(format!(
-            "{:<20}  {:<12}  {:<12}  {}",
+            "{:<18}  {:<20}  {:<12}  {:<12}  {}",
+            d.name.as_str(),
             d.instance_id.as_str(),
             d.state,
             d.instance_type.as_ref(),
@@ -35,6 +36,7 @@ pub(crate) fn format_status(d: &DevboxResponse) -> String {
         .as_deref()
         .map_or_else(|| "-".to_string(), format_timestamp_str);
     let pairs: &[(&str, &str)] = &[
+        ("Name", &d.name),
         ("Instance ID", d.instance_id.as_str()),
         ("State", &state_str),
         ("Type", instance_type_str),
@@ -54,21 +56,18 @@ pub(crate) fn format_status(d: &DevboxResponse) -> String {
 /// Format a successful claim response with a connection hint.
 pub(crate) fn format_claim_success(d: &DevboxResponse) -> String {
     format!(
-        "Claimed devbox {}\n  Type: {}\n  Region: {}\n  Connect: devbox ssh \
-         (saved as an active claim; --id is needed only when you hold several)",
-        d.instance_id.as_str(),
-        d.instance_type.as_ref(),
-        d.region,
+        "Claimed devbox {name}\n  Instance: {instance}\n  Type: {ty}\n  Region: {region}\n  \
+         Connect: devbox ssh {name}",
+        name = d.name,
+        instance = d.instance_id.as_str(),
+        ty = d.instance_type.as_ref(),
+        region = d.region,
     )
 }
 
 /// Format a successful release confirmation.
 pub(crate) fn format_release_success(d: &DevboxResponse) -> String {
-    format!(
-        "Released devbox {} (now {})",
-        d.instance_id.as_str(),
-        d.state
-    )
+    format!("Released devbox {} (now {})", d.name, d.state)
 }
 
 #[cfg(test)]
@@ -92,6 +91,7 @@ mod tests {
             devboxes: vec![DevboxResponse {
                 id: "abcd1234".to_string(),
                 instance_id: "i-0123456789abcdef0".to_string(),
+                name: "calm-quilt".to_string(),
                 state: DevboxState::Ready,
                 instance_type: InstanceType("m5.large".to_string()),
                 ami_id: AmiId("ami-12345678".to_string()),
@@ -102,7 +102,8 @@ mod tests {
             }],
         };
         let output = format_list_table(&list);
-        // The instance ID is shown; the internal UUID never is.
+        // The name and instance ID are shown; the internal UUID never is.
+        assert!(output.contains("calm-quilt"));
         assert!(output.contains("i-0123456789abcdef0"));
         assert!(!output.contains("abcd1234"));
         assert!(output.contains("ready"));
@@ -115,6 +116,7 @@ mod tests {
         let d = DevboxResponse {
             id: "test-id".to_string(),
             instance_id: "i-abc".to_string(),
+            name: "calm-quilt".to_string(),
             state: DevboxState::Claimed,
             instance_type: InstanceType("m5.large".to_string()),
             ami_id: AmiId("ami-123".to_string()),
@@ -124,7 +126,8 @@ mod tests {
             claimed_at: Some("2024-01-02T00:00:00Z".to_string()),
         };
         let output = format_status(&d);
-        // The instance ID is shown; the internal UUID is not.
+        // The name and instance ID are shown; the internal UUID is not.
+        assert!(output.contains("calm-quilt"));
         assert!(output.contains("i-abc"));
         assert!(!output.contains("test-id"));
         assert!(output.contains("claimed"));
@@ -141,6 +144,7 @@ mod tests {
         let d = DevboxResponse {
             id: "test-id".to_string(),
             instance_id: "i-abc123".to_string(),
+            name: "calm-quilt".to_string(),
             state: DevboxState::Claimed,
             instance_type: InstanceType("m5.large".to_string()),
             ami_id: AmiId("ami-123".to_string()),
@@ -150,11 +154,13 @@ mod tests {
             claimed_at: Some("2024-01-02T00:00:00Z".to_string()),
         };
         let output = format_claim_success(&d);
-        assert!(output.contains("Claimed devbox i-abc123"));
+        assert!(output.contains("Claimed devbox calm-quilt"));
+        assert!(output.contains("i-abc123"));
         assert!(!output.contains("test-id"));
         assert!(output.contains("m5.large"));
         assert!(output.contains("us-east-1"));
-        assert!(output.contains("devbox ssh"));
+        // The connect hint selects the box by name.
+        assert!(output.contains("devbox ssh calm-quilt"));
     }
 
     #[test]
@@ -162,6 +168,7 @@ mod tests {
         let d = DevboxResponse {
             id: "test-id".to_string(),
             instance_id: "i-rel123".to_string(),
+            name: "calm-quilt".to_string(),
             state: DevboxState::Terminating,
             instance_type: InstanceType("m5.large".to_string()),
             ami_id: AmiId("ami-123".to_string()),
@@ -171,7 +178,7 @@ mod tests {
             claimed_at: None,
         };
         let output = format_release_success(&d);
-        assert!(output.contains("Released devbox i-rel123"));
+        assert!(output.contains("Released devbox calm-quilt"));
         assert!(!output.contains("test-id"));
         assert!(output.contains("terminating"));
     }

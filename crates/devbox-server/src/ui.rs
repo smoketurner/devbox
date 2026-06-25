@@ -83,6 +83,7 @@ pub struct DevboxDetail {
     /// Internal UUID, used only for routing (links, release form action). The
     /// instance ID is the user-facing identifier shown in the title and grid.
     pub id: String,
+    pub name: String,
     pub state: String,
     pub instance_type: String,
     pub region: String,
@@ -99,6 +100,7 @@ impl From<Document<DevboxDoc>> for DevboxDetail {
     fn from(doc: Document<DevboxDoc>) -> Self {
         DevboxDetail {
             id: doc.id,
+            name: doc.data.name,
             state: doc.data.state.to_string(),
             instance_type: doc.data.instance_type.to_string(),
             region: doc.data.region,
@@ -137,7 +139,8 @@ pub struct ErrorPageTemplate {
 #[derive(Template)]
 #[template(path = "claim_form.html")]
 pub struct ClaimFormTemplate {
-    pub instance_type: Option<String>,
+    /// The name the user typed, echoed back so an error re-render keeps it.
+    pub name: Option<String>,
     pub error: Option<String>,
 }
 
@@ -157,6 +160,7 @@ impl_template_into_response!(
 /// A devbox entry for the dashboard template.
 pub struct DashboardDevbox {
     pub id: String,
+    pub name: String,
     pub state: String,
     pub instance_type: String,
     pub instance_id: String,
@@ -169,10 +173,10 @@ pub struct DashboardDevbox {
 // ============================================================================
 
 /// Form data for claiming a devbox. The owner is always the signed-in user, so
-/// the form only carries the optional instance type.
+/// the form only carries the optional name override.
 #[derive(serde::Deserialize)]
 struct ClaimFormData {
-    instance_type: Option<String>,
+    name: Option<String>,
 }
 
 // ============================================================================
@@ -388,6 +392,7 @@ async fn dashboard(State(state): State<SharedState>, headers: HeaderMap) -> Resp
                 .into_iter()
                 .map(|doc| DashboardDevbox {
                     id: doc.id.clone(),
+                    name: doc.data.name.clone(),
                     state: doc.data.state.to_string(),
                     instance_type: doc.data.instance_type.to_string(),
                     instance_id: doc.data.instance_id.clone(),
@@ -449,7 +454,7 @@ async fn claim_form(State(state): State<SharedState>, headers: HeaderMap) -> Res
         return redirect;
     }
     ClaimFormTemplate {
-        instance_type: None,
+        name: None,
         error: None,
     }
     .into_response()
@@ -469,66 +474,17 @@ async fn submit_claim(
         Err(redirect) => return redirect,
     };
 
-    let ready_docs = match state.store.find_all::<DevboxDoc>("state", "ready").await {
-        Ok(docs) => docs,
-        Err(e) => {
-            return ClaimFormTemplate {
-                instance_type: form.instance_type,
-                error: Some(format!("Failed to query devboxes: {e}")),
-            }
-            .into_response();
+    // Claim through the shared routine (validation, uniqueness, and the
+    // race-safe re-check all live there). On failure, re-render the form with
+    // the same message the API would return, echoing back the typed name.
+    match crate::routes::claim_a_devbox(&state, &owner, form.name.as_deref()).await {
+        Ok(doc) => Redirect::to(&format!("/devboxes/{}", doc.id)).into_response(),
+        Err(e) => ClaimFormTemplate {
+            name: form.name,
+            error: Some(e.user_message()),
         }
-    };
-
-    if ready_docs.is_empty() {
-        return ClaimFormTemplate {
-            instance_type: form.instance_type,
-            error: Some("No devboxes available.".to_string()),
-        }
-        .into_response();
+        .into_response(),
     }
-
-    let mut candidates = ready_docs;
-    if let Some(ref pref) = form.instance_type
-        && !pref.is_empty()
-    {
-        candidates.sort_by(|a, b| {
-            let a_match = a.data.instance_type.as_ref() == pref.as_str();
-            let b_match = b.data.instance_type.as_ref() == pref.as_str();
-            b_match.cmp(&a_match)
-        });
-    }
-
-    for candidate in candidates {
-        let mut updated = candidate.data.clone();
-        updated.state = DevboxState::Claimed;
-        updated.owner = Some(owner.clone());
-        updated.claimed_at = Some(jiff::Timestamp::now());
-
-        match state
-            .store
-            .compare_and_update(&candidate.id, candidate.version, &updated)
-            .await
-        {
-            Ok(true) => {
-                return Redirect::to(&format!("/devboxes/{}", candidate.id)).into_response();
-            }
-            Ok(false) => continue,
-            Err(e) => {
-                return ClaimFormTemplate {
-                    instance_type: form.instance_type,
-                    error: Some(format!("Claim failed: {e}")),
-                }
-                .into_response();
-            }
-        }
-    }
-
-    ClaimFormTemplate {
-        instance_type: form.instance_type,
-        error: Some("No devboxes available (all claimed concurrently).".to_string()),
-    }
-    .into_response()
 }
 
 /// Process the release form submission from the detail page.
@@ -584,6 +540,8 @@ async fn submit_release(
     let mut updated = doc.data.clone();
     updated.state = DevboxState::Terminating;
     updated.owner = None;
+    // Free the name immediately so it can be reused on a fresh claim.
+    updated.name = String::new();
 
     match state.store.update(&id, &updated).await {
         Ok(()) => Redirect::to(&format!("/devboxes/{id}")).into_response(),

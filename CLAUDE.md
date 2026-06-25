@@ -107,7 +107,15 @@ against ASG membership each tick. The host's `devbox-agent warmup` sets the
 instance tag `devbox:ready=true` once the host is ready; the reconciler then
 marks the `DevboxDoc` `Ready`. Boxes that never tag ready within `ready_timeout`
 (default 300 s, env `POOL_READY_TIMEOUT_SECS`) are terminated by the reconciler
-and the ASG relaunches a replacement.
+and the ASG relaunches a replacement. Every box the reconciler creates is given
+a unique, memorable `adjective-noun` **name** (e.g. `calm-quilt`) — generated in
+`crates/devbox-server/src/naming.rs` from `aws_lc_rs::rand`. The name is shown in
+the dashboard/CLI and is a global selector: `devbox ssh|release|status <name>`
+resolves a box by name (or id). A claimant may override it via the claim body's
+optional `name` (validated by `is_valid_devbox_name`); uniqueness across
+non-terminated boxes is enforced atomically by
+`DocumentStore::compare_and_update_unique`. There is no backfill — docs written
+before the field existed keep an empty name and age out as the pool churns.
 
 > There are no active `.kiro/specs/` left — this file plus the Terraform in
 > `devbox-infra` (the `image-builder`, `pool`, and `control-plane` modules) are the
@@ -175,7 +183,7 @@ cargo run --bin devbox-server          # serves http://localhost:3000
 | `GET /health` | Server + database health |
 | `GET /api/v1/devboxes` | List all devboxes |
 | `GET /api/v1/devboxes/{id}` | Get one devbox |
-| `POST /api/v1/devboxes/claim` | Claim a Ready devbox (body: optional `instance_type`; `owner` from token) |
+| `POST /api/v1/devboxes/claim` | Claim a Ready devbox (body: optional `name` override; `owner` from token) |
 | `POST /api/v1/devboxes/{id}/release` | Release a Claimed devbox (no body; `owner` from token) |
 | `GET /api/v1/pool/metrics` | Pool counts vs target |
 | `GET /` | HTML dashboard |

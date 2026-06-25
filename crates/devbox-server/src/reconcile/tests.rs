@@ -122,6 +122,42 @@ mod reconcile_tests {
         );
     }
 
+    /// Test: every doc the reconciler creates gets a unique, friendly name.
+    #[tokio::test]
+    async fn test_created_docs_get_unique_names() {
+        let store = setup_store().await;
+        let compute = MockCompute::new();
+        let config = test_config();
+
+        compute.seed_asg(3, 5, 3);
+        let i1 = compute.add_instance("InService");
+        compute.add_instance("InService");
+        compute.add_instance("InService");
+
+        reconciliation_tick(&store, &compute, &config)
+            .await
+            .unwrap();
+
+        let all = store.list_all::<DevboxDoc>().await.unwrap();
+        assert_eq!(all.len(), 3, "expected one doc per instance");
+        let names: std::collections::HashSet<&str> =
+            all.iter().map(|d| d.data.name.as_str()).collect();
+        assert_eq!(names.len(), 3, "names must be unique across boxes");
+        for d in &all {
+            assert!(!d.data.name.is_empty(), "every new box must be named");
+            assert_ne!(
+                d.data.name, d.data.instance_id,
+                "a new box gets a generated friendly name, not its instance id"
+            );
+        }
+        // Sanity: the generated names are friendly adjective-noun handles.
+        let first = all
+            .iter()
+            .find(|d| d.data.instance_id == i1)
+            .expect("doc for first instance");
+        assert!(first.data.name.contains('-'), "got: {}", first.data.name);
+    }
+
     /// Test: after setting the ready tag, the next tick flips the doc to Ready.
     #[tokio::test]
     async fn test_warming_instance_with_ready_tag_becomes_ready() {
@@ -268,6 +304,7 @@ mod reconcile_tests {
 
         let ready_doc = DevboxDoc {
             instance_id: ready_id.clone(),
+            name: "ready-box".to_string(),
             state: DevboxState::Ready,
             instance_type: InstanceType("m7g.large".to_string()),
             ami_id: AmiId("ami-mock".to_string()),
@@ -281,6 +318,7 @@ mod reconcile_tests {
         };
         let claimed_doc = DevboxDoc {
             instance_id: claimed_id.clone(),
+            name: "claimed-box".to_string(),
             state: DevboxState::Claimed,
             instance_type: InstanceType("m7g.large".to_string()),
             ami_id: AmiId("ami-mock".to_string()),
@@ -332,6 +370,7 @@ mod reconcile_tests {
         // A claimed box awaiting its owner tag (describe-independent step 9).
         let claimed_doc = DevboxDoc {
             instance_id: claimed_id.clone(),
+            name: "claimed-box".to_string(),
             state: DevboxState::Claimed,
             instance_type: InstanceType("m7g.large".to_string()),
             ami_id: AmiId("ami-mock".to_string()),
@@ -347,6 +386,7 @@ mod reconcile_tests {
         let past = Timestamp::from_second(0).unwrap();
         let warming_doc = DevboxDoc {
             instance_id: warming_id.clone(),
+            name: "warming-box".to_string(),
             state: DevboxState::Warming,
             instance_type: InstanceType("m7g.large".to_string()),
             ami_id: AmiId("ami-mock".to_string()),
@@ -411,6 +451,7 @@ mod reconcile_tests {
         let past = Timestamp::from_second(0).unwrap();
         let warming_doc = DevboxDoc {
             instance_id: instance_id.clone(),
+            name: "warming-box".to_string(),
             state: DevboxState::Warming,
             instance_type: InstanceType("m7g.large".to_string()),
             ami_id: AmiId("ami-mock".to_string()),

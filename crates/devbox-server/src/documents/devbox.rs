@@ -12,6 +12,12 @@ pub struct DevboxDoc {
     /// EC2 instance ID. The reconciler is adopt-only — a doc is created only from
     /// an instance that already exists in the ASG — so this is always present.
     pub instance_id: String,
+    /// Friendly `adjective-noun` handle (e.g. `calm-quilt`), unique across
+    /// non-terminated boxes and usable as a selector. The reconciler assigns it
+    /// when it creates the box; a claimant may override it (`claim --name`).
+    /// Empty for documents written before this field existed (not backfilled).
+    #[serde(default)]
+    pub name: String,
     /// Current state in the lifecycle.
     pub state: DevboxState,
     /// EC2 instance type (e.g., "m5.large").
@@ -56,6 +62,13 @@ impl DocumentType for DevboxDoc {
             });
         }
 
+        if !self.name.is_empty() {
+            entries.push(IndexEntry {
+                field: "name",
+                value: self.name.clone(),
+            });
+        }
+
         entries.push(IndexEntry {
             field: "instance_id",
             value: self.instance_id.clone(),
@@ -68,7 +81,6 @@ impl DocumentType for DevboxDoc {
 #[cfg(test)]
 #[expect(
     clippy::unwrap_used,
-    clippy::get_unwrap,
     reason = "test code: panic on assertion failure is acceptable"
 )]
 mod tests {
@@ -77,6 +89,7 @@ mod tests {
     fn sample_devbox() -> DevboxDoc {
         DevboxDoc {
             instance_id: "i-1234567890abcdef0".to_string(),
+            name: "calm-quilt".to_string(),
             state: DevboxState::Ready,
             instance_type: InstanceType("m5.large".to_string()),
             ami_id: AmiId("ami-12345678".to_string()),
@@ -103,10 +116,15 @@ mod tests {
     fn test_devbox_doc_index_entries_no_owner() {
         let doc = sample_devbox();
         let entries = doc.index_entries();
-        assert_eq!(entries.len(), 2); // state + instance_id
+        assert_eq!(entries.len(), 3); // state + name + instance_id
         assert_eq!(entries.first().unwrap().field, "state");
         assert_eq!(entries.first().unwrap().value, "ready");
-        assert_eq!(entries.get(1).unwrap().field, "instance_id");
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.field == "name" && e.value == "calm-quilt")
+        );
+        assert!(entries.iter().any(|e| e.field == "instance_id"));
     }
 
     #[test]
@@ -114,7 +132,16 @@ mod tests {
         let mut doc = sample_devbox();
         doc.owner = Some("user@example.com".to_string());
         let entries = doc.index_entries();
-        assert_eq!(entries.len(), 3); // state + owner + instance_id
+        assert_eq!(entries.len(), 4); // state + owner + name + instance_id
+    }
+
+    #[test]
+    fn test_devbox_doc_index_entries_empty_name() {
+        let mut doc = sample_devbox();
+        doc.name = String::new();
+        let entries = doc.index_entries();
+        assert_eq!(entries.len(), 2); // state + instance_id (no name)
+        assert!(!entries.iter().any(|e| e.field == "name"));
     }
 
     #[test]

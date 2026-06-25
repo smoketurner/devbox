@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result};
 use jiff::Timestamp;
-use sea_query::{Expr, ExprTrait, Iden, Order, Query};
+use sea_query::{Alias, Expr, ExprTrait, Iden, Order, Query};
 
 use super::document_type::{Document, DocumentType, IndexEntry};
 use super::pool::Pool;
@@ -108,6 +108,17 @@ struct RawDocumentRow {
 #[derive(sqlx::FromRow)]
 struct IdRow {
     id: String,
+}
+
+/// Outcome of [`DocumentStore::compare_and_update_unique`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum UpdateOutcome {
+    /// The document was updated.
+    Updated,
+    /// The version guard failed — the document changed concurrently.
+    VersionMismatch,
+    /// Another document already holds the requested unique index value.
+    DuplicateValue,
 }
 
 // ============================================================================
@@ -410,6 +421,98 @@ impl DocumentStore {
         })
     }
 
+    /// Conditionally update a document, rejecting the write when another
+    /// document already holds the index entry `(unique_field, unique_value)`.
+    ///
+    /// The uniqueness read and the version-guarded update run in one
+    /// transaction. Under serializable isolation (Aurora DSQL) two concurrent
+    /// writers of the same value conflict; [`with_dsql_retry!`](crate::with_dsql_retry)
+    /// re-runs the loser, which then observes the value and returns
+    /// [`UpdateOutcome::DuplicateValue`]. On single-writer SQLite the
+    /// transaction serializes to the same effect. Callers needing no uniqueness
+    /// use [`compare_and_update`](Self::compare_and_update).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization or a database operation fails.
+    pub async fn compare_and_update_unique<T: DocumentType>(
+        &self,
+        id: &str,
+        expected_version: i32,
+        doc: &T,
+        unique_field: &str,
+        unique_value: &str,
+    ) -> Result<UpdateOutcome> {
+        crate::with_dsql_retry!(async {
+            let json = serde_json::to_string(doc).context("failed to serialize document")?;
+            let now_str = Timestamp::now().to_string();
+            let expires = doc.expires_at();
+            let indexes = doc.index_entries();
+
+            let expires_str = expires.map(|ts| ts.to_string());
+            let expires_ref: Option<&str> = expires_str.as_deref();
+
+            let mut tx = self.pool.begin().await?;
+
+            // Reject if any *other* document already holds the unique value.
+            // Reading it inside the transaction is what lets serializable
+            // isolation detect a concurrent writer of the same value.
+            let clash_stmt = Query::select()
+                .expr_as(Expr::col(DocumentIndexes::DocumentId), Alias::new("id"))
+                .from(DocumentIndexes::Table)
+                .and_where(Expr::col(DocumentIndexes::IndexField).eq(unique_field))
+                .and_where(Expr::col(DocumentIndexes::IndexValue).eq(unique_value))
+                .and_where(Expr::col(DocumentIndexes::DocumentId).ne(id))
+                .limit(1)
+                .to_owned();
+            let clash: Option<IdRow> = crate::tx_fetch_optional!(tx, clash_stmt, IdRow)?;
+            if clash.is_some() {
+                return Ok(UpdateOutcome::DuplicateValue);
+            }
+
+            // UPDATE with version guard (optimistic concurrency)
+            let update_stmt = {
+                let mut q = Query::update();
+                q.table(Documents::Table)
+                    .value(Documents::Data, Expr::val(json.as_str()))
+                    .value(Documents::ExpiresAt, Expr::val(expires_ref))
+                    .value(
+                        Documents::SchemaVersion,
+                        Expr::val(T::CURRENT_VERSION.cast_signed()),
+                    )
+                    .value(Documents::UpdatedAt, Expr::val(now_str.as_str()))
+                    .value(
+                        Documents::Version,
+                        Expr::val(expected_version.saturating_add(1)),
+                    )
+                    .and_where(Expr::col(Documents::Id).eq(id))
+                    .and_where(Expr::col(Documents::Version).eq(expected_version));
+                q.to_owned()
+            };
+
+            let result = crate::tx_execute!(tx, update_stmt)?;
+            if result.rows_affected() == 0 {
+                return Ok(UpdateOutcome::VersionMismatch);
+            }
+
+            // DELETE old indexes
+            let delete_idx_stmt = Query::delete()
+                .from_table(DocumentIndexes::Table)
+                .and_where(Expr::col(DocumentIndexes::DocumentId).eq(id))
+                .to_owned();
+            crate::tx_execute!(tx, delete_idx_stmt)?;
+
+            // INSERT new indexes
+            for entry in &indexes {
+                let idx_stmt = build_index_insert(id, entry)?;
+                crate::tx_execute!(tx, idx_stmt)?;
+            }
+
+            tx.commit().await?;
+            Ok(UpdateOutcome::Updated)
+        })
+    }
+
     // ========================================================================
     // Delete
     // ========================================================================
@@ -649,6 +752,7 @@ mod tests {
     fn sample_devbox() -> DevboxDoc {
         DevboxDoc {
             instance_id: "i-1234567890abcdef0".to_string(),
+            name: "calm-quilt".to_string(),
             state: DevboxState::Ready,
             instance_type: InstanceType("m5.large".to_string()),
             ami_id: AmiId("ami-12345678".to_string()),

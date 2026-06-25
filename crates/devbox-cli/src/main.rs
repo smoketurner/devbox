@@ -15,7 +15,9 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use dialoguer::Select;
 
-use devbox_common::{ClaimRequest, DevboxListResponse, DevboxResponse, DevboxState, InstanceType};
+use devbox_common::{
+    ClaimRequest, DevboxListResponse, DevboxResponse, DevboxState, is_valid_devbox_name,
+};
 
 /// Default server used before the first `devbox login` (and when no
 /// `--server`/`$DEVBOX_SERVER` is given and none has been remembered).
@@ -65,19 +67,25 @@ fn is_interactive() -> bool {
 
 /// Resolve the target devbox id for `ssh`/`status`/`release`.
 ///
-/// An explicit `--id` always wins. Otherwise we consult the local registry of
-/// active claims for this server. When it is empty — e.g. the box was claimed
-/// from another machine or directly via the API — we fall back to the server,
-/// scoped to the authenticated owner, and remember the box we resolve to so the
-/// next call is a local read again.
-async fn resolve_id(
-    explicit: Option<String>,
+/// An explicit `target` (a name or an id) is resolved against the server: a
+/// known local claim id short-circuits without a round-trip, otherwise the
+/// server listing is matched on `name == target || id == target`. With no
+/// `target` we consult the local registry of active claims for this server;
+/// when it is empty — e.g. the box was claimed from another machine or directly
+/// via the API — we fall back to the server, scoped to the authenticated owner,
+/// and remember the box we resolve to so the next call is a local read again.
+async fn resolve_target(
+    target: Option<String>,
     server: &str,
     http: &reqwest::Client,
     session: &session::Session,
 ) -> Result<String> {
-    if let Some(id) = explicit {
-        return Ok(id);
+    if let Some(target) = target {
+        // Fast path: a known local claim id needs no network round-trip.
+        if state::active_claims(server)?.iter().any(|c| c.id == target) {
+            return Ok(target);
+        }
+        return resolve_by_name_or_id(http, server, session, &target).await;
     }
 
     let local = state::active_claims(server)?;
@@ -93,11 +101,51 @@ async fn resolve_id(
     Ok(chosen.id)
 }
 
+/// Resolve `target` to a devbox id by matching it against the server listing on
+/// either the friendly name or the id. Names are globally unique among
+/// non-terminated boxes, so at most one box matches.
+async fn resolve_by_name_or_id(
+    http: &reqwest::Client,
+    server: &str,
+    session: &session::Session,
+    target: &str,
+) -> Result<String> {
+    let url = format!("{server}/api/v1/devboxes");
+    let resp = with_auth(http.get(&url), &session.token)
+        .send()
+        .await
+        .context("failed to query devboxes while resolving the target")?;
+    if !resp.status().is_success() {
+        bail!(
+            "could not look up devbox '{target}' on {server} (HTTP {})",
+            resp.status()
+        );
+    }
+    let list: DevboxListResponse = resp
+        .json()
+        .await
+        .context("failed to parse devbox list while resolving the target")?;
+
+    let found = list
+        .devboxes
+        .into_iter()
+        .find(|d| d.name == target || d.id == target)
+        .with_context(|| format!("no devbox named '{target}' on {server}"))?;
+
+    // Cache it locally if it is the owner's claim, so later calls are local reads.
+    if claimed_by(&found, &session.owner) {
+        remember_claim(&found, server);
+    }
+    Ok(found.id)
+}
+
 /// Choose one claim: zero is an error, one is used directly, and several open an
 /// interactive picker (or, on a non-TTY, an error listing the candidate ids).
 fn select_claim(claims: Vec<state::Claim>, server: &str) -> Result<state::Claim> {
     match claims.len() {
-        0 => bail!("no active devbox for {server}; run `devbox claim` first or pass --id"),
+        0 => {
+            bail!("no active devbox for {server}; run `devbox claim` first or pass a name or id")
+        }
         1 => claims
             .into_iter()
             .next()
@@ -124,7 +172,7 @@ fn select_claim(claims: Vec<state::Claim>, server: &str) -> Result<state::Claim>
         _ => {
             let ids: Vec<&str> = claims.iter().map(|c| c.id.as_str()).collect();
             bail!(
-                "multiple active devboxes ({}); pass --id to choose",
+                "multiple active devboxes ({}); pass a name or id to choose",
                 ids.join(", ")
             )
         }
@@ -263,29 +311,27 @@ enum Commands {
     Logout,
     /// Claim an available devbox.
     Claim {
-        /// Preferred instance type.
+        /// Optional name for the box (lowercase letters, digits, '_' and '-').
+        /// Leave unset to keep the auto-generated name.
         #[arg(long)]
-        instance_type: Option<String>,
+        name: Option<String>,
     },
     /// Release a claimed devbox.
     Release {
-        /// Devbox ID to release (defaults to your active claim).
-        #[arg(long)]
-        id: Option<String>,
+        /// Devbox name or id to release (defaults to your active claim).
+        target: Option<String>,
     },
     /// List all devboxes.
     List,
     /// Get status of a specific devbox.
     Status {
-        /// Devbox ID to check (defaults to your active claim).
-        #[arg(long)]
-        id: Option<String>,
+        /// Devbox name or id to check (defaults to your active claim).
+        target: Option<String>,
     },
     /// SSH into a claimed devbox over an SSM tunnel.
     Ssh {
-        /// Devbox ID to connect to (defaults to your active claim).
-        #[arg(long)]
-        id: Option<String>,
+        /// Devbox name or id to connect to (defaults to your active claim).
+        target: Option<String>,
         /// AWS profile for the SSM tunnel (auto-selected by the control-plane
         /// account when omitted).
         #[arg(long)]
@@ -333,12 +379,21 @@ async fn main() -> Result<()> {
             println!("logged out of {server}");
         }
 
-        Commands::Claim { instance_type } => {
+        Commands::Claim { name } => {
             let session = require_session(&server)?;
+            // Normalize blank → None and reject an obviously invalid name before
+            // the round-trip; the server validates authoritatively too.
+            let name = name.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            if let Some(ref n) = name
+                && !is_valid_devbox_name(n)
+            {
+                bail!(
+                    "invalid name '{n}': use 1-32 lowercase letters, digits, \
+                     '_' or '-', not starting with '-'"
+                );
+            }
             let url = format!("{server}/api/v1/devboxes/claim");
-            let req = ClaimRequest {
-                instance_type: instance_type.map(InstanceType),
-            };
+            let req = ClaimRequest { name };
             let resp = with_auth(http.post(&url).json(&req), &session.token)
                 .send()
                 .await
@@ -357,9 +412,9 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Release { id } => {
+        Commands::Release { target } => {
             let session = require_session(&server)?;
-            let id = resolve_id(id, &server, &http, &session).await?;
+            let id = resolve_target(target, &server, &http, &session).await?;
             let url = format!("{server}/api/v1/devboxes/{id}/release");
             let resp = with_auth(http.post(&url), &session.token)
                 .send()
@@ -404,9 +459,9 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Status { id } => {
+        Commands::Status { target } => {
             let session = require_session(&server)?;
-            let id = resolve_id(id, &server, &http, &session).await?;
+            let id = resolve_target(target, &server, &http, &session).await?;
             let url = format!("{server}/api/v1/devboxes/{id}");
             let resp = with_auth(http.get(&url), &session.token)
                 .send()
@@ -426,13 +481,13 @@ async fn main() -> Result<()> {
         }
 
         Commands::Ssh {
-            id,
+            target,
             profile,
             print,
             args,
         } => {
             let session = require_session(&server)?;
-            let id = resolve_id(id, &server, &http, &session).await?;
+            let id = resolve_target(target, &server, &http, &session).await?;
             let url = format!("{server}/api/v1/devboxes/{id}");
             let resp = with_auth(http.get(&url), &session.token)
                 .send()
@@ -482,7 +537,7 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
-    use devbox_common::AmiId;
+    use devbox_common::{AmiId, InstanceType};
 
     #[test]
     fn test_cli_parses() {
@@ -490,10 +545,58 @@ mod tests {
         Cli::command().debug_assert();
     }
 
+    #[test]
+    fn claim_parses_name_flag() {
+        let cli = Cli::try_parse_from(["devbox", "claim", "--name", "my-proj"]).unwrap();
+        assert!(matches!(
+            &cli.command,
+            Commands::Claim { name } if name.as_deref() == Some("my-proj")
+        ));
+    }
+
+    #[test]
+    fn release_and_status_take_a_positional_target() {
+        let rel = Cli::try_parse_from(["devbox", "release", "calm-quilt"]).unwrap();
+        assert!(matches!(
+            &rel.command,
+            Commands::Release { target } if target.as_deref() == Some("calm-quilt")
+        ));
+        let stat = Cli::try_parse_from(["devbox", "status", "calm-quilt"]).unwrap();
+        assert!(matches!(
+            &stat.command,
+            Commands::Status { target } if target.as_deref() == Some("calm-quilt")
+        ));
+    }
+
+    #[test]
+    fn ssh_separates_target_from_trailing_args() {
+        // `devbox ssh <name> -- <cmd...>` must bind the name to `target` and the
+        // post-`--` tokens to `args`, not fold them together.
+        let cli =
+            Cli::try_parse_from(["devbox", "ssh", "calm-quilt", "--", "uptime", "-l"]).unwrap();
+        assert!(matches!(
+            &cli.command,
+            Commands::Ssh { target, args, .. }
+                if target.as_deref() == Some("calm-quilt")
+                    && args.len() == 2
+                    && args.first().map(String::as_str) == Some("uptime")
+        ));
+    }
+
+    #[test]
+    fn ssh_without_target_defaults_to_active_claim() {
+        let cli = Cli::try_parse_from(["devbox", "ssh"]).unwrap();
+        assert!(matches!(
+            &cli.command,
+            Commands::Ssh { target, args, .. } if target.is_none() && args.is_empty()
+        ));
+    }
+
     fn devbox(id: &str, state: DevboxState, owner: Option<&str>) -> DevboxResponse {
         DevboxResponse {
             id: id.to_string(),
             instance_id: "i-1234567890abcdef0".to_string(),
+            name: id.to_string(),
             state,
             instance_type: InstanceType("m5.large".to_string()),
             ami_id: AmiId("ami-12345678".to_string()),

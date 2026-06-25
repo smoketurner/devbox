@@ -234,6 +234,26 @@ pub fn username_from_email(email: &str) -> Option<String> {
     is_valid_unix_username(&local).then_some(local)
 }
 
+/// Maximum length of a devbox name, in characters.
+pub const DEVBOX_NAME_MAX_LEN: usize = 32;
+
+/// Whether `name` is a valid devbox name.
+///
+/// A devbox name is a friendly handle (e.g. `calm-quilt`) shown in the UI and
+/// CLI and usable as a selector for `ssh`/`release`/`status`. The rules:
+/// non-empty, at most [`DEVBOX_NAME_MAX_LEN`] characters, every character one of
+/// `a`–`z`, `0`–`9`, `_` or `-`, and not starting with `-` (so it can be passed
+/// as a CLI positional without being mistaken for a flag). Auto-generated names
+/// always satisfy these rules.
+#[must_use]
+pub fn is_valid_devbox_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > DEVBOX_NAME_MAX_LEN || name.starts_with('-') {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
 // ============================================================================
 // Display helpers
 // ============================================================================
@@ -334,11 +354,15 @@ impl std::fmt::Display for DevboxState {
 ///
 /// The owner is never supplied by the client — the server binds it to the
 /// authenticated principal (the Unix login derived from the token's `email`
-/// claim). Only the optional instance-type preference travels in the body.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// claim). Only an optional name override travels in the body: every box is
+/// auto-named at creation, and a claimant may rename it to something of their
+/// own choosing (see [`is_valid_devbox_name`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClaimRequest {
-    /// Optional preferred instance type.
-    pub instance_type: Option<InstanceType>,
+    /// Optional name override. When omitted (or blank), the box keeps its
+    /// auto-generated name. Must satisfy [`is_valid_devbox_name`].
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 // ============================================================================
@@ -350,6 +374,10 @@ pub struct ClaimRequest {
 pub struct DevboxResponse {
     pub id: String,
     pub instance_id: String,
+    /// Friendly `adjective-noun` handle (e.g. `calm-quilt`), unique across
+    /// non-terminated boxes. Assigned by the reconciler at creation; a claimant
+    /// may override it. Used as a selector for `ssh`/`release`/`status`.
+    pub name: String,
     pub state: DevboxState,
     pub instance_type: InstanceType,
     pub ami_id: AmiId,
@@ -489,20 +517,38 @@ mod tests {
     #[test]
     fn test_claim_request_serde() {
         let req = ClaimRequest {
-            instance_type: Some(InstanceType("m5.large".to_string())),
+            name: Some("calm-quilt".to_string()),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ClaimRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            parsed.instance_type,
-            Some(InstanceType("m5.large".to_string()))
-        );
+        assert_eq!(parsed.name.as_deref(), Some("calm-quilt"));
     }
 
     #[test]
-    fn test_claim_request_omits_instance_type() {
+    fn test_claim_request_omits_name() {
         let parsed: ClaimRequest = serde_json::from_str("{}").unwrap();
-        assert_eq!(parsed.instance_type, None);
+        assert_eq!(parsed.name, None);
+    }
+
+    #[test]
+    fn test_is_valid_devbox_name_accepts() {
+        assert!(is_valid_devbox_name("calm-quilt"));
+        assert!(is_valid_devbox_name("box1"));
+        assert!(is_valid_devbox_name("a"));
+        assert!(is_valid_devbox_name("web_app"));
+        assert!(is_valid_devbox_name("9lives")); // leading digit is fine for names
+        assert!(is_valid_devbox_name(&"x".repeat(DEVBOX_NAME_MAX_LEN)));
+    }
+
+    #[test]
+    fn test_is_valid_devbox_name_rejects() {
+        assert!(!is_valid_devbox_name(""));
+        assert!(!is_valid_devbox_name("MyProj")); // uppercase
+        assert!(!is_valid_devbox_name("-lead")); // leading hyphen
+        assert!(!is_valid_devbox_name("has space"));
+        assert!(!is_valid_devbox_name("dots.bad")); // dots not allowed
+        assert!(!is_valid_devbox_name("a/../b"));
+        assert!(!is_valid_devbox_name(&"x".repeat(DEVBOX_NAME_MAX_LEN + 1)));
     }
 
     #[test]
