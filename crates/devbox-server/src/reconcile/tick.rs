@@ -200,9 +200,6 @@ async fn sync_docs_with_asg(
         .filter(|n| !n.is_empty())
         .collect();
 
-    // Backfill names onto surviving docs written before the field existed.
-    backfill_names(store, &docs, &asg_instance_ids, &mut used_names).await;
-
     // Build set of instance_ids that already have docs
     let doc_instance_ids: HashSet<String> =
         docs.iter().map(|d| d.data.instance_id.clone()).collect();
@@ -274,53 +271,6 @@ async fn sync_docs_with_asg(
                     instance_id = %inst.instance_id,
                     "failed to create doc for ASG instance"
                 );
-            }
-        }
-    }
-}
-
-/// Assign a unique name to each surviving doc that lacks one.
-///
-/// Docs written before the `name` field existed deserialize with an empty name;
-/// this brings them up to the "every box has a unique name" invariant. Stale
-/// docs (not in the ASG, slated for deletion) are skipped. Each assigned name is
-/// added to `used_names` so later generations in the same tick don't collide.
-async fn backfill_names(
-    store: &DocumentStore,
-    docs: &[crate::db::document_type::Document<DevboxDoc>],
-    asg_instance_ids: &HashSet<&str>,
-    used_names: &mut HashSet<String>,
-) {
-    for doc in docs {
-        if !doc.data.name.is_empty() || !asg_instance_ids.contains(doc.data.instance_id.as_str()) {
-            continue;
-        }
-
-        let name = crate::naming::generate_unique_name(store, used_names)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::error!(
-                    error = %e,
-                    doc_id = %doc.id,
-                    "backfill name generation failed; falling back to instance id"
-                );
-                doc.data.instance_id.clone()
-            });
-
-        let mut updated = doc.data.clone();
-        updated.name = name.clone();
-        match store
-            .compare_and_update(&doc.id, doc.version, &updated)
-            .await
-        {
-            Ok(true) => {
-                used_names.insert(name);
-            }
-            Ok(false) => {
-                tracing::warn!(doc_id = %doc.id, "version conflict backfilling name");
-            }
-            Err(e) => {
-                tracing::error!(error = %e, doc_id = %doc.id, "failed to backfill name");
             }
         }
     }

@@ -122,7 +122,7 @@ mod reconcile_tests {
         );
     }
 
-    /// Test: every doc the reconciler creates gets a unique, non-empty name.
+    /// Test: every doc the reconciler creates gets a unique, friendly name.
     #[tokio::test]
     async fn test_created_docs_get_unique_names() {
         let store = setup_store().await;
@@ -130,7 +130,7 @@ mod reconcile_tests {
         let config = test_config();
 
         compute.seed_asg(3, 5, 3);
-        compute.add_instance("InService");
+        let i1 = compute.add_instance("InService");
         compute.add_instance("InService");
         compute.add_instance("InService");
 
@@ -144,52 +144,18 @@ mod reconcile_tests {
             all.iter().map(|d| d.data.name.as_str()).collect();
         assert_eq!(names.len(), 3, "names must be unique across boxes");
         for d in &all {
-            assert!(!d.data.name.is_empty(), "every box must be named");
-            assert!(
-                d.data.name.contains('-'),
-                "auto names are adjective-noun: {}",
-                d.data.name
+            assert!(!d.data.name.is_empty(), "every new box must be named");
+            assert_ne!(
+                d.data.name, d.data.instance_id,
+                "a new box gets a generated friendly name, not its instance id"
             );
         }
-    }
-
-    /// Test: a pre-existing doc with no name (written before names existed) is
-    /// backfilled with a name, without creating a duplicate doc.
-    #[tokio::test]
-    async fn test_backfill_assigns_name_to_unnamed_doc() {
-        let store = setup_store().await;
-        let compute = MockCompute::new();
-        let config = test_config();
-
-        compute.seed_asg(1, 5, 1);
-        let instance_id = compute.add_instance("InService");
-
-        let doc = DevboxDoc {
-            instance_id: instance_id.clone(),
-            name: String::new(),
-            state: DevboxState::Warming,
-            instance_type: InstanceType("m7g.large".to_string()),
-            ami_id: AmiId("ami-mock".to_string()),
-            subnet_id: SubnetId("subnet-mock".to_string()),
-            region: "us-east-1".to_string(),
-            ebs_volume_id: None,
-            owner: None,
-            claimed_at: None,
-            created_at: Timestamp::now(),
-            owner_tag_applied: false,
-        };
-        store.insert(&doc).await.unwrap();
-
-        reconciliation_tick(&store, &compute, &config)
-            .await
-            .unwrap();
-
-        let all = store.list_all::<DevboxDoc>().await.unwrap();
-        assert_eq!(all.len(), 1, "backfill must not create a duplicate doc");
-        assert!(
-            !all.first().unwrap().data.name.is_empty(),
-            "backfill must assign a name to the unnamed doc"
-        );
+        // Sanity: the generated names are friendly adjective-noun handles.
+        let first = all
+            .iter()
+            .find(|d| d.data.instance_id == i1)
+            .expect("doc for first instance");
+        assert!(first.data.name.contains('-'), "got: {}", first.data.name);
     }
 
     /// Test: after setting the ready tag, the next tick flips the doc to Ready.

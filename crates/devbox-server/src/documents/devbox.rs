@@ -13,9 +13,9 @@ pub struct DevboxDoc {
     /// an instance that already exists in the ASG — so this is always present.
     pub instance_id: String,
     /// Friendly `adjective-noun` handle (e.g. `calm-quilt`), unique across
-    /// non-terminated boxes. The reconciler assigns it at creation and backfills
-    /// any doc it finds with an empty name; a claimant may override it. Defaults
-    /// empty for documents written before this field existed.
+    /// non-terminated boxes and usable as a selector. The reconciler assigns it
+    /// when it creates the box; a claimant may override it (`claim --name`).
+    /// Empty for documents written before this field existed (not backfilled).
     #[serde(default)]
     pub name: String,
     /// Current state in the lifecycle.
