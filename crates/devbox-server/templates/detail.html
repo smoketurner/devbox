@@ -63,10 +63,21 @@
                 </div>
             </dl>
         </div>
-        <div class="mt-6">
+        <div class="mt-6 space-y-4">
             {% if devbox.state == "claimed" %}
             <form method="post" action="/devboxes/{{ devbox.id }}/release">
                 <button type="submit" class="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded transition-colors">Release</button>
+            </form>
+            <form method="post" action="/devboxes/{{ devbox.id }}/rename" class="flex items-center gap-2">
+                <input
+                    type="text"
+                    name="name"
+                    value="{{ devbox.name }}"
+                    placeholder="new-name"
+                    class="bg-gray-800 border border-gray-600 text-white px-3 py-2 rounded text-sm focus:outline-none focus:border-blue-500"
+                    required
+                >
+                <button type="submit" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded transition-colors text-sm">Rename</button>
             </form>
             {% else if devbox.state == "ready" %}
             <a href="/devboxes/claim" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded transition-colors inline-block">Claim</a>

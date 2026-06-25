@@ -365,6 +365,18 @@ pub struct ClaimRequest {
     pub name: Option<String>,
 }
 
+/// Request to rename a claimed devbox.
+///
+/// The box must be in the `Claimed` state and the caller must be its owner.
+/// The new name is required (unlike [`ClaimRequest`] where the name is
+/// optional) and must satisfy [`is_valid_devbox_name`]. Uniqueness is enforced
+/// atomically by the document store.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenameRequest {
+    /// New name for the box. Must satisfy [`is_valid_devbox_name`].
+    pub name: String,
+}
+
 // ============================================================================
 // API Response Types
 // ============================================================================

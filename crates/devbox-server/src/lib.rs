@@ -9,4 +9,5 @@ pub mod error;
 pub mod naming;
 pub mod reconcile;
 pub mod routes;
+pub mod service;
 pub mod ui;

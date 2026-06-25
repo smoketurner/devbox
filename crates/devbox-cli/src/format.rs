@@ -70,6 +70,11 @@ pub(crate) fn format_release_success(d: &DevboxResponse) -> String {
     format!("Released devbox {} (now {})", d.name, d.state)
 }
 
+/// Format a successful rename confirmation.
+pub(crate) fn format_rename_success(d: &DevboxResponse) -> String {
+    format!("Renamed devbox to {}", d.name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +186,24 @@ mod tests {
         assert!(output.contains("Released devbox calm-quilt"));
         assert!(!output.contains("test-id"));
         assert!(output.contains("terminating"));
+    }
+
+    #[test]
+    fn test_format_rename_success() {
+        let d = DevboxResponse {
+            id: "test-id".to_string(),
+            instance_id: "i-ren123".to_string(),
+            name: "my-feature".to_string(),
+            state: DevboxState::Claimed,
+            instance_type: InstanceType("m5.large".to_string()),
+            ami_id: AmiId("ami-123".to_string()),
+            owner: Some("alice".to_string()),
+            region: "us-east-1".to_string(),
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            claimed_at: Some("2024-01-02T00:00:00Z".to_string()),
+        };
+        let output = format_rename_success(&d);
+        assert!(output.contains("Renamed devbox to my-feature"));
+        assert!(!output.contains("test-id"));
     }
 }
