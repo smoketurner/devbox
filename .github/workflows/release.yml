@@ -70,7 +70,9 @@ jobs:
         with:
           persist-credentials: false
       - name: Install build dependencies
-        run: brew install go cmake
+        run: |
+          brew trust aws/tap
+          brew install go cmake
       - name: Setup Rust toolchain
         run: |
           rustup show
