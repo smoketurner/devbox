@@ -2,18 +2,19 @@
 
 use std::sync::Arc;
 
-use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Request, State};
 use axum::http::HeaderMap;
-use axum::response::Json;
+use axum::middleware::{Next, from_fn_with_state};
+use axum::response::{Json, Response};
 use axum::routing::{get, post};
+use axum::{Extension, Router};
 
 use devbox_common::{
     ClaimRequest, DevboxListResponse, DevboxResponse, DevboxState, HealthResponse,
     PoolMetricsResponse, ProtectedResourceMetadata,
 };
 
-use crate::auth::Authenticator;
+use crate::auth::{Authenticator, Principal};
 use crate::db::DocumentStore;
 use crate::documents::devbox::DevboxDoc;
 use crate::error::{AppError, JsonBody};
@@ -29,8 +30,10 @@ use crate::ui::build_ui_router;
 pub struct AppState {
     pub store: Arc<DocumentStore>,
     pub reconciler_config: ReconcilerConfig,
-    /// Claim/release always require an authenticated principal and bind `owner`
-    /// to it — the Unix login derived from the token's `email` claim.
+    /// Every API endpoint requires an authenticated principal (only `/health` and
+    /// the RFC 9728 discovery document are open). Claim/release additionally bind
+    /// `owner` to that principal — the Unix login derived from the token's `email`
+    /// claim.
     pub auth: Authenticator,
     /// AWS account the pool runs in (`AWS_ACCOUNT_ID`), advertised in the RFC
     /// 9728 discovery document so `devbox ssh` can auto-select the local AWS
@@ -41,30 +44,49 @@ pub struct AppState {
 /// Handle to the shared application state, passed to every handler.
 pub type SharedState = Arc<AppState>;
 
-/// Resolve the caller's `owner` from the request credential: the Unix login
-/// derived from the verified token's `email` claim.
+/// Authenticate the request once at the edge of the `/api/v1` router: reject with
+/// 401 when no valid credential is present, otherwise stash the resolved
+/// [`Principal`] in request extensions. Handlers that act as the caller
+/// (claim/release) read it back via `Extension<Principal>`; read handlers ignore
+/// it. Applied as a `route_layer`, so every current and future `/api/v1` route is
+/// authenticated by construction — there is no per-handler opt-in to forget.
 ///
-/// The owner doubles as the Unix login account the host provisions for the
-/// claimant. The derivation already gates on `is_valid_unix_username`
-/// (see `auth::jwt::decode_owner`), so a value returned here is always a valid
-/// login; a malformed `email` yields a 401 rather than a downstream SSH break.
-async fn authenticated_owner(state: &AppState, headers: &HeaderMap) -> Result<String, AppError> {
-    Ok(state.auth.authenticate(headers).await?.0)
+/// The principal is the Unix login derived from the verified token's `email`
+/// claim. That derivation already gates on `is_valid_unix_username` (see
+/// `auth::jwt::decode_owner`), so a malformed `email` yields a 401 here rather
+/// than a downstream SSH break.
+async fn require_auth(
+    State(state): State<SharedState>,
+    mut req: Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    let principal = state.auth.authenticate(req.headers()).await?;
+    req.extensions_mut().insert(principal);
+    Ok(next.run(req).await)
 }
 
 /// Build the Axum router with all routes.
+///
+/// Every `/api/v1` route sits behind [`require_auth`]; only `/health`
+/// (infrastructure health checks present no credential) and the RFC 9728
+/// discovery document (fetched pre-login to bootstrap auth) are open. The
+/// dashboard routes carry their own OIDC-session gate (see [`build_ui_router`]).
 pub fn build_router(state: SharedState) -> Router {
+    let api = Router::new()
+        .route("/api/v1/devboxes", get(list_devboxes))
+        .route("/api/v1/devboxes/{id}", get(get_devbox))
+        .route("/api/v1/devboxes/claim", post(claim_devbox))
+        .route("/api/v1/devboxes/{id}/release", post(release_devbox))
+        .route("/api/v1/pool/metrics", get(pool_metrics))
+        .route_layer(from_fn_with_state(state.clone(), require_auth));
+
     Router::new()
         .route("/health", get(health_check))
         .route(
             "/.well-known/oauth-protected-resource",
             get(protected_resource_metadata),
         )
-        .route("/api/v1/devboxes", get(list_devboxes))
-        .route("/api/v1/devboxes/{id}", get(get_devbox))
-        .route("/api/v1/devboxes/claim", post(claim_devbox))
-        .route("/api/v1/devboxes/{id}/release", post(release_devbox))
-        .route("/api/v1/pool/metrics", get(pool_metrics))
+        .merge(api)
         .merge(build_ui_router())
         .with_state(state)
 }
@@ -136,10 +158,10 @@ async fn get_devbox(
 /// Claim an available devbox.
 async fn claim_devbox(
     State(state): State<SharedState>,
-    headers: HeaderMap,
+    Extension(principal): Extension<Principal>,
     JsonBody(req): JsonBody<ClaimRequest>,
 ) -> Result<Json<DevboxResponse>, AppError> {
-    let owner = authenticated_owner(&state, &headers).await?;
+    let owner = principal.0;
 
     let ready_docs = state.store.find_all::<DevboxDoc>("state", "ready").await?;
     if ready_docs.is_empty() {
@@ -193,9 +215,9 @@ async fn claim_devbox(
 async fn release_devbox(
     State(state): State<SharedState>,
     Path(id): Path<String>,
-    headers: HeaderMap,
+    Extension(principal): Extension<Principal>,
 ) -> Result<Json<DevboxResponse>, AppError> {
-    let caller = authenticated_owner(&state, &headers).await?;
+    let caller = principal.0;
 
     let doc = state
         .store
@@ -280,10 +302,12 @@ async fn pool_metrics(
 mod tests {
     use std::time::Duration;
 
+    use axum::body::Body;
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     use devbox_common::{AmiId, InstanceType, SubnetId};
     use jiff::Timestamp;
+    use tower::ServiceExt;
 
     use super::*;
     use crate::db::migrations::run_sqlite_migrations;
@@ -383,12 +407,18 @@ mod tests {
         }
     }
 
+    /// `Extension<Principal>` the auth middleware would have injected — supplied
+    /// directly here so handler-logic tests bypass the (separately tested) layer.
+    fn principal(owner: &str) -> Extension<Principal> {
+        Extension(Principal(owner.to_string()))
+    }
+
     #[tokio::test]
-    async fn claim_marks_box_claimed_with_authenticated_owner() {
-        let state = setup_state_as("jdoe").await;
+    async fn claim_marks_box_claimed_and_binds_owner() {
+        let state = setup_state().await;
         insert(&state, ready_devbox()).await;
 
-        let body = claim_devbox(State(state), HeaderMap::new(), JsonBody(claim()))
+        let body = claim_devbox(State(state), principal("jdoe"), JsonBody(claim()))
             .await
             .ok()
             .unwrap()
@@ -405,18 +435,8 @@ mod tests {
     async fn claim_empty_pool_is_conflict() {
         let state = setup_state().await;
         let status =
-            status_of(claim_devbox(State(state), HeaderMap::new(), JsonBody(claim())).await);
+            status_of(claim_devbox(State(state), principal("jdoe"), JsonBody(claim())).await);
         assert_eq!(status, StatusCode::CONFLICT);
-    }
-
-    #[tokio::test]
-    async fn claim_without_credential_is_unauthorized() {
-        let state = setup_state_no_principal().await;
-        insert(&state, ready_devbox()).await;
-        // No Authorization / x-amzn-oidc-data header → AuthError::Missing → 401.
-        let status =
-            status_of(claim_devbox(State(state), HeaderMap::new(), JsonBody(claim())).await);
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -425,8 +445,8 @@ mod tests {
         insert(&state, ready_devbox()).await;
 
         let (r1, r2) = tokio::join!(
-            claim_devbox(State(state.clone()), HeaderMap::new(), JsonBody(claim())),
-            claim_devbox(State(state.clone()), HeaderMap::new(), JsonBody(claim())),
+            claim_devbox(State(state.clone()), principal("jdoe"), JsonBody(claim())),
+            claim_devbox(State(state.clone()), principal("jdoe"), JsonBody(claim())),
         );
 
         let statuses = [status_of(r1), status_of(r2)];
@@ -441,14 +461,14 @@ mod tests {
 
     #[tokio::test]
     async fn release_by_non_owner_is_forbidden() {
-        // Box owned by alice; caller authenticates as bob.
-        let state = setup_state_as("bob").await;
+        // Box owned by alice; caller is bob.
+        let state = setup_state().await;
         let mut doc = ready_devbox();
         doc.state = DevboxState::Claimed;
         doc.owner = Some("alice".to_string());
         let id = insert(&state, doc).await;
 
-        let status = status_of(release_devbox(State(state), Path(id), HeaderMap::new()).await);
+        let status = status_of(release_devbox(State(state), Path(id), principal("bob")).await);
         assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
@@ -501,7 +521,70 @@ mod tests {
         let state = setup_state().await;
         let id = insert(&state, ready_devbox()).await;
 
-        let status = status_of(release_devbox(State(state), Path(id), HeaderMap::new()).await);
+        let status = status_of(release_devbox(State(state), Path(id), principal("jdoe")).await);
         assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn list_returns_devboxes() {
+        let state = setup_state().await;
+        insert(&state, ready_devbox()).await;
+        let Json(body) = list_devboxes(State(state)).await.ok().unwrap();
+        assert_eq!(body.devboxes.len(), 1);
+    }
+
+    /// Drive a request through the full router so the auth `route_layer` runs, and
+    /// return the resulting status. The body is empty: unauthenticated requests are
+    /// rejected by the layer before any handler or body parsing, so even POSTs
+    /// surface as 401 here.
+    async fn router_status(state: SharedState, method: &str, uri: &str) -> StatusCode {
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        build_router(state).oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_api_routes_are_rejected() {
+        // With no principal configured, the edge layer rejects every /api/v1 route
+        // — reads included — with 401 before the handler runs. This pins the
+        // secure-by-default wiring: a route under the layer cannot serve anonymously.
+        for (method, uri) in [
+            ("GET", "/api/v1/devboxes"),
+            ("GET", "/api/v1/devboxes/any-id"),
+            ("GET", "/api/v1/pool/metrics"),
+            ("POST", "/api/v1/devboxes/claim"),
+            ("POST", "/api/v1/devboxes/any-id/release"),
+        ] {
+            let status = router_status(setup_state_no_principal().await, method, uri).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} must be 401"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn health_and_discovery_stay_open() {
+        // The two endpoints deliberately outside the auth layer answer without a
+        // credential.
+        for uri in ["/health", "/.well-known/oauth-protected-resource"] {
+            let status = router_status(setup_state_no_principal().await, "GET", uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri} must stay open");
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_api_read_passes_the_layer() {
+        // with_test_owner authenticates every request, so the layer admits it and
+        // the read handler responds 200 — proving the layer passes traffic through,
+        // not just blocks it.
+        let state = setup_state().await;
+        insert(&state, ready_devbox()).await;
+        let status = router_status(state, "GET", "/api/v1/devboxes").await;
+        assert_eq!(status, StatusCode::OK);
     }
 }

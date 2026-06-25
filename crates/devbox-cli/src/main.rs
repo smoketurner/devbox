@@ -46,12 +46,11 @@ fn resolve_server(explicit: Option<String>) -> Result<String> {
     Ok(DEFAULT_SERVER.to_string())
 }
 
-/// Attach a Bearer token to a request when one is present.
-fn with_auth(builder: reqwest::RequestBuilder, token: Option<&str>) -> reqwest::RequestBuilder {
-    match token {
-        Some(t) => builder.bearer_auth(t),
-        None => builder,
-    }
+/// Attach the caller's bearer token to a request. Every API endpoint requires
+/// authentication (only `/health` and the discovery document are open), so the
+/// token is always present.
+fn with_auth(builder: reqwest::RequestBuilder, token: &str) -> reqwest::RequestBuilder {
+    builder.bearer_auth(token)
 }
 
 /// Whether we can safely open an interactive prompt. `dialoguer` renders to and
@@ -67,23 +66,42 @@ fn is_interactive() -> bool {
 /// Resolve the target devbox id for `ssh`/`status`/`release`.
 ///
 /// An explicit `--id` always wins. Otherwise we consult the local registry of
-/// active claims for this server: zero is an error, one is used directly, and
-/// several open an interactive picker (or, on a non-TTY, an error listing them).
-fn resolve_id(explicit: Option<String>, server: &str) -> Result<String> {
+/// active claims for this server. When it is empty — e.g. the box was claimed
+/// from another machine or directly via the API — we fall back to the server,
+/// scoped to the authenticated owner, and remember the box we resolve to so the
+/// next call is a local read again.
+async fn resolve_id(
+    explicit: Option<String>,
+    server: &str,
+    http: &reqwest::Client,
+    session: &session::Session,
+) -> Result<String> {
     if let Some(id) = explicit {
         return Ok(id);
     }
 
-    let claims = state::active_claims(server)?;
+    let local = state::active_claims(server)?;
+    if !local.is_empty() {
+        return Ok(select_claim(local, server)?.id);
+    }
+
+    // Empty registry: discover the owner's claims from the server and adopt only
+    // the one we resolve to (a narrow read-through cache; `list` stays prune-only).
+    let discovered = discover_claims(http, server, session).await?;
+    let chosen = select_claim(discovered, server)?;
+    remember(chosen.clone());
+    Ok(chosen.id)
+}
+
+/// Choose one claim: zero is an error, one is used directly, and several open an
+/// interactive picker (or, on a non-TTY, an error listing the candidate ids).
+fn select_claim(claims: Vec<state::Claim>, server: &str) -> Result<state::Claim> {
     match claims.len() {
         0 => bail!("no active devbox for {server}; run `devbox claim` first or pass --id"),
-        1 => {
-            let claim = claims
-                .into_iter()
-                .next()
-                .context("active claim disappeared while resolving id")?;
-            Ok(claim.id)
-        }
+        1 => claims
+            .into_iter()
+            .next()
+            .context("active claim disappeared while resolving id"),
         _ if is_interactive() => {
             let labels: Vec<String> = claims
                 .iter()
@@ -99,8 +117,8 @@ fn resolve_id(explicit: Option<String>, server: &str) -> Result<String> {
                 .interact()
                 .context("devbox selection cancelled")?;
             claims
-                .get(choice)
-                .map(|c| c.id.clone())
+                .into_iter()
+                .nth(choice)
                 .context("invalid devbox selection")
         }
         _ => {
@@ -138,28 +156,31 @@ async fn resolve_aws_profile(http: &reqwest::Client, server: &str) -> Result<Opt
     aws_profile::select_profile(&account_id, is_interactive())
 }
 
-/// The cached session's bearer token, or an error directing the user to log in.
+/// The cached session for `server`, or an error directing the user to log in.
 ///
-/// Authentication is mandatory: the server binds `owner` to the authenticated
-/// principal, so claim/release always need a valid token.
-fn require_token(server: &str) -> Result<String> {
-    let Some(session) = session::current(server)? else {
-        bail!("not logged in to {server}; run `devbox login`")
-    };
-    Ok(session.token)
+/// Authentication is mandatory for mutating calls: the server binds `owner` to
+/// the authenticated principal, so claim/release always need a valid session.
+fn require_session(server: &str) -> Result<session::Session> {
+    session::current(server)?.with_context(|| {
+        format!("not logged in to {server} (or your session expired); run `devbox login`")
+    })
 }
 
-/// Record a freshly claimed devbox in the local registry. Best-effort: the box is
-/// already claimed, so a write failure only warns.
-fn remember_claim(devbox: &DevboxResponse, server: &str) {
-    let claim = state::Claim {
-        id: devbox.id.clone(),
-        server_url: server.to_string(),
-        claimed_at: devbox.claimed_at.clone(),
-    };
+/// Persist `claim` in the local registry, warning (not failing) on error — the
+/// box is already claimed, so a local write failure is non-fatal.
+fn remember(claim: state::Claim) {
     if let Err(e) = state::add(claim) {
         eprintln!("warning: could not record claim locally: {e:#}");
     }
+}
+
+/// Record a freshly claimed devbox in the local registry.
+fn remember_claim(devbox: &DevboxResponse, server: &str) {
+    remember(state::Claim {
+        id: devbox.id.clone(),
+        server_url: server.to_string(),
+        claimed_at: devbox.claimed_at.clone(),
+    });
 }
 
 /// Drop a released devbox from the local registry. Best-effort.
@@ -183,14 +204,55 @@ fn reconcile_claims(list: &DevboxListResponse, server: &str, owner: &str) {
     }
 }
 
+/// Whether `d` is currently `Claimed` by `owner`.
+fn claimed_by(d: &DevboxResponse, owner: &str) -> bool {
+    d.state == DevboxState::Claimed && d.owner.as_deref() == Some(owner)
+}
+
 /// The ids the server reports as `Claimed` by `owner` — the set the local
 /// registry should be reconciled against.
 fn live_claimed_ids(list: &DevboxListResponse, owner: &str) -> BTreeSet<String> {
     list.devboxes
         .iter()
-        .filter(|d| d.state == DevboxState::Claimed && d.owner.as_deref() == Some(owner))
+        .filter(|d| claimed_by(d, owner))
         .map(|d| d.id.clone())
         .collect()
+}
+
+/// The authenticated owner's active claims, derived from a server listing.
+fn claims_from_list(list: DevboxListResponse, server: &str, owner: &str) -> Vec<state::Claim> {
+    list.devboxes
+        .into_iter()
+        .filter(|d| claimed_by(d, owner))
+        .map(|d| state::Claim {
+            id: d.id,
+            server_url: server.to_string(),
+            claimed_at: d.claimed_at,
+        })
+        .collect()
+}
+
+/// Discover the authenticated owner's active claims from the server, used when
+/// the local registry is empty. Returns an empty list (rather than erroring) when
+/// the read fails, so the caller surfaces the normal "no active devbox" message.
+async fn discover_claims(
+    http: &reqwest::Client,
+    server: &str,
+    session: &session::Session,
+) -> Result<Vec<state::Claim>> {
+    let url = format!("{server}/api/v1/devboxes");
+    let resp = with_auth(http.get(&url), &session.token)
+        .send()
+        .await
+        .context("failed to query devboxes while resolving the active claim")?;
+    if !resp.status().is_success() {
+        return Ok(Vec::new());
+    }
+    let list: DevboxListResponse = resp
+        .json()
+        .await
+        .context("failed to parse devbox list while resolving the active claim")?;
+    Ok(claims_from_list(list, server, &session.owner))
 }
 
 #[derive(Subcommand)]
@@ -272,12 +334,12 @@ async fn main() -> Result<()> {
         }
 
         Commands::Claim { instance_type } => {
-            let token = require_token(&server)?;
+            let session = require_session(&server)?;
             let url = format!("{server}/api/v1/devboxes/claim");
             let req = ClaimRequest {
                 instance_type: instance_type.map(InstanceType),
             };
-            let resp = with_auth(http.post(&url).json(&req), Some(&token))
+            let resp = with_auth(http.post(&url).json(&req), &session.token)
                 .send()
                 .await
                 .context("failed to send claim request")?;
@@ -296,10 +358,10 @@ async fn main() -> Result<()> {
         }
 
         Commands::Release { id } => {
-            let token = require_token(&server)?;
-            let id = resolve_id(id, &server)?;
+            let session = require_session(&server)?;
+            let id = resolve_id(id, &server, &http, &session).await?;
             let url = format!("{server}/api/v1/devboxes/{id}/release");
-            let resp = with_auth(http.post(&url), Some(&token))
+            let resp = with_auth(http.post(&url), &session.token)
                 .send()
                 .await
                 .context("failed to send release request")?;
@@ -318,13 +380,9 @@ async fn main() -> Result<()> {
         }
 
         Commands::List => {
-            // Reads are open; a missing or unreadable session must not block them,
-            // so attach a token only if one is cleanly available (best-effort). The
-            // same session's owner gates reconcile so we never prune ownership-blind.
-            let session = session::current(&server).ok().flatten();
-            let token = session.as_ref().map(|s| s.token.clone());
+            let session = require_session(&server)?;
             let url = format!("{server}/api/v1/devboxes");
-            let resp = with_auth(http.get(&url), token.as_deref())
+            let resp = with_auth(http.get(&url), &session.token)
                 .send()
                 .await
                 .context("failed to send list request")?;
@@ -332,9 +390,7 @@ async fn main() -> Result<()> {
             if resp.status().is_success() {
                 let list: DevboxListResponse =
                     resp.json().await.context("failed to parse response")?;
-                if let Some(session) = &session {
-                    reconcile_claims(&list, &server, &session.owner);
-                }
+                reconcile_claims(&list, &server, &session.owner);
                 if list.devboxes.is_empty() {
                     println!("No devboxes found.");
                 } else {
@@ -349,12 +405,10 @@ async fn main() -> Result<()> {
         }
 
         Commands::Status { id } => {
-            // Reads are open; a missing or unreadable session must not block them,
-            // so attach a token only if one is cleanly available (best-effort).
-            let token = session::current(&server).ok().flatten().map(|s| s.token);
-            let id = resolve_id(id, &server)?;
+            let session = require_session(&server)?;
+            let id = resolve_id(id, &server, &http, &session).await?;
             let url = format!("{server}/api/v1/devboxes/{id}");
-            let resp = with_auth(http.get(&url), token.as_deref())
+            let resp = with_auth(http.get(&url), &session.token)
                 .send()
                 .await
                 .context("failed to send status request")?;
@@ -377,12 +431,10 @@ async fn main() -> Result<()> {
             print,
             args,
         } => {
-            // Reads are open; a missing or unreadable session must not block them,
-            // so attach a token only if one is cleanly available (best-effort).
-            let token = session::current(&server).ok().flatten().map(|s| s.token);
-            let id = resolve_id(id, &server)?;
+            let session = require_session(&server)?;
+            let id = resolve_id(id, &server, &http, &session).await?;
             let url = format!("{server}/api/v1/devboxes/{id}");
-            let resp = with_auth(http.get(&url), token.as_deref())
+            let resp = with_auth(http.get(&url), &session.token)
                 .send()
                 .await
                 .context("failed to look up devbox")?;
@@ -423,6 +475,10 @@ async fn main() -> Result<()> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test code: panic on assertion failure is acceptable"
+)]
 mod tests {
     use super::*;
     use clap::CommandFactory;
@@ -462,5 +518,66 @@ mod tests {
         assert!(ids.contains("mine"));
         // A box re-claimed by another user must not be retained as ours.
         assert!(!ids.contains("theirs"));
+    }
+
+    fn claim(id: &str) -> state::Claim {
+        state::Claim {
+            id: id.to_string(),
+            server_url: "http://s".to_string(),
+            claimed_at: None,
+        }
+    }
+
+    #[test]
+    fn claims_from_list_keeps_only_owner_claimed_and_carries_fields() {
+        let mut mine = devbox("mine", DevboxState::Claimed, Some("jdoe"));
+        mine.claimed_at = Some("2026-06-23T01:00:00Z".to_string());
+        let list = DevboxListResponse {
+            devboxes: vec![
+                mine,
+                devbox("theirs", DevboxState::Claimed, Some("asmith")),
+                devbox("ready", DevboxState::Ready, None),
+            ],
+        };
+        let claims = claims_from_list(list, "http://s1", "jdoe");
+        assert_eq!(claims.len(), 1);
+        let c = claims.first().unwrap();
+        assert_eq!(c.id, "mine");
+        assert_eq!(
+            c.server_url, "http://s1",
+            "server is stamped onto the claim"
+        );
+        assert_eq!(
+            c.claimed_at.as_deref(),
+            Some("2026-06-23T01:00:00Z"),
+            "claimed_at is carried through for the picker label"
+        );
+    }
+
+    #[test]
+    fn select_claim_empty_errors_with_claim_hint() {
+        let err = select_claim(Vec::new(), "http://s").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no active devbox"), "got: {msg}");
+        assert!(msg.contains("devbox claim"), "got: {msg}");
+    }
+
+    #[test]
+    fn select_claim_single_returns_it() {
+        let chosen = select_claim(vec![claim("box-a")], "http://s").unwrap();
+        assert_eq!(chosen.id, "box-a");
+    }
+
+    #[test]
+    fn select_claim_multiple_without_tty_lists_ids() {
+        // The interactive picker needs a human; only the non-TTY branch (which
+        // lists the candidate ids) is deterministic under `cargo test`.
+        if is_interactive() {
+            return;
+        }
+        let err = select_claim(vec![claim("box-a"), claim("box-b")], "http://s").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("multiple active devboxes"), "got: {msg}");
+        assert!(msg.contains("box-a") && msg.contains("box-b"), "got: {msg}");
     }
 }

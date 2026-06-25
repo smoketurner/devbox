@@ -258,8 +258,11 @@ cached id_token as `id_token_hint`, so the SSO session is terminated too (not ju
 the local cookie). Vouch redirects back to `/signed-out` — derived from
 `AUTH_OIDC_REDIRECT_URI`'s origin, no separate env var — which must be registered
 in the Vouch client's `post_logout_redirect_uris` (an unregistered URI falls back
-to Vouch's own done page). Read endpoints (list/get/health/pool metrics) stay
-open.
+to Vouch's own done page). **Every `/api/v1` endpoint requires authentication**,
+reads included (list/get/pool metrics) — an unauthenticated API call is a 401,
+never data. Only `/health` (infrastructure health checks present no credential)
+and the RFC 9728 discovery document (fetched pre-login to bootstrap auth) are
+open; the CLI's `list`/`status`/`ssh` therefore require `devbox login` too.
 
 **Planned / not yet built** (ideas borrowed from [`.kiro/references.md`](.kiro/references.md)
 are tagged inline):
