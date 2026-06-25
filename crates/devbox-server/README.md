@@ -7,9 +7,9 @@ warm pool of EC2 dev boxes that callers claim over SSH. See the
 
 ## What it does
 
-- **API + dashboard** (`routes.rs`, `ui.rs`) — `claim` / `release` / `list` /
-  `status` / pool metrics, plus an HTML dashboard. Claim is exactly-once under
-  optimistic concurrency.
+- **API + dashboard** (`routes.rs`, `ui.rs`, `service.rs`) — `claim` / `release` /
+  `rename` / `list` / `status` / pool metrics, plus an HTML dashboard. Claim is
+  exactly-once under optimistic concurrency.
 - **Auth** (`auth/`) — resolves the caller from a `Bearer` Vouch JWT (CLI/agents
   via device-code OAuth) or the ALB's `x-amzn-oidc-data` (legacy), and binds
   `owner` to the verified principal. The dashboard uses app-side OIDC login with
@@ -33,6 +33,7 @@ warm pool of EC2 dev boxes that callers claim over SSH. See the
 | `GET /api/v1/devboxes/{id}` | Get one |
 | `POST /api/v1/devboxes/claim` | Claim a Ready devbox |
 | `POST /api/v1/devboxes/{id}/release` | Release a Claimed devbox |
+| `POST /api/v1/devboxes/{id}/rename` | Rename a Claimed devbox |
 | `GET /api/v1/pool/metrics` | Pool counts vs target |
 | `GET /` | HTML dashboard |
 

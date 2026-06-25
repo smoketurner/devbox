@@ -92,7 +92,7 @@ Rust workspace, four crates:
 |-------|------|
 | `devbox-common` | Shared types: `DevboxId`, `DevboxState`, API request/response |
 | `devbox-server` | Axum API (`/api/v1/devboxes/*`) + HTML dashboard, document store (SQLite dev / Aurora DSQL prod), ASG-adopting pool reconciler, AWS compute layer |
-| `devbox-cli`    | `claim` / `release` / `list` / `status` / `ssh` |
+| `devbox-cli`    | `claim` / `release` / `rename` / `list` / `status` / `ssh` |
 | `devbox-agent`  | On-host binary baked into the AMI: `principals` (sshd resolver), `owner-sync` (provision the claimant's account), `warmup` (self-tags `devbox:ready=true` once warmed). musl static; built/released by CI, downloaded into the golden AMI |
 
 **Pool management is ASG-based and the reconciler is adopt-only.** The Launch
@@ -110,7 +110,7 @@ marks the `DevboxDoc` `Ready`. Boxes that never tag ready within `ready_timeout`
 and the ASG relaunches a replacement. Every box the reconciler creates is given
 a unique, memorable `adjective-noun` **name** (e.g. `calm-quilt`) — generated in
 `crates/devbox-server/src/naming.rs` from `aws_lc_rs::rand`. The name is shown in
-the dashboard/CLI and is a global selector: `devbox ssh|release|status <name>`
+the dashboard/CLI and is a global selector: `devbox ssh|release|status|rename <name>`
 resolves a box by name (or id). A claimant may override it via the claim body's
 optional `name` (validated by `is_valid_devbox_name`); uniqueness across
 non-terminated boxes is enforced atomically by
@@ -165,10 +165,10 @@ cargo run --bin devbox-server          # serves http://localhost:3000
 | Need | Location |
 |------|----------|
 | Shared types | `crates/devbox-common/src/lib.rs` |
-| CLI (incl. `ssh` over SSM) | `crates/devbox-cli/src/main.rs`, `crates/devbox-cli/src/ssh.rs`, `crates/devbox-cli/src/ssm.rs` (native data channel) |
+| CLI (incl. `ssh` over SSM) | `crates/devbox-cli/src/main.rs` (Clap definitions), `crates/devbox-cli/src/command.rs` (handlers), `crates/devbox-cli/src/ssh.rs`, `crates/devbox-cli/src/ssm.rs` (native data channel) |
 | On-host agent (principals / owner-sync / warmup) | `crates/devbox-agent/src/` |
 | Server entry / config / shutdown | `crates/devbox-server/src/main.rs` |
-| HTTP routes | `crates/devbox-server/src/routes.rs` |
+| HTTP routes | `crates/devbox-server/src/routes.rs`, `crates/devbox-server/src/service.rs` (domain logic) |
 | Dashboard UI | `crates/devbox-server/src/ui.rs` |
 | Reconciler (loop, tick, config, lock) | `crates/devbox-server/src/reconcile/` |
 | AWS compute trait + impl + mock | `crates/devbox-server/src/compute/` |
@@ -185,12 +185,13 @@ cargo run --bin devbox-server          # serves http://localhost:3000
 | `GET /api/v1/devboxes/{id}` | Get one devbox |
 | `POST /api/v1/devboxes/claim` | Claim a Ready devbox (body: optional `name` override; `owner` from token) |
 | `POST /api/v1/devboxes/{id}/release` | Release a Claimed devbox (no body; `owner` from token) |
+| `POST /api/v1/devboxes/{id}/rename` | Rename a Claimed devbox (body: `name`; `owner` from token) |
 | `GET /api/v1/pool/metrics` | Pool counts vs target |
 | `GET /` | HTML dashboard |
 
 ## Status: implemented vs planned
 
-**Implemented:** API + CLI (claim/release/list/status/**ssh**), document store over
+**Implemented:** API + CLI (claim/release/rename/list/status/**ssh**), document store over
 SQLite/DSQL with optimistic concurrency, **adopt-only** ASG reconciler (adopts the
 Terraform ASG by name, syncs membership, maintains desired capacity, scale-in
 protection, `devbox:owner` tagging via `apply_pending_owner_tags`), graceful
