@@ -383,29 +383,28 @@ pub(crate) async fn cmd_release(
     }
 }
 
-/// Rename the caller's claimed devbox to a new name.
+/// Rename the devbox identified by `target` (name or id) to `new_name`.
 ///
-/// Validates `name` locally (fast-fail before a round-trip), resolves the
-/// target box, and POSTs to the rename endpoint. On success, prints the
+/// Validates `new_name` locally before the round-trip; on success prints the
 /// renamed box.
 pub(crate) async fn cmd_rename(
     http: &reqwest::Client,
     server: &str,
-    name: String,
-    target: Option<String>,
+    target: String,
+    new_name: String,
 ) -> Result<()> {
     let session = require_session(server)?;
     // Normalize and validate locally; server validates authoritatively too.
-    let name = name.trim().to_string();
-    if !is_valid_devbox_name(&name) {
+    let new_name = new_name.trim().to_string();
+    if !is_valid_devbox_name(&new_name) {
         bail!(
-            "invalid name '{name}': use 1-32 lowercase letters, digits, \
+            "invalid name '{new_name}': use 1-32 lowercase letters, digits, \
              '_' or '-', not starting with '-'"
         );
     }
-    let id = resolve_target(target, server, http, &session).await?;
+    let id = resolve_target(Some(target), server, http, &session).await?;
     let url = format!("{server}/api/v1/devboxes/{id}/rename");
-    let req = RenameRequest { name };
+    let req = RenameRequest { name: new_name };
     let resp = with_auth(http.post(&url).json(&req), &session.token)
         .send()
         .await

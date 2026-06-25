@@ -47,11 +47,10 @@ enum Commands {
     },
     /// Rename a claimed devbox.
     Rename {
+        /// Devbox name or id to rename.
+        target: String,
         /// New name for the box (lowercase letters, digits, '_' and '-').
-        name: String,
-        /// Devbox name or id to rename (defaults to your active claim).
-        #[arg(long)]
-        target: Option<String>,
+        new_name: String,
     },
     /// List all devboxes.
     List,
@@ -113,8 +112,8 @@ async fn main() -> Result<()> {
         Commands::Release { target } => {
             command::cmd_release(&http, &server, target).await?;
         }
-        Commands::Rename { name, target } => {
-            command::cmd_rename(&http, &server, name, target).await?;
+        Commands::Rename { target, new_name } => {
+            command::cmd_rename(&http, &server, target, new_name).await?;
         }
         Commands::List => {
             command::cmd_list(&http, &server).await?;
@@ -168,24 +167,19 @@ mod tests {
     }
 
     #[test]
-    fn rename_parses_name_positional() {
-        let cli = Cli::try_parse_from(["devbox", "rename", "my-feature"]).unwrap();
+    fn rename_parses_mv_style_positionals() {
+        let cli = Cli::try_parse_from(["devbox", "rename", "calm-quilt", "my-feature"]).unwrap();
         assert!(matches!(
             &cli.command,
-            Commands::Rename { name, target }
-                if name == "my-feature" && target.is_none()
+            Commands::Rename { target, new_name }
+                if target == "calm-quilt" && new_name == "my-feature"
         ));
     }
 
     #[test]
-    fn rename_parses_name_with_target() {
-        let cli = Cli::try_parse_from(["devbox", "rename", "my-feature", "--target", "calm-quilt"])
-            .unwrap();
-        assert!(matches!(
-            &cli.command,
-            Commands::Rename { name, target }
-                if name == "my-feature" && target.as_deref() == Some("calm-quilt")
-        ));
+    fn rename_single_positional_is_error() {
+        // Missing required <NEW_NAME> must be a parse error.
+        assert!(Cli::try_parse_from(["devbox", "rename", "my-feature"]).is_err());
     }
 
     #[test]
