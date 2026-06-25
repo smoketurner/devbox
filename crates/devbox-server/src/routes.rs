@@ -1,4 +1,8 @@
 //! HTTP route handlers.
+//!
+//! This module is the Axum boundary only. Handlers here extract request data,
+//! call into [`crate::service`] for all business logic, and map the result to
+//! an HTTP response. No domain logic lives here.
 
 use std::sync::Arc;
 
@@ -10,16 +14,15 @@ use axum::routing::{get, post};
 use axum::{Extension, Router};
 
 use devbox_common::{
-    ClaimRequest, DEVBOX_NAME_MAX_LEN, DevboxListResponse, DevboxResponse, DevboxState,
-    HealthResponse, PoolMetricsResponse, ProtectedResourceMetadata, is_valid_devbox_name,
+    ClaimRequest, DevboxListResponse, DevboxResponse, HealthResponse, PoolMetricsResponse,
+    ProtectedResourceMetadata, RenameRequest,
 };
 
 use crate::auth::{Authenticator, Principal};
-use crate::db::document_type::Document;
-use crate::db::{DocumentStore, UpdateOutcome};
 use crate::documents::devbox::DevboxDoc;
 use crate::error::{AppError, JsonBody};
 use crate::reconcile::ReconcilerConfig;
+use crate::service;
 use crate::ui::build_ui_router;
 
 /// Application state shared across handlers.
@@ -29,7 +32,7 @@ use crate::ui::build_ui_router;
 /// `Arc`. `store` is the exception: it is also held by the background reconciler
 /// task, so it stays `Arc<DocumentStore>`.
 pub struct AppState {
-    pub store: Arc<DocumentStore>,
+    pub store: Arc<crate::db::DocumentStore>,
     pub reconciler_config: ReconcilerConfig,
     /// Every API endpoint requires an authenticated principal (only `/health` and
     /// the RFC 9728 discovery document are open). Claim/release additionally bind
@@ -76,9 +79,10 @@ pub fn build_router(state: SharedState) -> Router {
     let api = Router::new()
         .route("/api/v1/devboxes", get(list_devboxes))
         .route("/api/v1/devboxes/{id}", get(get_devbox))
-        .route("/api/v1/devboxes/claim", post(claim_devbox))
-        .route("/api/v1/devboxes/{id}/release", post(release_devbox))
-        .route("/api/v1/pool/metrics", get(pool_metrics))
+        .route("/api/v1/devboxes/claim", post(handle_claim))
+        .route("/api/v1/devboxes/{id}/release", post(handle_release))
+        .route("/api/v1/devboxes/{id}/rename", post(handle_rename))
+        .route("/api/v1/pool/metrics", get(handle_pool_metrics))
         .route_layer(from_fn_with_state(state.clone(), require_auth));
 
     Router::new()
@@ -156,215 +160,43 @@ async fn get_devbox(
     Ok(Json(doc.into()))
 }
 
-/// Validate an optional name override for a claim.
-///
-/// A blank or absent value yields `None` (the box keeps its auto name). A
-/// non-blank value must satisfy [`is_valid_devbox_name`] (`400` otherwise).
-/// Uniqueness is *not* checked here — it is enforced atomically at claim time by
-/// [`DocumentStore::compare_and_update_unique`](crate::db::DocumentStore::compare_and_update_unique).
-fn validate_name_override(raw: Option<&str>) -> Result<Option<String>, AppError> {
-    let Some(name) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
-        return Ok(None);
-    };
-
-    if !is_valid_devbox_name(name) {
-        return Err(AppError::BadRequest(format!(
-            "invalid name '{name}': use 1-{DEVBOX_NAME_MAX_LEN} lowercase letters, \
-             digits, '_' or '-', not starting with '-'"
-        )));
-    }
-
-    Ok(Some(name.to_string()))
-}
-
-/// Claim a Ready box for `owner`, optionally renaming it to `name`.
-///
-/// Shared by the JSON API and the HTML dashboard. When a name override is given,
-/// each candidate is claimed via [`compare_and_update_unique`](crate::db::DocumentStore::compare_and_update_unique),
-/// which checks the name and writes the claim in one transaction — so two
-/// concurrent claimants of the same name cannot both win (the DB rejects the
-/// loser). A `DuplicateValue` means some live box already holds the name; the
-/// loop continues, because that box may itself be a later candidate (the
-/// uniqueness check excludes the box being claimed, so claiming it succeeds).
-/// Only if no candidate can take the name does the claim fail with a `409`.
-/// Without an override the box keeps its reconciler-assigned unique name, so a
-/// plain version-guarded claim suffices.
-pub(crate) async fn claim_a_devbox(
-    state: &AppState,
-    owner: &str,
-    name: Option<&str>,
-) -> Result<Document<DevboxDoc>, AppError> {
-    let name_override = validate_name_override(name)?;
-
-    let ready_docs = state.store.find_all::<DevboxDoc>("state", "ready").await?;
-    if ready_docs.is_empty() {
-        return Err(AppError::Conflict("no devboxes available".into()));
-    }
-
-    // Sort candidates by created_at ascending (longest-waiting first).
-    let mut candidates = ready_docs;
-    candidates.sort_by_key(|a| a.data.created_at);
-
-    // Set once a candidate reports the name as already held, so an exhausted
-    // loop reports "name in use" rather than the generic pool message.
-    let mut name_in_use = false;
-
-    for candidate in candidates {
-        let mut updated = candidate.data.clone();
-        updated.state = DevboxState::Claimed;
-        updated.owner = Some(owner.to_string());
-        updated.claimed_at = Some(jiff::Timestamp::now());
-        updated.owner_tag_applied = false;
-
-        let claimed = match name_override {
-            Some(ref name) => {
-                updated.name = name.clone();
-                match state
-                    .store
-                    .compare_and_update_unique(
-                        &candidate.id,
-                        candidate.version,
-                        &updated,
-                        "name",
-                        name,
-                    )
-                    .await?
-                {
-                    UpdateOutcome::Updated => true,
-                    // Another claimer took this box; try the next candidate.
-                    UpdateOutcome::VersionMismatch => continue,
-                    // The name is held by another box. If that box is itself a
-                    // later candidate we'll reach it and claim it; otherwise the
-                    // loop exhausts and we report the name as in use.
-                    UpdateOutcome::DuplicateValue => {
-                        name_in_use = true;
-                        continue;
-                    }
-                }
-            }
-            None => {
-                state
-                    .store
-                    .compare_and_update(&candidate.id, candidate.version, &updated)
-                    .await?
-            }
-        };
-
-        if claimed {
-            let refreshed = state
-                .store
-                .get::<DevboxDoc>(&candidate.id)
-                .await?
-                .ok_or_else(|| {
-                    AppError::Internal(anyhow::anyhow!("devbox vanished after claim"))
-                })?;
-            return Ok(refreshed);
-        }
-    }
-
-    match name_override {
-        Some(name) if name_in_use => Err(AppError::Conflict(format!(
-            "name '{name}' is already in use"
-        ))),
-        _ => Err(AppError::Conflict(
-            "pool exhausted: all candidates failed concurrent claim".into(),
-        )),
-    }
-}
-
-/// Claim an available devbox.
-async fn claim_devbox(
+/// HTTP adapter: claim an available devbox.
+async fn handle_claim(
     State(state): State<SharedState>,
     Extension(principal): Extension<Principal>,
     JsonBody(req): JsonBody<ClaimRequest>,
 ) -> Result<Json<DevboxResponse>, AppError> {
-    let doc = claim_a_devbox(&state, &principal.0, req.name.as_deref()).await?;
+    let doc = service::claim_devbox(&state, &principal.0, req.name.as_deref()).await?;
     Ok(Json(doc.into()))
 }
 
-/// Release a claimed devbox.
-async fn release_devbox(
+/// HTTP adapter: release a claimed devbox.
+async fn handle_release(
     State(state): State<SharedState>,
     Path(id): Path<String>,
     Extension(principal): Extension<Principal>,
 ) -> Result<Json<DevboxResponse>, AppError> {
-    let caller = principal.0;
-
-    let doc = state
-        .store
-        .get::<DevboxDoc>(&id)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("devbox '{id}' not found")))?;
-
-    if doc.data.state != DevboxState::Claimed {
-        return Err(AppError::Conflict(format!(
-            "cannot release devbox in '{}' state",
-            doc.data.state
-        )));
-    }
-
-    let current_owner = doc.data.owner.as_deref().unwrap_or("");
-    if current_owner != caller {
-        return Err(AppError::Forbidden("ownership mismatch".into()));
-    }
-
-    let mut updated = doc.data.clone();
-    updated.state = DevboxState::Terminating;
-    // Free the name immediately so it can be reused on a fresh claim.
-    updated.name = String::new();
-
-    let success = state
-        .store
-        .compare_and_update(&doc.id, doc.version, &updated)
-        .await?;
-    if !success {
-        return Err(AppError::Conflict(
-            "devbox was modified concurrently".into(),
-        ));
-    }
-
-    let refreshed = state
-        .store
-        .get::<DevboxDoc>(&id)
-        .await?
-        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("devbox vanished after release")))?;
-    Ok(Json(refreshed.into()))
+    let doc = service::release_devbox(&state, &principal.0, &id).await?;
+    Ok(Json(doc.into()))
 }
 
-/// Get pool metrics.
-async fn pool_metrics(
+/// HTTP adapter: rename a claimed devbox.
+async fn handle_rename(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    Extension(principal): Extension<Principal>,
+    JsonBody(req): JsonBody<RenameRequest>,
+) -> Result<Json<DevboxResponse>, AppError> {
+    let doc = service::rename_devbox(&state, &principal.0, &id, &req.name).await?;
+    Ok(Json(doc.into()))
+}
+
+/// HTTP adapter: return pool metrics.
+async fn handle_pool_metrics(
     State(state): State<SharedState>,
 ) -> Result<Json<PoolMetricsResponse>, AppError> {
-    let docs = state.store.list_all::<DevboxDoc>().await?;
-
-    let mut warming = 0u32;
-    let mut ready = 0u32;
-    let mut claimed = 0u32;
-    let mut terminating = 0u32;
-
-    for doc in &docs {
-        match doc.data.state {
-            DevboxState::Launching => {}
-            DevboxState::Warming => warming = warming.saturating_add(1),
-            DevboxState::Ready => ready = ready.saturating_add(1),
-            DevboxState::Claimed => claimed = claimed.saturating_add(1),
-            DevboxState::Terminating => terminating = terminating.saturating_add(1),
-        }
-    }
-
-    let target = state.reconciler_config.target_warm_pool_size;
-    let ready_delta = i32::try_from(target)
-        .unwrap_or(i32::MAX)
-        .saturating_sub(i32::try_from(ready).unwrap_or(0));
-
-    Ok(Json(PoolMetricsResponse {
-        warming,
-        ready,
-        claimed,
-        terminating,
-        target_warm_pool_size: target,
-        ready_delta,
-    }))
+    let metrics = service::pool_metrics(&state).await?;
+    Ok(Json(metrics))
 }
 
 #[cfg(test)]
@@ -383,10 +215,13 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    use crate::auth::Authenticator;
+    use crate::db::DocumentStore;
     use crate::db::migrations::run_sqlite_migrations;
     use crate::db::pool::Pool;
-
-    use crate::auth::Authenticator;
+    use crate::documents::devbox::DevboxDoc;
+    use crate::error::AppError;
+    use crate::reconcile::ReconcilerConfig;
 
     /// Build an `AppState` over a single-connection in-memory SQLite store
     /// (`max_connections(1)`, so concurrent handler calls share one database)
@@ -450,7 +285,7 @@ mod tests {
         DevboxDoc {
             instance_id: "i-1234567890abcdef0".to_string(),
             name: "calm-quilt".to_string(),
-            state: DevboxState::Ready,
+            state: devbox_common::DevboxState::Ready,
             instance_type: InstanceType("m5.large".to_string()),
             ami_id: AmiId("ami-12345678".to_string()),
             subnet_id: SubnetId("subnet-12345678".to_string()),
@@ -475,262 +310,10 @@ mod tests {
         }
     }
 
-    fn claim() -> ClaimRequest {
-        ClaimRequest { name: None }
-    }
-
-    fn claim_named(name: &str) -> ClaimRequest {
-        ClaimRequest {
-            name: Some(name.to_string()),
-        }
-    }
-
-    /// A second ready box with a distinct instance id and name, so tests that
-    /// need two candidates don't collide on the unique `instance_id` index.
-    fn ready_devbox_other() -> DevboxDoc {
-        let mut doc = ready_devbox();
-        doc.instance_id = "i-0987654321fedcba0".to_string();
-        doc.name = "brave-otter".to_string();
-        doc
-    }
-
     /// `Extension<Principal>` the auth middleware would have injected — supplied
     /// directly here so handler-logic tests bypass the (separately tested) layer.
     fn principal(owner: &str) -> Extension<Principal> {
         Extension(Principal(owner.to_string()))
-    }
-
-    #[tokio::test]
-    async fn claim_marks_box_claimed_and_binds_owner() {
-        let state = setup_state().await;
-        insert(&state, ready_devbox()).await;
-
-        let body = claim_devbox(State(state), principal("jdoe"), JsonBody(claim()))
-            .await
-            .ok()
-            .unwrap()
-            .0;
-
-        assert_eq!(body.state, DevboxState::Claimed);
-        assert_eq!(body.owner.as_deref(), Some("jdoe"));
-        // The instance's region (from instance metadata, carried on the doc) is
-        // surfaced so the CLI can open the SSM tunnel without client-side config.
-        assert_eq!(body.region, "us-east-1");
-    }
-
-    #[tokio::test]
-    async fn claim_keeps_auto_name_when_no_override() {
-        let state = setup_state().await;
-        insert(&state, ready_devbox()).await;
-
-        let body = claim_devbox(State(state), principal("jdoe"), JsonBody(claim()))
-            .await
-            .ok()
-            .unwrap()
-            .0;
-
-        assert_eq!(body.name, "calm-quilt");
-    }
-
-    #[tokio::test]
-    async fn claim_applies_valid_name_override() {
-        let state = setup_state().await;
-        insert(&state, ready_devbox()).await;
-
-        let body = claim_devbox(
-            State(state),
-            principal("jdoe"),
-            JsonBody(claim_named("my-project")),
-        )
-        .await
-        .ok()
-        .unwrap()
-        .0;
-
-        assert_eq!(body.name, "my-project");
-        assert_eq!(body.state, DevboxState::Claimed);
-    }
-
-    #[tokio::test]
-    async fn claim_blank_override_keeps_auto_name() {
-        let state = setup_state().await;
-        insert(&state, ready_devbox()).await;
-
-        let body = claim_devbox(
-            State(state),
-            principal("jdoe"),
-            JsonBody(claim_named("   ")),
-        )
-        .await
-        .ok()
-        .unwrap()
-        .0;
-
-        assert_eq!(body.name, "calm-quilt");
-    }
-
-    #[tokio::test]
-    async fn claim_invalid_name_is_bad_request() {
-        let state = setup_state().await;
-        insert(&state, ready_devbox()).await;
-
-        let status = status_of(
-            claim_devbox(
-                State(state),
-                principal("jdoe"),
-                JsonBody(claim_named("Bad Name")),
-            )
-            .await,
-        );
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn claim_name_matching_a_ready_box_claims_that_box() {
-        // A ready box already carries the requested name, and an older box with a
-        // different name sorts ahead of it. The claim must succeed by claiming the
-        // box that holds the name — not abort because the older candidate can't
-        // take it.
-        let state = setup_state().await;
-        // Older candidate, different name → tried first.
-        let mut older = ready_devbox_other();
-        older.created_at = Timestamp::from_second(0).unwrap();
-        older.name = "older-box".to_string();
-        insert(&state, older).await;
-        // The box that already has the requested name (i-1234…, "calm-quilt").
-        insert(&state, ready_devbox()).await;
-
-        let body = claim_devbox(
-            State(state),
-            principal("jdoe"),
-            JsonBody(claim_named("calm-quilt")),
-        )
-        .await
-        .ok()
-        .unwrap()
-        .0;
-
-        assert_eq!(body.name, "calm-quilt");
-        assert_eq!(
-            body.instance_id, "i-1234567890abcdef0",
-            "must claim the box that already holds the name"
-        );
-        assert_eq!(body.state, DevboxState::Claimed);
-    }
-
-    #[tokio::test]
-    async fn claim_duplicate_name_is_conflict() {
-        let state = setup_state().await;
-        // An already-claimed box named "taken".
-        let mut existing = ready_devbox_other();
-        existing.state = DevboxState::Claimed;
-        existing.owner = Some("alice".to_string());
-        existing.name = "taken".to_string();
-        insert(&state, existing).await;
-        // A ready box to claim with the colliding name.
-        insert(&state, ready_devbox()).await;
-
-        let status = status_of(
-            claim_devbox(
-                State(state),
-                principal("jdoe"),
-                JsonBody(claim_named("taken")),
-            )
-            .await,
-        );
-        assert_eq!(status, StatusCode::CONFLICT);
-    }
-
-    #[tokio::test]
-    async fn concurrent_named_claims_do_not_duplicate_a_name() {
-        // Two ready boxes, two simultaneous claims for the same name. Exactly one
-        // must win the name; the other must be rejected and its box returned to
-        // the pool — never two boxes sharing a name (the selector guarantee).
-        let state = setup_state().await;
-        insert(&state, ready_devbox()).await;
-        insert(&state, ready_devbox_other()).await;
-
-        let (r1, r2) = tokio::join!(
-            claim_devbox(
-                State(state.clone()),
-                principal("jdoe"),
-                JsonBody(claim_named("shared")),
-            ),
-            claim_devbox(
-                State(state.clone()),
-                principal("jdoe"),
-                JsonBody(claim_named("shared")),
-            ),
-        );
-
-        let statuses = [status_of(r1), status_of(r2)];
-        assert!(
-            statuses
-                .iter()
-                .all(|s| *s == StatusCode::OK || *s == StatusCode::CONFLICT),
-            "each claim resolves to OK or CONFLICT, got {statuses:?}"
-        );
-        let ok = statuses.iter().filter(|s| **s == StatusCode::OK).count();
-        // A later committer always observes an earlier one, so at most one wins;
-        // a contended loser is rejected (and may, rarely, leave both rejected).
-        assert!(ok <= 1, "at most one named claim may win");
-
-        // The safety property: the name is held by exactly as many live boxes as
-        // claims won — never two (which would break the `ssh <name>` selector).
-        let holders = state
-            .store
-            .find_all::<DevboxDoc>("name", "shared")
-            .await
-            .unwrap();
-        let live = holders
-            .iter()
-            .filter(|d| d.data.state != DevboxState::Terminating)
-            .count();
-        assert_eq!(
-            live, ok,
-            "a name must be held by exactly the winner (0 or 1)"
-        );
-    }
-
-    #[tokio::test]
-    async fn claim_empty_pool_is_conflict() {
-        let state = setup_state().await;
-        let status =
-            status_of(claim_devbox(State(state), principal("jdoe"), JsonBody(claim())).await);
-        assert_eq!(status, StatusCode::CONFLICT);
-    }
-
-    #[tokio::test]
-    async fn concurrent_claims_yield_one_winner_one_conflict() {
-        let state = setup_state().await;
-        insert(&state, ready_devbox()).await;
-
-        let (r1, r2) = tokio::join!(
-            claim_devbox(State(state.clone()), principal("jdoe"), JsonBody(claim())),
-            claim_devbox(State(state.clone()), principal("jdoe"), JsonBody(claim())),
-        );
-
-        let statuses = [status_of(r1), status_of(r2)];
-        let ok = statuses.iter().filter(|s| **s == StatusCode::OK).count();
-        let conflict = statuses
-            .iter()
-            .filter(|s| **s == StatusCode::CONFLICT)
-            .count();
-        assert_eq!(ok, 1, "exactly one claim must win");
-        assert_eq!(conflict, 1, "the loser must get 409 Conflict");
-    }
-
-    #[tokio::test]
-    async fn release_by_non_owner_is_forbidden() {
-        // Box owned by alice; caller is bob.
-        let state = setup_state().await;
-        let mut doc = ready_devbox();
-        doc.state = DevboxState::Claimed;
-        doc.owner = Some("alice".to_string());
-        let id = insert(&state, doc).await;
-
-        let status = status_of(release_devbox(State(state), Path(id), principal("bob")).await);
-        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -778,15 +361,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn release_of_unclaimed_box_is_conflict() {
-        let state = setup_state().await;
-        let id = insert(&state, ready_devbox()).await;
-
-        let status = status_of(release_devbox(State(state), Path(id), principal("jdoe")).await);
-        assert_eq!(status, StatusCode::CONFLICT);
-    }
-
-    #[tokio::test]
     async fn list_returns_devboxes() {
         let state = setup_state().await;
         insert(&state, ready_devbox()).await;
@@ -815,37 +389,60 @@ mod tests {
         for (method, uri) in [
             ("GET", "/api/v1/devboxes"),
             ("GET", "/api/v1/devboxes/any-id"),
-            ("GET", "/api/v1/pool/metrics"),
             ("POST", "/api/v1/devboxes/claim"),
             ("POST", "/api/v1/devboxes/any-id/release"),
+            ("POST", "/api/v1/devboxes/any-id/rename"),
+            ("GET", "/api/v1/pool/metrics"),
         ] {
-            let status = router_status(setup_state_no_principal().await, method, uri).await;
+            let state = setup_state_no_principal().await;
             assert_eq!(
-                status,
+                router_status(state, method, uri).await,
                 StatusCode::UNAUTHORIZED,
-                "{method} {uri} must be 401"
+                "expected 401 for {method} {uri}"
             );
         }
     }
 
     #[tokio::test]
-    async fn health_and_discovery_stay_open() {
-        // The two endpoints deliberately outside the auth layer answer without a
-        // credential.
-        for uri in ["/health", "/.well-known/oauth-protected-resource"] {
-            let status = router_status(setup_state_no_principal().await, "GET", uri).await;
-            assert_eq!(status, StatusCode::OK, "{uri} must stay open");
+    async fn open_routes_need_no_auth() {
+        // /health and the discovery document are open by design.
+        for (method, uri) in [
+            ("GET", "/health"),
+            ("GET", "/.well-known/oauth-protected-resource"),
+        ] {
+            let state = setup_state_no_principal().await;
+            let status = router_status(state, method, uri).await;
+            assert_ne!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "expected open access for {method} {uri}, got {status}"
+            );
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Thin handler smoke tests: verify HTTP adapter wiring, not domain logic.
+    // Domain behaviour is covered by service::tests.
+    // -----------------------------------------------------------------------
+
     #[tokio::test]
-    async fn authenticated_api_read_passes_the_layer() {
-        // with_test_owner authenticates every request, so the layer admits it and
-        // the read handler responds 200 — proving the layer passes traffic through,
-        // not just blocks it.
+    async fn handle_release_of_unclaimed_box_is_conflict() {
         let state = setup_state().await;
-        insert(&state, ready_devbox()).await;
-        let status = router_status(state, "GET", "/api/v1/devboxes").await;
-        assert_eq!(status, StatusCode::OK);
+        let id = insert(&state, ready_devbox()).await;
+
+        let status = status_of(handle_release(State(state), Path(id), principal("jdoe")).await);
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn handle_release_by_non_owner_is_forbidden() {
+        let state = setup_state().await;
+        let mut doc = ready_devbox();
+        doc.state = devbox_common::DevboxState::Claimed;
+        doc.owner = Some("alice".to_string());
+        let id = insert(&state, doc).await;
+
+        let status = status_of(handle_release(State(state), Path(id), principal("bob")).await);
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 }

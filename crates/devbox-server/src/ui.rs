@@ -17,7 +17,7 @@ use crate::auth::{SessionUser, random_token};
 use crate::db::document_type::Document;
 use crate::documents::devbox::DevboxDoc;
 use crate::routes::{AppState, SharedState};
-use devbox_common::{DevboxState, format_timestamp};
+use devbox_common::format_timestamp;
 
 /// Cookie holding the Vouch OIDC ID token after a successful dashboard login.
 const SESSION_COOKIE: &str = "devbox_session";
@@ -177,6 +177,13 @@ pub struct DashboardDevbox {
 #[derive(serde::Deserialize)]
 struct ClaimFormData {
     name: Option<String>,
+}
+
+/// Form data for renaming a devbox. The name is required (the rename form
+/// always has a non-empty input).
+#[derive(serde::Deserialize)]
+struct RenameFormData {
+    name: String,
 }
 
 // ============================================================================
@@ -375,6 +382,7 @@ pub fn build_ui_router() -> Router<SharedState> {
         .route("/devboxes/claim", get(claim_form).post(submit_claim))
         .route("/devboxes/{id}", get(devbox_detail))
         .route("/devboxes/{id}/release", post(submit_release))
+        .route("/devboxes/{id}/rename", post(submit_rename))
         .route("/static/{*path}", get(static_asset))
 }
 
@@ -477,7 +485,7 @@ async fn submit_claim(
     // Claim through the shared routine (validation, uniqueness, and the
     // race-safe re-check all live there). On failure, re-render the form with
     // the same message the API would return, echoing back the typed name.
-    match crate::routes::claim_a_devbox(&state, &owner, form.name.as_deref()).await {
+    match crate::service::claim_devbox(&state, &owner, form.name.as_deref()).await {
         Ok(doc) => Redirect::to(&format!("/devboxes/{}", doc.id)).into_response(),
         Err(e) => ClaimFormTemplate {
             name: form.name,
@@ -501,62 +509,58 @@ async fn submit_release(
         Ok(user) => user,
         Err(redirect) => return redirect,
     };
-    let doc = match state.store.get::<DevboxDoc>(&id).await {
-        Ok(Some(doc)) => doc,
-        Ok(None) => {
-            return ErrorPageTemplate {
-                title: "Not Found".to_string(),
-                message: format!("Devbox '{id}' not found."),
-            }
-            .into_response();
-        }
+
+    match crate::service::release_devbox(&state, &user.principal, &id).await {
+        Ok(_) => Redirect::to(&format!("/devboxes/{id}")).into_response(),
         Err(e) => {
-            return ErrorPageTemplate {
-                title: "Error".to_string(),
-                message: format!("Failed to load devbox: {e}"),
-            }
-            .into_response();
-        }
-    };
-
-    if doc.data.state != DevboxState::Claimed {
-        return DevboxDetailTemplate {
-            devbox: doc.into(),
-            error: Some("Cannot release devbox in current state.".to_string()),
-        }
-        .into_response();
-    }
-
-    // Only the claimant may release.
-    let owner = doc.data.owner.clone().unwrap_or_default();
-    if user.principal != owner {
-        return DevboxDetailTemplate {
-            devbox: doc.into(),
-            error: Some("You can only release a devbox you claimed.".to_string()),
-        }
-        .into_response();
-    }
-
-    let mut updated = doc.data.clone();
-    updated.state = DevboxState::Terminating;
-    updated.owner = None;
-    // Free the name immediately so it can be reused on a fresh claim.
-    updated.name = String::new();
-
-    match state.store.update(&id, &updated).await {
-        Ok(()) => Redirect::to(&format!("/devboxes/{id}")).into_response(),
-        Err(e) => {
-            // Re-fetch for template
+            // Re-fetch so the template reflects the current box state.
             let refreshed = state.store.get::<DevboxDoc>(&id).await.ok().flatten();
             match refreshed {
-                Some(refreshed_doc) => DevboxDetailTemplate {
-                    devbox: refreshed_doc.into(),
-                    error: Some(format!("Release failed: {e}")),
+                Some(doc) => DevboxDetailTemplate {
+                    devbox: doc.into(),
+                    error: Some(e.user_message()),
                 }
                 .into_response(),
                 None => ErrorPageTemplate {
-                    title: "Error".to_string(),
-                    message: format!("Release failed: {e}"),
+                    title: "Not Found".to_string(),
+                    message: format!("Devbox '{id}' not found."),
+                }
+                .into_response(),
+            }
+        }
+    }
+}
+
+/// Process the rename form submission from the detail page.
+///
+/// POST /devboxes/{id}/rename
+async fn submit_rename(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<RenameFormData>,
+) -> Response {
+    // Gate before loading the devbox so unauthenticated POSTs can't probe its
+    // existence/metadata (consistent with submit_release).
+    let user = match require_login(&state, &headers).await {
+        Ok(user) => user,
+        Err(redirect) => return redirect,
+    };
+
+    match crate::service::rename_devbox(&state, &user.principal, &id, &form.name).await {
+        Ok(_) => Redirect::to(&format!("/devboxes/{id}")).into_response(),
+        Err(e) => {
+            // Re-fetch the doc so the template reflects current state.
+            let refreshed = state.store.get::<DevboxDoc>(&id).await.ok().flatten();
+            match refreshed {
+                Some(doc) => DevboxDetailTemplate {
+                    devbox: doc.into(),
+                    error: Some(e.user_message()),
+                }
+                .into_response(),
+                None => ErrorPageTemplate {
+                    title: "Not Found".to_string(),
+                    message: format!("Devbox '{id}' not found."),
                 }
                 .into_response(),
             }
