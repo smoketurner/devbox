@@ -105,15 +105,14 @@ async fn tick(client: &Client) -> Result<Pass> {
         }
         Decision::Provision(owner) => {
             ensure_user(&owner)?;
-            // Best-effort: the claimant's email rides on a separate tag. A read
-            // failure or absent tag just leaves the git identity unset.
-            match imds::instance_tag(client, "devbox:owner-email").await {
-                Ok(email) => configure_git_identity(&owner, email.as_deref()),
-                Err(e) => tracing::warn!(
-                    error = %format!("{e:#}"),
-                    "could not read devbox:owner-email; skipping git identity"
-                ),
-            }
+            // The email tag must be read before we finish. A transient IMDS error
+            // propagates so the poll loop retries instead of permanently skipping
+            // the git identity; an absent tag (`Ok(None)`) is final and just leaves
+            // it unset.
+            let email = imds::instance_tag(client, "devbox:owner-email")
+                .await
+                .context("read devbox:owner-email")?;
+            configure_git_identity(&owner, email.as_deref());
             Ok(Pass::Done)
         }
     }
