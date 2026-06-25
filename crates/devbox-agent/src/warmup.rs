@@ -4,6 +4,9 @@
 //! instance via `ec2:CreateTags`. The reconciler observes that tag and flips
 //! the `DevboxDoc` from `Warming` to `Ready`; only Ready boxes can be claimed.
 //!
+//! Warm-up starts Docker, freshens the snapshot-seeded repos under `/workspace`
+//! to near-HEAD (see [`crate::freshen`]), then tags the box ready.
+//!
 //! If warm-up fails the agent exits with a non-zero status. The reconciler's
 //! reaper terminates boxes that never become ready within `ready_timeout` and
 //! the ASG relaunches a replacement — no lifecycle-hook `ABANDON` signal needed.
@@ -13,6 +16,7 @@ use aws_config::BehaviorVersion;
 use aws_sdk_ec2::config::Region;
 use aws_sdk_ec2::types::Tag;
 
+use crate::freshen::{self, ReadyDecision};
 use crate::imds;
 
 /// Run warm-up and self-tag the instance `devbox:ready=true`.
@@ -24,8 +28,9 @@ use crate::imds;
 ///
 /// # Errors
 ///
-/// Returns an error if Docker fails to start, instance identity cannot be read
-/// from IMDS, or the `ec2:CreateTags` call fails.
+/// Returns an error if Docker fails to start, a required workspace is absent
+/// (snapshot failed to attach), instance identity cannot be read from IMDS, or
+/// the `ec2:CreateTags` call fails.
 pub(crate) async fn run() -> Result<()> {
     ensure_docker_running()?;
 
@@ -36,6 +41,13 @@ pub(crate) async fn run() -> Result<()> {
     let region = imds::get(&imds_client, "/latest/meta-data/placement/region")
         .await?
         .context("region unavailable from IMDS")?;
+
+    if freshen::freshen_workspace(&region).await == ReadyDecision::FailAndReap {
+        anyhow::bail!(
+            "workspace required but empty; snapshot likely failed to attach — leaving box \
+             un-tagged so the reconciler reaps it"
+        );
+    }
 
     let ec2_client = ec2_client(region).await;
     tag_ready(&ec2_client, &instance_id).await?;

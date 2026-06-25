@@ -1,0 +1,462 @@
+//! Workspace freshening: bring snapshot-seeded repos to near-HEAD before ready.
+//!
+//! A warm box launches with `/workspace` seeded from a periodically-refreshed EBS
+//! snapshot (provisioned by Terraform), so the repos are present but a few
+//! minutes-to-hours stale. During warm-up the agent fetches the small delta since
+//! the snapshot was cut and resets each repo to its upstream HEAD, so a claimant
+//! gets a near-HEAD checkout without paying a full clone at launch.
+//!
+//! The fetch is **read-only** — the agent mints a short-lived GitHub App
+//! installation token at warm-up (see [`crate::github_token`]) — and
+//! **time-budgeted**: if the delta is too large to land within the budget, the box
+//! still becomes Ready serving the snapshot-age checkout (degrade, don't reap) — a
+//! slightly-stale box beats no box, and the claimant can fetch HEAD themselves. The
+//! one hard failure is a workspace that was *required* (snapshot expected) but is
+//! absent: that means the snapshot failed to attach, so the box is left un-tagged
+//! for the reconciler to reap.
+
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use tokio::process::Command;
+
+/// Where the snapshot-seeded repositories live.
+const WORKSPACE: &str = "/workspace";
+
+/// Env var the credential helper reads the token from; the agent sets it on the
+/// git child from the freshly minted token (it is never baked or inherited).
+const TOKEN_ENV: &str = "DEVBOX_GITHUB_TOKEN";
+
+/// Environment variable that, when truthy, makes an empty `/workspace` a hard
+/// failure (the deployment seeds repos via snapshot, so empty means the snapshot
+/// did not attach). Unset/false preserves the no-snapshot behaviour: skip freshen.
+const REQUIRE_ENV: &str = "DEVBOX_REQUIRE_WORKSPACE";
+
+/// Environment variable overriding the overall fetch time budget, in seconds.
+const BUDGET_ENV: &str = "WARMUP_FETCH_TIMEOUT_SECS";
+
+/// Default overall budget for fetching all repos; stays well under `ready_timeout`.
+const DEFAULT_BUDGET: Duration = Duration::from_secs(120);
+
+/// Smallest budget worth granting the fetch. Below this we degrade instead of
+/// running: GNU `timeout`'s granularity is one second and a sub-second fetch is
+/// useless.
+const MIN_STEP: Duration = Duration::from_secs(1);
+
+/// Fixed cap for the local, near-instant reset/clean that follow a successful fetch.
+/// They're charged separately from the network budget so a fetch can never succeed
+/// while the working-tree reset is skipped.
+const LOCAL_GIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Inline git credential helper: emit `x-access-token` plus the token from the
+/// child environment. The token itself never appears in the process arguments —
+/// only the variable name does.
+const CREDENTIAL_HELPER: &str =
+    "!f() { echo username=x-access-token; echo \"password=$DEVBOX_GITHUB_TOKEN\"; }; f";
+
+/// What warm-up should do after attempting to freshen the workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadyDecision {
+    /// Tag the box ready: workspace is fresh, acceptably stale, or not seeded.
+    TagReady,
+    /// Leave the box un-tagged so the reconciler reaps it: a required workspace is
+    /// absent, so the snapshot almost certainly failed to attach.
+    FailAndReap,
+}
+
+/// Freshen every repository under `/workspace`, returning the readiness decision.
+///
+/// Each repo is fetched and hard-reset to its upstream HEAD within the shared time
+/// budget; a repo that errors or times out is left at its snapshot-age state and
+/// logged. The only outcome that withholds readiness is a required-but-empty
+/// workspace.
+pub(crate) async fn freshen_workspace(region: &str) -> ReadyDecision {
+    let repos = repos_under(Path::new(WORKSPACE));
+    let decision = classify(&repos, require_workspace());
+    if repos.is_empty() {
+        match decision {
+            ReadyDecision::FailAndReap => tracing::error!(
+                workspace = WORKSPACE,
+                "workspace required but no repositories present; snapshot likely failed to attach"
+            ),
+            ReadyDecision::TagReady => {
+                tracing::info!(
+                    workspace = WORKSPACE,
+                    "no repositories to freshen; skipping"
+                );
+            }
+        }
+        return decision;
+    }
+
+    let token = mint_token(region).await;
+    // One shared budget. Each git op is given the time *left* in it (see `run_git`),
+    // so once it's spent the remaining repos serve their snapshot-age checkout
+    // (already near-HEAD) and the box still goes Ready — better than hanging warm-up
+    // until the reaper kills the box.
+    let start = Instant::now();
+    let budget = fetch_budget();
+    for repo in &repos {
+        match freshen_repo(repo, token.as_deref(), start, budget).await {
+            Ok(()) => tracing::info!(repo = %repo.display(), "freshened to upstream HEAD"),
+            Err(e) => tracing::warn!(
+                repo = %repo.display(),
+                error = %format!("{e:#}"),
+                "stopped freshening repo; serving snapshot-age checkout"
+            ),
+        }
+    }
+    ReadyDecision::TagReady
+}
+
+/// Git repositories directly under `root`: `root` itself if it is a repo, otherwise
+/// each immediate child directory containing a `.git` entry. Sorted for determinism.
+fn repos_under(root: &Path) -> Vec<PathBuf> {
+    if root.join(".git").exists() {
+        return vec![root.to_path_buf()];
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut repos: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.join(".git").exists())
+        .collect();
+    repos.sort();
+    repos
+}
+
+/// Decide readiness from what was discovered. An empty, *required* workspace is the
+/// sole hard failure; everything else proceeds (degrade over reap).
+fn classify(repos: &[PathBuf], require_workspace: bool) -> ReadyDecision {
+    if repos.is_empty() && require_workspace {
+        ReadyDecision::FailAndReap
+    } else {
+        ReadyDecision::TagReady
+    }
+}
+
+/// Freshen one repo, clearing lock files a killed git op may leave so the box
+/// never goes Ready with a wedged repo.
+async fn freshen_repo(
+    repo: &Path,
+    token: Option<&str>,
+    start: Instant,
+    budget: Duration,
+) -> Result<()> {
+    clear_stale_locks(repo);
+    let outcome = fetch_reset_clean(repo, token, start, budget).await;
+    // A git op killed at the budget (or one that exits mid-write) can leave a
+    // `.git/*.lock` behind; warm-up still tags the box ready, so clear it now or
+    // the claimant inherits "Unable to create '.git/index.lock'".
+    clear_stale_locks(repo);
+    outcome
+}
+
+/// Fetch the delta since the snapshot, hard-reset to upstream HEAD, and drop stray
+/// untracked files. `clean -fd` (no `-x`) preserves ignored build caches (`target/`).
+async fn fetch_reset_clean(
+    repo: &Path,
+    token: Option<&str>,
+    start: Instant,
+    budget: Duration,
+) -> Result<()> {
+    // Only the network fetch is charged against the shared budget. If it's spent,
+    // skip the whole repo — don't fetch refs we then wouldn't reset onto.
+    let Some(fetch_timeout) = step_timeout(start, budget) else {
+        anyhow::bail!("fetch budget spent before {}", repo.display());
+    };
+    run_git(repo, token, &["fetch", "--prune", "origin"], fetch_timeout)
+        .await
+        .with_context(|| format!("git fetch in {}", repo.display()))?;
+    // reset/clean are local and near-instant; always run them after a successful
+    // fetch so the working tree actually advances (a fixed cap guards pathology).
+    run_git(repo, None, &["reset", "--hard", "@{u}"], LOCAL_GIT_TIMEOUT)
+        .await
+        .with_context(|| format!("git reset in {}", repo.display()))?;
+    run_git(repo, None, &["clean", "-fd"], LOCAL_GIT_TIMEOUT)
+        .await
+        .with_context(|| format!("git clean in {}", repo.display()))?;
+    Ok(())
+}
+
+/// Run `git -C <repo> <args>` under GNU `timeout <cap>`, so a stuck op is
+/// group-killed exactly at `cap` rather than orphaning git's process group the way
+/// an outer cancel-and-kill would.
+///
+/// `git fetch` spawns helpers (`git-remote-https`, …) in its process group; a
+/// parent-only kill would orphan them to keep doing network I/O and writing under
+/// `.git`. GNU `timeout` (AL2023 coreutils, like the `git`/`useradd`/`chown` the
+/// agent already shells out to) runs `git` in its own group and signals the whole
+/// group on expiry — SIGTERM first so `git` removes its own locks, then SIGKILL
+/// (`-k`) for stragglers.
+async fn run_git(repo: &Path, token: Option<&str>, args: &[&str], cap: Duration) -> Result<()> {
+    let mut cmd = Command::new("timeout");
+    cmd.arg("-k")
+        .arg("5")
+        .arg(cap.as_secs().max(1).to_string())
+        .arg("git")
+        .arg("-C")
+        .arg(repo);
+    if let Some(token) = token {
+        cmd.arg("-c")
+            .arg(format!("credential.helper={CREDENTIAL_HELPER}"))
+            .env(TOKEN_ENV, token);
+    }
+    // Never block on an interactive prompt if a credential is missing or rejected.
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
+        .args(args)
+        .kill_on_drop(true);
+
+    let status = cmd
+        .status()
+        .await
+        .with_context(|| format!("run timeout git {}", args.join(" ")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("git {} exited with {:?}", args.join(" "), status.code())
+    }
+}
+
+/// Time left in the shared budget, or `None` once too little remains to be worth
+/// granting (below `MIN_STEP`), so the caller degrades instead of running.
+fn step_timeout(start: Instant, budget: Duration) -> Option<Duration> {
+    let left = budget.saturating_sub(start.elapsed());
+    (left >= MIN_STEP).then_some(left)
+}
+
+/// Remove git `*.lock` files an interrupted or killed op may leave, so the fetch is
+/// re-entrant and the claimant never inherits a wedged repo.
+///
+/// Sweeps the top level of `.git` (`index.lock`, `packed-refs.lock`, `config.lock`,
+/// `FETCH_HEAD.lock`, `shallow.lock`, …) and recurses through `.git/refs` for
+/// per-ref locks. `.git/objects` is intentionally skipped — it holds no lock files
+/// and is the one subtree large enough to be worth not walking.
+fn clear_stale_locks(repo: &Path) {
+    let git_dir = repo.join(".git");
+    remove_lock_files(&git_dir, false);
+    remove_lock_files(&git_dir.join("refs"), true);
+}
+
+/// Remove every `*.lock` file directly in `dir`, recursing into subdirectories when
+/// `recurse` is set. Missing directories and individual removal errors are ignored
+/// (best-effort cleanup); only unexpected errors are logged.
+fn remove_lock_files(dir: &Path, recurse: bool) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            if recurse {
+                remove_lock_files(&path, true);
+            }
+            continue;
+        }
+        if path.extension().is_some_and(|ext| ext == "lock") {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::debug!(path = %path.display(), error = %e, "could not remove stale git lock");
+                }
+            }
+        }
+    }
+}
+
+/// Mint the read-only GitHub token for the fetch, degrading to unauthenticated
+/// (`None`) when the box isn't configured for it or minting fails — a private repo
+/// then fails to freshen and serves its snapshot-age checkout.
+async fn mint_token(region: &str) -> Option<String> {
+    match crate::github_token::installation_token(region).await {
+        Ok(Some(token)) => Some(token),
+        Ok(None) => {
+            tracing::warn!(
+                "GitHub App not configured; fetching without credentials (private repos won't freshen)"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "failed to mint GitHub token; fetching without credentials"
+            );
+            None
+        }
+    }
+}
+
+/// Whether an empty `/workspace` should fail warm-up (snapshot deployments).
+fn require_workspace() -> bool {
+    parse_require(std::env::var(REQUIRE_ENV).ok().as_deref())
+}
+
+/// The overall fetch budget from the environment, or the default.
+fn fetch_budget() -> Duration {
+    parse_budget(std::env::var(BUDGET_ENV).ok().as_deref())
+}
+
+/// Parse the fetch budget; a missing, zero, or unparseable value yields the default.
+fn parse_budget(value: Option<&str>) -> Duration {
+    value
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map_or(DEFAULT_BUDGET, Duration::from_secs)
+}
+
+/// Parse the require flag; only `1`/`true` (case-insensitive) are truthy.
+fn parse_require(value: Option<&str>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let value = value.trim();
+    value == "1" || value.eq_ignore_ascii_case("true")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DEFAULT_BUDGET, Duration, Instant, Path, PathBuf, ReadyDecision, classify,
+        clear_stale_locks, parse_budget, parse_require, repos_under, step_timeout,
+    };
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// A unique, empty temp directory for the calling test (no extra crates needed).
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test setup; a failure should fail the test"
+    )]
+    fn temp_root() -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("devbox-freshen-{}-{n}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test setup; a failure should fail the test"
+    )]
+    fn make_repo(parent: &Path, name: &str) {
+        std::fs::create_dir_all(parent.join(name).join(".git")).unwrap();
+    }
+
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test setup; a failure should fail the test"
+    )]
+    fn make_plain_dir(parent: &Path, name: &str) {
+        std::fs::create_dir_all(parent.join(name)).unwrap();
+    }
+
+    #[test]
+    fn repos_under_returns_only_git_children_sorted() {
+        let root = temp_root();
+        make_repo(&root, "beta");
+        make_repo(&root, "alpha");
+        make_plain_dir(&root, "not-a-repo");
+
+        let found = repos_under(&root);
+
+        assert_eq!(found, vec![root.join("alpha"), root.join("beta")]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn repos_under_treats_root_itself_as_a_repo() {
+        let root = temp_root();
+        std::fs::create_dir_all(root.join(".git")).ok();
+
+        assert_eq!(repos_under(&root), vec![root.clone()]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn repos_under_missing_directory_is_empty() {
+        let missing = Path::new("/no/such/devbox/workspace/path");
+        assert!(repos_under(missing).is_empty());
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test setup; a failure should fail the test"
+    )]
+    fn clear_stale_locks_sweeps_top_level_and_refs_but_keeps_real_files() {
+        let root = temp_root();
+        let git = root.join(".git");
+        std::fs::create_dir_all(git.join("refs/remotes/origin")).unwrap();
+        std::fs::create_dir_all(git.join("objects")).unwrap();
+        for lock in [
+            "index.lock",
+            "packed-refs.lock",
+            "config.lock",
+            "FETCH_HEAD.lock",
+        ] {
+            std::fs::write(git.join(lock), b"").unwrap();
+        }
+        std::fs::write(git.join("refs/remotes/origin/main.lock"), b"").unwrap();
+        // Non-lock files must survive — including one named like a lock under objects.
+        std::fs::write(git.join("config"), b"[core]\n").unwrap();
+        std::fs::write(git.join("objects/pack-abc.idx"), b"x").unwrap();
+
+        clear_stale_locks(&root);
+
+        for lock in [
+            "index.lock",
+            "packed-refs.lock",
+            "config.lock",
+            "FETCH_HEAD.lock",
+        ] {
+            assert!(!git.join(lock).exists(), "{lock} should be removed");
+        }
+        assert!(!git.join("refs/remotes/origin/main.lock").exists());
+        assert!(git.join("config").exists());
+        assert!(git.join("objects/pack-abc.idx").exists());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn classify_fails_only_when_required_and_empty() {
+        assert_eq!(classify(&[], true), ReadyDecision::FailAndReap);
+        assert_eq!(classify(&[], false), ReadyDecision::TagReady);
+        let repos = vec![PathBuf::from("/workspace/repo")];
+        assert_eq!(classify(&repos, true), ReadyDecision::TagReady);
+        assert_eq!(classify(&repos, false), ReadyDecision::TagReady);
+    }
+
+    #[test]
+    fn parse_budget_handles_overrides_and_fallbacks() {
+        assert_eq!(parse_budget(Some("300")), Duration::from_secs(300));
+        assert_eq!(parse_budget(Some("  60 ")), Duration::from_secs(60));
+        assert_eq!(parse_budget(None), DEFAULT_BUDGET);
+        assert_eq!(parse_budget(Some("0")), DEFAULT_BUDGET);
+        assert_eq!(parse_budget(Some("nonsense")), DEFAULT_BUDGET);
+    }
+
+    #[test]
+    fn step_timeout_none_once_budget_spent() {
+        // Spent or sub-second budget -> no grant, so the op is skipped (degrade).
+        assert!(step_timeout(Instant::now(), Duration::ZERO).is_none());
+        assert!(step_timeout(Instant::now(), Duration::from_millis(500)).is_none());
+        // A fresh budget grants ~the whole thing.
+        assert!(step_timeout(Instant::now(), Duration::from_secs(120)).is_some());
+    }
+
+    #[test]
+    fn parse_require_only_truthy_for_one_or_true() {
+        assert!(parse_require(Some("1")));
+        assert!(parse_require(Some("true")));
+        assert!(parse_require(Some(" TRUE ")));
+        assert!(!parse_require(Some("0")));
+        assert!(!parse_require(Some("no")));
+        assert!(!parse_require(None));
+    }
+}

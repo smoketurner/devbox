@@ -147,6 +147,12 @@ fn ensure_user(user: &str) -> Result<()> {
     if let Err(e) = run_cmd("chown", &["-R", &format!("{user}:{user}"), WORKSPACE]) {
         tracing::warn!(user, error = %e, "failed to hand workspace to claimant");
     }
+    // The snapshot-seeded repos were fetched by warm-up as root; a recursive chown
+    // over a large tree can be slow or partial. Mark all workspace repos as safe so
+    // the claimant's first `git` command does not abort with "dubious ownership".
+    if let Err(e) = run_cmd("git", &["config", "--system", "safe.directory", "*"]) {
+        tracing::warn!(user, error = %e, "failed to mark workspace repos as safe git directories");
+    }
     tracing::info!(user, "provisioned claimant login account");
     Ok(())
 }
