@@ -39,9 +39,15 @@ const BUDGET_ENV: &str = "WARMUP_FETCH_TIMEOUT_SECS";
 /// Default overall budget for fetching all repos; stays well under `ready_timeout`.
 const DEFAULT_BUDGET: Duration = Duration::from_secs(120);
 
-/// Smallest budget worth granting a git op. Below this we degrade instead of running:
-/// GNU `timeout`'s granularity is one second and a sub-second git op is useless.
+/// Smallest budget worth granting the fetch. Below this we degrade instead of
+/// running: GNU `timeout`'s granularity is one second and a sub-second fetch is
+/// useless.
 const MIN_STEP: Duration = Duration::from_secs(1);
+
+/// Fixed cap for the local, near-instant reset/clean that follow a successful fetch.
+/// They're charged separately from the network budget so a fetch can never succeed
+/// while the working-tree reset is skipped.
+const LOCAL_GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Inline git credential helper: emit `x-access-token` plus the token from the
 /// child environment. The token itself never appears in the process arguments —
@@ -157,45 +163,40 @@ async fn fetch_reset_clean(
     start: Instant,
     budget: Duration,
 ) -> Result<()> {
-    run_git(repo, token, &["fetch", "--prune", "origin"], start, budget)
+    // Only the network fetch is charged against the shared budget. If it's spent,
+    // skip the whole repo — don't fetch refs we then wouldn't reset onto.
+    let Some(fetch_timeout) = step_timeout(start, budget) else {
+        anyhow::bail!("fetch budget spent before {}", repo.display());
+    };
+    run_git(repo, token, &["fetch", "--prune", "origin"], fetch_timeout)
         .await
         .with_context(|| format!("git fetch in {}", repo.display()))?;
-    run_git(repo, None, &["reset", "--hard", "@{u}"], start, budget)
+    // reset/clean are local and near-instant; always run them after a successful
+    // fetch so the working tree actually advances (a fixed cap guards pathology).
+    run_git(repo, None, &["reset", "--hard", "@{u}"], LOCAL_GIT_TIMEOUT)
         .await
         .with_context(|| format!("git reset in {}", repo.display()))?;
-    run_git(repo, None, &["clean", "-fd"], start, budget)
+    run_git(repo, None, &["clean", "-fd"], LOCAL_GIT_TIMEOUT)
         .await
         .with_context(|| format!("git clean in {}", repo.display()))?;
     Ok(())
 }
 
-/// Run `git -C <repo> <args>` under GNU `timeout` for the time *left* in the shared
-/// budget, so a single stuck op is group-killed exactly at the deadline — the whole
-/// pass stays within `WARMUP_FETCH_TIMEOUT_SECS` and git never keeps mutating
-/// `/workspace` after warm-up tags the box ready. Errors once the budget is spent so
-/// the caller degrades.
+/// Run `git -C <repo> <args>` under GNU `timeout <cap>`, so a stuck op is
+/// group-killed exactly at `cap` rather than orphaning git's process group the way
+/// an outer cancel-and-kill would.
 ///
 /// `git fetch` spawns helpers (`git-remote-https`, …) in its process group; a
 /// parent-only kill would orphan them to keep doing network I/O and writing under
 /// `.git`. GNU `timeout` (AL2023 coreutils, like the `git`/`useradd`/`chown` the
 /// agent already shells out to) runs `git` in its own group and signals the whole
 /// group on expiry — SIGTERM first so `git` removes its own locks, then SIGKILL
-/// (`-k`) for stragglers. Doing the kill here (not via an outer cancel) is what keeps
-/// the group from being orphaned.
-async fn run_git(
-    repo: &Path,
-    token: Option<&str>,
-    args: &[&str],
-    start: Instant,
-    budget: Duration,
-) -> Result<()> {
-    let Some(left) = step_timeout(start, budget) else {
-        anyhow::bail!("fetch budget spent before git {}", args.join(" "));
-    };
+/// (`-k`) for stragglers.
+async fn run_git(repo: &Path, token: Option<&str>, args: &[&str], cap: Duration) -> Result<()> {
     let mut cmd = Command::new("timeout");
     cmd.arg("-k")
         .arg("5")
-        .arg(left.as_secs().to_string())
+        .arg(cap.as_secs().max(1).to_string())
         .arg("git")
         .arg("-C")
         .arg(repo);
