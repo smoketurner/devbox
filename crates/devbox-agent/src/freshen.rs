@@ -16,7 +16,7 @@
 //! for the reconciler to reap.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::process::Command;
@@ -38,9 +38,6 @@ const BUDGET_ENV: &str = "WARMUP_FETCH_TIMEOUT_SECS";
 
 /// Default overall budget for fetching all repos; stays well under `ready_timeout`.
 const DEFAULT_BUDGET: Duration = Duration::from_secs(120);
-
-/// Timeout for local-only git operations (reset/clean) that touch no network.
-const LOCAL_GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Inline git credential helper: emit `x-access-token` plus the token from the
 /// child environment. The token itself never appears in the process arguments —
@@ -84,10 +81,27 @@ pub(crate) async fn freshen_workspace(region: &str) -> ReadyDecision {
     }
 
     let token = mint_token(region).await;
-    let start = Instant::now();
     let budget = fetch_budget();
-    for repo in &repos {
-        match freshen_repo(repo, token.as_deref(), start, budget).await {
+    // One overall cap on the whole fetch. If it elapses, whatever hasn't freshened
+    // stays at its snapshot-age checkout (already near-HEAD) and the box still goes
+    // Ready — better than hanging warm-up until the reaper kills the box.
+    if tokio::time::timeout(budget, freshen_all(&repos, token.as_deref(), budget))
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            ?budget,
+            "fetch budget elapsed; serving snapshot-age checkout"
+        );
+    }
+    ReadyDecision::TagReady
+}
+
+/// Freshen each repo in turn, logging per-repo outcomes. A repo that errors is left
+/// at its snapshot-age checkout; the loop continues.
+async fn freshen_all(repos: &[PathBuf], token: Option<&str>, op_timeout: Duration) {
+    for repo in repos {
+        match freshen_repo(repo, token, op_timeout).await {
             Ok(()) => tracing::info!(repo = %repo.display(), "freshened to upstream HEAD"),
             Err(e) => tracing::warn!(
                 repo = %repo.display(),
@@ -96,7 +110,6 @@ pub(crate) async fn freshen_workspace(region: &str) -> ReadyDecision {
             ),
         }
     }
-    ReadyDecision::TagReady
 }
 
 /// Git repositories directly under `root`: `root` itself if it is a repo, otherwise
@@ -129,14 +142,9 @@ fn classify(repos: &[PathBuf], require_workspace: bool) -> ReadyDecision {
 
 /// Freshen one repo, clearing lock files a killed git op may leave so the box
 /// never goes Ready with a wedged repo.
-async fn freshen_repo(
-    repo: &Path,
-    token: Option<&str>,
-    start: Instant,
-    budget: Duration,
-) -> Result<()> {
+async fn freshen_repo(repo: &Path, token: Option<&str>, op_timeout: Duration) -> Result<()> {
     clear_stale_locks(repo);
-    let outcome = fetch_and_reset(repo, token, start, budget).await;
+    let outcome = fetch_reset_clean(repo, token, op_timeout).await;
     // A git op killed at the budget (or one that exits mid-write) can leave a
     // `.git/*.lock` behind; warm-up still tags the box ready, so clear it now or
     // the claimant inherits "Unable to create '.git/index.lock'".
@@ -144,56 +152,38 @@ async fn freshen_repo(
     outcome
 }
 
-/// Run fetch → reset → clean, charging every step against the shared deadline so
-/// the whole pass (across all repos) is bounded by `budget`, not just the fetch.
-async fn fetch_and_reset(
-    repo: &Path,
-    token: Option<&str>,
-    start: Instant,
-    budget: Duration,
-) -> Result<()> {
-    let fetch_timeout = budget_remaining(start, budget, repo, "fetch")?;
-    run_git(repo, token, &["fetch", "--prune", "origin"], fetch_timeout)
+/// Fetch the delta since the snapshot, hard-reset to upstream HEAD, and drop stray
+/// untracked files. `clean -fd` (no `-x`) preserves ignored build caches (`target/`).
+async fn fetch_reset_clean(repo: &Path, token: Option<&str>, op_timeout: Duration) -> Result<()> {
+    run_git(repo, token, &["fetch", "--prune", "origin"], op_timeout)
         .await
         .with_context(|| format!("git fetch in {}", repo.display()))?;
-
-    // reset/clean are local-only — no credentials. They are charged against the
-    // same budget (capped at LOCAL_GIT_TIMEOUT) so a large repo set cannot push
-    // warm-up past `ready_timeout`. `clean -fd` (no `-x`) drops stray untracked
-    // files while preserving ignored build caches (e.g. `target/`).
-    let reset_timeout = budget_remaining(start, budget, repo, "reset")?.min(LOCAL_GIT_TIMEOUT);
-    run_git(repo, None, &["reset", "--hard", "@{u}"], reset_timeout)
+    run_git(repo, None, &["reset", "--hard", "@{u}"], op_timeout)
         .await
         .with_context(|| format!("git reset in {}", repo.display()))?;
-
-    let clean_timeout = budget_remaining(start, budget, repo, "clean")?.min(LOCAL_GIT_TIMEOUT);
-    run_git(repo, None, &["clean", "-fd"], clean_timeout)
+    run_git(repo, None, &["clean", "-fd"], op_timeout)
         .await
         .with_context(|| format!("git clean in {}", repo.display()))?;
     Ok(())
 }
 
-/// Time left in the shared budget, or an error (so the caller degrades) once spent.
-fn budget_remaining(start: Instant, budget: Duration, repo: &Path, step: &str) -> Result<Duration> {
-    let remaining = budget.saturating_sub(start.elapsed());
-    if remaining.is_zero() {
-        anyhow::bail!("fetch budget exhausted before {step} in {}", repo.display());
-    }
-    Ok(remaining)
-}
-
-/// Run `git -C <repo> <args>` under GNU `timeout` so the whole process group dies
-/// on overrun, not just the top-level `git`.
+/// Run `git -C <repo> <args>` under GNU `timeout` so a single stuck op dies with its
+/// whole process group, not just the top-level `git`.
 ///
 /// `git fetch` spawns helpers (`git-remote-https`, …) in its process group; a
 /// parent-only kill would orphan them to keep doing network I/O and writing under
 /// `.git`. GNU `timeout` (AL2023 coreutils, like the `git`/`useradd`/`chown` the
 /// agent already shells out to) runs `git` in its own group and signals the whole
 /// group on expiry — SIGTERM first so `git` removes its own locks, then SIGKILL
-/// (`-k`) for stragglers. An outer tokio deadline guards against `timeout` itself
-/// misbehaving.
-async fn run_git(repo: &Path, token: Option<&str>, args: &[&str], budget: Duration) -> Result<()> {
-    let secs = budget.as_secs().max(1);
+/// (`-k`) for stragglers. The caller's overall `tokio::time::timeout` bounds the
+/// total across repos; on cancellation `kill_on_drop` tears down the in-flight op.
+async fn run_git(
+    repo: &Path,
+    token: Option<&str>,
+    args: &[&str],
+    op_timeout: Duration,
+) -> Result<()> {
+    let secs = op_timeout.as_secs().max(1);
     let mut cmd = Command::new("timeout");
     cmd.arg("-k")
         .arg("5")
@@ -211,19 +201,14 @@ async fn run_git(repo: &Path, token: Option<&str>, args: &[&str], budget: Durati
         .args(args)
         .kill_on_drop(true);
 
-    let backstop = budget.saturating_add(Duration::from_secs(10));
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("spawn timeout git {}", args.join(" ")))?;
-    match tokio::time::timeout(backstop, child.wait()).await {
-        Ok(Ok(status)) if status.success() => Ok(()),
-        Ok(Ok(status)) => anyhow::bail!("git {} exited with {:?}", args.join(" "), status.code()),
-        Ok(Err(e)) => Err(e).with_context(|| format!("wait on git {}", args.join(" "))),
-        Err(_) => {
-            child.start_kill().ok();
-            child.wait().await.ok();
-            anyhow::bail!("git {} exceeded backstop {backstop:?}", args.join(" "))
-        }
+    let status = cmd
+        .status()
+        .await
+        .with_context(|| format!("run timeout git {}", args.join(" ")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("git {} exited with {:?}", args.join(" "), status.code())
     }
 }
 
@@ -319,8 +304,8 @@ fn parse_require(value: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_BUDGET, Duration, Instant, Path, PathBuf, ReadyDecision, budget_remaining,
-        classify, clear_stale_locks, parse_budget, parse_require, repos_under,
+        DEFAULT_BUDGET, Duration, Path, PathBuf, ReadyDecision, classify, clear_stale_locks,
+        parse_budget, parse_require, repos_under,
     };
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -438,15 +423,6 @@ mod tests {
         assert_eq!(parse_budget(None), DEFAULT_BUDGET);
         assert_eq!(parse_budget(Some("0")), DEFAULT_BUDGET);
         assert_eq!(parse_budget(Some("nonsense")), DEFAULT_BUDGET);
-    }
-
-    #[test]
-    fn budget_remaining_bails_once_spent() {
-        let repo = Path::new("/workspace/repo");
-        // A spent budget errors so the caller degrades rather than running unbounded.
-        assert!(budget_remaining(Instant::now(), Duration::ZERO, repo, "fetch").is_err());
-        // A fresh budget leaves time for the step.
-        assert!(budget_remaining(Instant::now(), Duration::from_secs(120), repo, "fetch").is_ok());
     }
 
     #[test]

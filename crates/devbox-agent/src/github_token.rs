@@ -35,6 +35,13 @@ const JWT_TTL: Duration = Duration::from_secs(540);
 /// Back-date `iat` to tolerate clock skew between the box and GitHub.
 const JWT_BACKDATE: Duration = Duration::from_secs(60);
 
+/// Overall bound on the mint (SSM read + JWT + HTTP) so a stall can't block warm-up.
+const MINT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Per-request timeout for the GitHub API call.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
+/// Connect timeout for the GitHub API call.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Serialize)]
 struct Claims {
     iat: u64,
@@ -78,10 +85,17 @@ pub(crate) async fn installation_token(region: &str) -> Result<Option<String>> {
     let Some(cfg) = config() else {
         return Ok(None);
     };
+    let token = tokio::time::timeout(MINT_TIMEOUT, mint(region, &cfg))
+        .await
+        .context("GitHub token mint timed out")??;
+    Ok(Some(token))
+}
+
+/// Read the key, sign the JWT, and exchange it for an installation token.
+async fn mint(region: &str, cfg: &Config) -> Result<String> {
     let pem = read_key(region, &cfg.key_param).await?;
     let jwt = sign_jwt(&cfg.issuer, &pem)?;
-    let token = exchange(&cfg, &jwt).await?;
-    Ok(Some(token))
+    exchange(cfg, &jwt).await
 }
 
 /// Read minting configuration from the environment; `None` if any required value
@@ -149,6 +163,8 @@ async fn exchange(cfg: &Config, jwt: &str) -> Result<String> {
     );
     let client = reqwest::Client::builder()
         .user_agent("devbox-agent")
+        .timeout(HTTP_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT)
         .build()
         .context("build HTTP client")?;
     let resp = client
