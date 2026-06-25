@@ -5,10 +5,10 @@
 | Need | Location |
 |------|----------|
 | Shared types (DevboxId, DevboxState, API types) | `crates/devbox-common/src/lib.rs` |
-| CLI binary + subcommands | `crates/devbox-cli/src/main.rs`, `crates/devbox-cli/src/state.rs`, `crates/devbox-cli/src/auth.rs`, `crates/devbox-cli/src/session.rs` |
+| CLI binary + subcommands | `crates/devbox-cli/src/main.rs` (Clap definitions), `crates/devbox-cli/src/command.rs` (handlers), `crates/devbox-cli/src/state.rs`, `crates/devbox-cli/src/auth.rs`, `crates/devbox-cli/src/session.rs` |
 | Server binary entry point | `crates/devbox-server/src/main.rs` |
 | Server library root | `crates/devbox-server/src/lib.rs` |
-| HTTP route handlers | `crates/devbox-server/src/routes.rs` |
+| HTTP route handlers | `crates/devbox-server/src/routes.rs` (HTTP layer), `crates/devbox-server/src/service.rs` (domain logic) |
 | UI (HTML dashboard) routes | `crates/devbox-server/src/ui.rs` |
 | Pool reconciliation (loop, tick, config, lock) | `crates/devbox-server/src/reconcile/` |
 | Compute trait (ASG + instance ops) | `crates/devbox-server/src/compute/mod.rs` |
@@ -44,9 +44,9 @@
 
 ### New API Endpoint
 1. Add request/response types to `crates/devbox-common/src/lib.rs`
-2. Add handler function in `crates/devbox-server/src/routes.rs`
-3. Register route in `build_router()`
-4. Add CLI subcommand in `crates/devbox-cli/src/main.rs`
+2. Add domain logic function in `crates/devbox-server/src/service.rs`
+3. Add HTTP handler in `crates/devbox-server/src/routes.rs` and register in `build_router()`
+4. Add CLI subcommand in `crates/devbox-cli/src/main.rs` and handler in `crates/devbox-cli/src/command.rs`
 
 ### New Database Migration
 1. Add `.sql` file in `crates/devbox-server/migrations/sqlite/` with next sequence number

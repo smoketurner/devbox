@@ -131,7 +131,7 @@ devbox release --server http://localhost:3000
 |-------|-------------|
 | [`devbox-common`](crates/devbox-common/) | Shared types: `DevboxId`, `DevboxState` enum, API request/response types, configuration |
 | [`devbox-server`](crates/devbox-server/) | Axum HTTP server with database layer (SQLite/DSQL), pool reconciliation, EC2 orchestration, HTML dashboard |
-| [`devbox-cli`](crates/devbox-cli/) | CLI binary with `claim`, `release`, `list`, `status`, `ssh` subcommands via reqwest |
+| [`devbox-cli`](crates/devbox-cli/) | CLI binary with `claim`, `release`, `rename`, `list`, `status`, `ssh` subcommands via reqwest |
 
 ## Configuration
 

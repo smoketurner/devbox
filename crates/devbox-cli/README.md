@@ -10,6 +10,7 @@ devbox login                                         # authenticate via device-c
 devbox logout                                        # clear the cached session token
 devbox claim   [--instance-type <t>]                 # claim a Ready devbox
 devbox release [--id <id>]                           # release a claimed devbox
+devbox rename  <target> <new-name>                   # rename a claimed devbox
 devbox list                                          # list all devboxes (table)
 devbox status  [--id <id>]                           # one devbox, key/value
 devbox ssh     [--id <id>] [-- <cmd...>]             # SSH in over an SSM tunnel
