@@ -170,7 +170,9 @@ pub(crate) async fn claim_devbox(
 /// Shared by the JSON API and the HTML dashboard. Enforces:
 /// - State must be `Claimed` (409 otherwise).
 /// - Caller must be the box's owner (403 otherwise).
-/// - Clears `owner` and `name` atomically (name freed for reuse; box terminates).
+/// - Clears `owner` and frees `name` in the store (so both can be reused on a
+///   fresh claim) atomically. The returned document still carries the released
+///   box's `name` so callers can render a friendly confirmation.
 pub(crate) async fn release_devbox(
     state: &AppState,
     caller: &str,
@@ -194,6 +196,8 @@ pub(crate) async fn release_devbox(
         return Err(AppError::Forbidden("ownership mismatch".into()));
     }
 
+    let released_name = doc.data.name.clone();
+
     let mut updated = doc.data.clone();
     updated.state = DevboxState::Terminating;
     // Clear owner and free the name so both can be reused on a fresh claim.
@@ -210,11 +214,14 @@ pub(crate) async fn release_devbox(
         ));
     }
 
-    let refreshed = state
+    let mut refreshed = state
         .store
         .get::<DevboxDoc>(id)
         .await?
         .ok_or_else(|| AppError::Internal(anyhow::anyhow!("devbox vanished after release")))?;
+    // The store record has freed the name for reuse; the response still reports
+    // the released box's name so the caller's confirmation is friendly.
+    refreshed.data.name = released_name;
     Ok(refreshed)
 }
 
@@ -650,9 +657,20 @@ mod tests {
             refreshed.data.owner.is_none(),
             "owner must be cleared on release"
         );
+        // The response echoes the released box's name for a friendly confirmation...
+        assert_eq!(refreshed.data.name, "calm-quilt");
+
+        // ...but the persisted record frees the name for reuse on a fresh claim.
+        let persisted = state
+            .store
+            .get::<DevboxDoc>(&id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap();
         assert!(
-            refreshed.data.name.is_empty(),
-            "name must be freed on release"
+            persisted.data.name.is_empty(),
+            "name must be freed in the store"
         );
     }
 
