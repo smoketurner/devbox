@@ -180,11 +180,15 @@ fn validate_name_override(raw: Option<&str>) -> Result<Option<String>, AppError>
 /// Claim a Ready box for `owner`, optionally renaming it to `name`.
 ///
 /// Shared by the JSON API and the HTML dashboard. When a name override is given,
-/// the box is claimed via [`compare_and_update_unique`](crate::db::DocumentStore::compare_and_update_unique),
+/// each candidate is claimed via [`compare_and_update_unique`](crate::db::DocumentStore::compare_and_update_unique),
 /// which checks the name and writes the claim in one transaction — so two
 /// concurrent claimants of the same name cannot both win (the DB rejects the
-/// loser, who gets a `409`). Without an override the box keeps its
-/// reconciler-assigned unique name, so a plain version-guarded claim suffices.
+/// loser). A `DuplicateValue` means some live box already holds the name; the
+/// loop continues, because that box may itself be a later candidate (the
+/// uniqueness check excludes the box being claimed, so claiming it succeeds).
+/// Only if no candidate can take the name does the claim fail with a `409`.
+/// Without an override the box keeps its reconciler-assigned unique name, so a
+/// plain version-guarded claim suffices.
 pub(crate) async fn claim_a_devbox(
     state: &AppState,
     owner: &str,
@@ -201,6 +205,10 @@ pub(crate) async fn claim_a_devbox(
     let mut candidates = ready_docs;
     candidates.sort_by_key(|a| a.data.created_at);
 
+    // Set once a candidate reports the name as already held, so an exhausted
+    // loop reports "name in use" rather than the generic pool message.
+    let mut name_in_use = false;
+
     for candidate in candidates {
         let mut updated = candidate.data.clone();
         updated.state = DevboxState::Claimed;
@@ -208,7 +216,7 @@ pub(crate) async fn claim_a_devbox(
         updated.claimed_at = Some(jiff::Timestamp::now());
         updated.owner_tag_applied = false;
 
-        match name_override {
+        let claimed = match name_override {
             Some(ref name) => {
                 updated.name = name.clone();
                 match state
@@ -222,41 +230,46 @@ pub(crate) async fn claim_a_devbox(
                     )
                     .await?
                 {
-                    UpdateOutcome::Updated => {}
+                    UpdateOutcome::Updated => true,
                     // Another claimer took this box; try the next candidate.
                     UpdateOutcome::VersionMismatch => continue,
-                    // The name is taken (possibly by a concurrent claim that the
-                    // DB serialized ahead of us): reject — no box was consumed.
+                    // The name is held by another box. If that box is itself a
+                    // later candidate we'll reach it and claim it; otherwise the
+                    // loop exhausts and we report the name as in use.
                     UpdateOutcome::DuplicateValue => {
-                        return Err(AppError::Conflict(format!(
-                            "name '{name}' is already in use"
-                        )));
+                        name_in_use = true;
+                        continue;
                     }
                 }
             }
             None => {
-                let success = state
+                state
                     .store
                     .compare_and_update(&candidate.id, candidate.version, &updated)
-                    .await?;
-                if !success {
-                    // Lost the version race for this box; try the next candidate.
-                    continue;
-                }
+                    .await?
             }
-        }
+        };
 
-        let refreshed = state
-            .store
-            .get::<DevboxDoc>(&candidate.id)
-            .await?
-            .ok_or_else(|| AppError::Internal(anyhow::anyhow!("devbox vanished after claim")))?;
-        return Ok(refreshed);
+        if claimed {
+            let refreshed = state
+                .store
+                .get::<DevboxDoc>(&candidate.id)
+                .await?
+                .ok_or_else(|| {
+                    AppError::Internal(anyhow::anyhow!("devbox vanished after claim"))
+                })?;
+            return Ok(refreshed);
+        }
     }
 
-    Err(AppError::Conflict(
-        "pool exhausted: all candidates failed concurrent claim".into(),
-    ))
+    match name_override {
+        Some(name) if name_in_use => Err(AppError::Conflict(format!(
+            "name '{name}' is already in use"
+        ))),
+        _ => Err(AppError::Conflict(
+            "pool exhausted: all candidates failed concurrent claim".into(),
+        )),
+    }
 }
 
 /// Claim an available devbox.
@@ -570,6 +583,39 @@ mod tests {
             .await,
         );
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn claim_name_matching_a_ready_box_claims_that_box() {
+        // A ready box already carries the requested name, and an older box with a
+        // different name sorts ahead of it. The claim must succeed by claiming the
+        // box that holds the name — not abort because the older candidate can't
+        // take it.
+        let state = setup_state().await;
+        // Older candidate, different name → tried first.
+        let mut older = ready_devbox_other();
+        older.created_at = Timestamp::from_second(0).unwrap();
+        older.name = "older-box".to_string();
+        insert(&state, older).await;
+        // The box that already has the requested name (i-1234…, "calm-quilt").
+        insert(&state, ready_devbox()).await;
+
+        let body = claim_devbox(
+            State(state),
+            principal("jdoe"),
+            JsonBody(claim_named("calm-quilt")),
+        )
+        .await
+        .ok()
+        .unwrap()
+        .0;
+
+        assert_eq!(body.name, "calm-quilt");
+        assert_eq!(
+            body.instance_id, "i-1234567890abcdef0",
+            "must claim the box that already holds the name"
+        );
+        assert_eq!(body.state, DevboxState::Claimed);
     }
 
     #[tokio::test]
