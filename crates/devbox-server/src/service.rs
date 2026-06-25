@@ -12,6 +12,7 @@
 
 use devbox_common::{DEVBOX_NAME_MAX_LEN, DevboxState, PoolMetricsResponse, is_valid_devbox_name};
 
+use crate::auth::Principal;
 use crate::db::UpdateOutcome;
 use crate::db::document_type::Document;
 use crate::documents::devbox::DevboxDoc;
@@ -84,7 +85,7 @@ pub(crate) fn validate_rename_name(raw: &str) -> Result<String, AppError> {
 /// plain version-guarded claim suffices.
 pub(crate) async fn claim_devbox(
     state: &AppState,
-    owner: &str,
+    claimant: &Principal,
     name: Option<&str>,
 ) -> Result<Document<DevboxDoc>, AppError> {
     let name_override = validate_name_override(name)?;
@@ -105,7 +106,8 @@ pub(crate) async fn claim_devbox(
     for candidate in candidates {
         let mut updated = candidate.data.clone();
         updated.state = DevboxState::Claimed;
-        updated.owner = Some(owner.to_string());
+        updated.owner = Some(claimant.owner.clone());
+        updated.owner_email = Some(claimant.email.clone());
         updated.claimed_at = Some(jiff::Timestamp::now());
         updated.owner_tag_applied = false;
 
@@ -356,12 +358,19 @@ mod tests {
     use jiff::Timestamp;
 
     use super::*;
-    use crate::auth::Authenticator;
+    use crate::auth::{Authenticator, Principal};
     use crate::db::DocumentStore;
     use crate::db::migrations::run_sqlite_migrations;
     use crate::db::pool::Pool;
     use crate::reconcile::ReconcilerConfig;
     use crate::routes::AppState;
+
+    fn claimant(login: &str) -> Principal {
+        Principal {
+            owner: login.to_string(),
+            email: format!("{login}@example.com"),
+        }
+    }
 
     async fn test_store() -> DocumentStore {
         let pool = Pool::new_test();
@@ -402,6 +411,7 @@ mod tests {
             region: "us-east-1".to_string(),
             ebs_volume_id: None,
             owner: None,
+            owner_email: None,
             claimed_at: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
@@ -435,10 +445,14 @@ mod tests {
         let state = setup_state().await;
         insert(&state, ready_devbox()).await;
 
-        let doc = claim_devbox(&state, "jdoe", None).await.ok().unwrap();
+        let doc = claim_devbox(&state, &claimant("jdoe"), None)
+            .await
+            .ok()
+            .unwrap();
 
         assert_eq!(doc.data.state, DevboxState::Claimed);
         assert_eq!(doc.data.owner.as_deref(), Some("jdoe"));
+        assert_eq!(doc.data.owner_email.as_deref(), Some("jdoe@example.com"));
     }
 
     #[tokio::test]
@@ -446,7 +460,10 @@ mod tests {
         let state = setup_state().await;
         insert(&state, ready_devbox()).await;
 
-        let doc = claim_devbox(&state, "jdoe", None).await.ok().unwrap();
+        let doc = claim_devbox(&state, &claimant("jdoe"), None)
+            .await
+            .ok()
+            .unwrap();
 
         // The instance's region (from instance metadata, carried on the doc) is
         // surfaced so the CLI can open the SSM tunnel without client-side config.
@@ -458,7 +475,10 @@ mod tests {
         let state = setup_state().await;
         insert(&state, ready_devbox()).await;
 
-        let doc = claim_devbox(&state, "jdoe", None).await.ok().unwrap();
+        let doc = claim_devbox(&state, &claimant("jdoe"), None)
+            .await
+            .ok()
+            .unwrap();
 
         assert_eq!(doc.data.name, "calm-quilt");
     }
@@ -468,7 +488,7 @@ mod tests {
         let state = setup_state().await;
         insert(&state, ready_devbox()).await;
 
-        let doc = claim_devbox(&state, "jdoe", Some("my-project"))
+        let doc = claim_devbox(&state, &claimant("jdoe"), Some("my-project"))
             .await
             .ok()
             .unwrap();
@@ -482,7 +502,7 @@ mod tests {
         let state = setup_state().await;
         insert(&state, ready_devbox()).await;
 
-        let doc = claim_devbox(&state, "jdoe", Some("   "))
+        let doc = claim_devbox(&state, &claimant("jdoe"), Some("   "))
             .await
             .ok()
             .unwrap();
@@ -495,7 +515,7 @@ mod tests {
         let state = setup_state().await;
         insert(&state, ready_devbox()).await;
 
-        let err = claim_devbox(&state, "jdoe", Some("Bad Name"))
+        let err = claim_devbox(&state, &claimant("jdoe"), Some("Bad Name"))
             .await
             .err()
             .unwrap();
@@ -518,7 +538,7 @@ mod tests {
         // The box that already has the requested name (i-1234…, "calm-quilt").
         insert(&state, ready_devbox()).await;
 
-        let doc = claim_devbox(&state, "jdoe", Some("calm-quilt"))
+        let doc = claim_devbox(&state, &claimant("jdoe"), Some("calm-quilt"))
             .await
             .ok()
             .unwrap();
@@ -543,7 +563,7 @@ mod tests {
         // A ready box to claim with the colliding name.
         insert(&state, ready_devbox()).await;
 
-        let err = claim_devbox(&state, "jdoe", Some("taken"))
+        let err = claim_devbox(&state, &claimant("jdoe"), Some("taken"))
             .await
             .err()
             .unwrap();
@@ -562,9 +582,10 @@ mod tests {
 
         let s1 = state.clone();
         let s2 = state.clone();
+        let p = claimant("jdoe");
         let (r1, r2) = tokio::join!(
-            claim_devbox(&s1, "jdoe", Some("shared")),
-            claim_devbox(&s2, "jdoe", Some("shared")),
+            claim_devbox(&s1, &p, Some("shared")),
+            claim_devbox(&s2, &p, Some("shared")),
         );
 
         let ok_count = [r1.is_ok(), r2.is_ok()].iter().filter(|b| **b).count();
@@ -592,7 +613,10 @@ mod tests {
     async fn claim_empty_pool_is_conflict() {
         let state = setup_state().await;
 
-        let err = claim_devbox(&state, "jdoe", None).await.err().unwrap();
+        let err = claim_devbox(&state, &claimant("jdoe"), None)
+            .await
+            .err()
+            .unwrap();
 
         assert!(matches!(err, AppError::Conflict(_)));
     }
@@ -604,10 +628,8 @@ mod tests {
 
         let s1 = state.clone();
         let s2 = state.clone();
-        let (r1, r2) = tokio::join!(
-            claim_devbox(&s1, "jdoe", None),
-            claim_devbox(&s2, "jdoe", None),
-        );
+        let p = claimant("jdoe");
+        let (r1, r2) = tokio::join!(claim_devbox(&s1, &p, None), claim_devbox(&s2, &p, None),);
 
         let ok = [r1.is_ok(), r2.is_ok()].iter().filter(|b| **b).count();
         let conflict = [r1.is_err(), r2.is_err()].iter().filter(|b| **b).count();
@@ -853,7 +875,7 @@ mod tests {
             .unwrap();
 
         // The old name must now be claimable (uniqueness constraint freed).
-        let claimed = claim_devbox(&state, "alice", Some("old-name")).await;
+        let claimed = claim_devbox(&state, &claimant("alice"), Some("old-name")).await;
         assert!(claimed.is_ok(), "old name must be reclaimable after rename");
     }
 }

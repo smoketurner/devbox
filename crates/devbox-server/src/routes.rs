@@ -166,7 +166,7 @@ async fn handle_claim(
     Extension(principal): Extension<Principal>,
     JsonBody(req): JsonBody<ClaimRequest>,
 ) -> Result<Json<DevboxResponse>, AppError> {
-    let doc = service::claim_devbox(&state, &principal.0, req.name.as_deref()).await?;
+    let doc = service::claim_devbox(&state, &principal, req.name.as_deref()).await?;
     Ok(Json(doc.into()))
 }
 
@@ -176,7 +176,7 @@ async fn handle_release(
     Path(id): Path<String>,
     Extension(principal): Extension<Principal>,
 ) -> Result<Json<DevboxResponse>, AppError> {
-    let doc = service::release_devbox(&state, &principal.0, &id).await?;
+    let doc = service::release_devbox(&state, &principal.owner, &id).await?;
     Ok(Json(doc.into()))
 }
 
@@ -187,7 +187,7 @@ async fn handle_rename(
     Extension(principal): Extension<Principal>,
     JsonBody(req): JsonBody<RenameRequest>,
 ) -> Result<Json<DevboxResponse>, AppError> {
-    let doc = service::rename_devbox(&state, &principal.0, &id, &req.name).await?;
+    let doc = service::rename_devbox(&state, &principal.owner, &id, &req.name).await?;
     Ok(Json(doc.into()))
 }
 
@@ -292,6 +292,7 @@ mod tests {
             region: "us-east-1".to_string(),
             ebs_volume_id: None,
             owner: None,
+            owner_email: None,
             claimed_at: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
@@ -313,7 +314,10 @@ mod tests {
     /// `Extension<Principal>` the auth middleware would have injected — supplied
     /// directly here so handler-logic tests bypass the (separately tested) layer.
     fn principal(owner: &str) -> Extension<Principal> {
-        Extension(Principal(owner.to_string()))
+        Extension(Principal {
+            owner: owner.to_string(),
+            email: format!("{owner}@example.com"),
+        })
     }
 
     #[tokio::test]

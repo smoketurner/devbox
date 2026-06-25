@@ -255,6 +255,7 @@ async fn sync_docs_with_asg(
             region: info.region.clone(),
             ebs_volume_id: None,
             owner: None,
+            owner_email: None,
             claimed_at: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
@@ -669,10 +670,14 @@ async fn apply_pending_owner_tags(
             None => continue,
         };
 
-        if let Err(e) = compute
-            .tag_instance(instance_id, &[("devbox:owner", owner)])
-            .await
-        {
+        // The claimant's email rides alongside the owner so the host can set the
+        // git identity; older docs without it just carry `devbox:owner`.
+        let mut tags: Vec<(&str, &str)> = vec![("devbox:owner", owner)];
+        if let Some(ref email) = doc.data.owner_email {
+            tags.push(("devbox:owner-email", email.as_str()));
+        }
+
+        if let Err(e) = compute.tag_instance(instance_id, &tags).await {
             tracing::error!(
                 error = %e,
                 instance_id = %instance_id,
