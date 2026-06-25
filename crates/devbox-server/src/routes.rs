@@ -15,7 +15,8 @@ use devbox_common::{
 };
 
 use crate::auth::{Authenticator, Principal};
-use crate::db::DocumentStore;
+use crate::db::document_type::Document;
+use crate::db::{DocumentStore, UpdateOutcome};
 use crate::documents::devbox::DevboxDoc;
 use crate::error::{AppError, JsonBody};
 use crate::reconcile::ReconcilerConfig;
@@ -155,16 +156,13 @@ async fn get_devbox(
     Ok(Json(doc.into()))
 }
 
-/// Validate and check a requested name override for a claim.
+/// Validate an optional name override for a claim.
 ///
 /// A blank or absent value yields `None` (the box keeps its auto name). A
-/// non-blank value must satisfy [`is_valid_devbox_name`] (`400` otherwise) and
-/// must not already be in use by a non-`Terminating` box (`409` otherwise) —
-/// names are globally unique so they unambiguously select a box.
-async fn resolve_name_override(
-    state: &AppState,
-    raw: Option<&str>,
-) -> Result<Option<String>, AppError> {
+/// non-blank value must satisfy [`is_valid_devbox_name`] (`400` otherwise).
+/// Uniqueness is *not* checked here — it is enforced atomically at claim time by
+/// [`DocumentStore::compare_and_update_unique`](crate::db::DocumentStore::compare_and_update_unique).
+fn validate_name_override(raw: Option<&str>) -> Result<Option<String>, AppError> {
     let Some(name) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
@@ -176,30 +174,23 @@ async fn resolve_name_override(
         )));
     }
 
-    let existing = state.store.find_all::<DevboxDoc>("name", name).await?;
-    if existing
-        .iter()
-        .any(|d| d.data.state != DevboxState::Terminating)
-    {
-        return Err(AppError::Conflict(format!(
-            "name '{name}' is already in use"
-        )));
-    }
-
     Ok(Some(name.to_string()))
 }
 
-/// Claim an available devbox.
-async fn claim_devbox(
-    State(state): State<SharedState>,
-    Extension(principal): Extension<Principal>,
-    JsonBody(req): JsonBody<ClaimRequest>,
-) -> Result<Json<DevboxResponse>, AppError> {
-    let owner = principal.0;
-
-    // Resolve the optional name override before consuming a box from the pool,
-    // so an invalid or already-taken name fails fast.
-    let name_override = resolve_name_override(&state, req.name.as_deref()).await?;
+/// Claim a Ready box for `owner`, optionally renaming it to `name`.
+///
+/// Shared by the JSON API and the HTML dashboard. When a name override is given,
+/// the box is claimed via [`compare_and_update_unique`](crate::db::DocumentStore::compare_and_update_unique),
+/// which checks the name and writes the claim in one transaction — so two
+/// concurrent claimants of the same name cannot both win (the DB rejects the
+/// loser, who gets a `409`). Without an override the box keeps its
+/// reconciler-assigned unique name, so a plain version-guarded claim suffices.
+pub(crate) async fn claim_a_devbox(
+    state: &AppState,
+    owner: &str,
+    name: Option<&str>,
+) -> Result<Document<DevboxDoc>, AppError> {
+    let name_override = validate_name_override(name)?;
 
     let ready_docs = state.store.find_all::<DevboxDoc>("state", "ready").await?;
     if ready_docs.is_empty() {
@@ -213,33 +204,69 @@ async fn claim_devbox(
     for candidate in candidates {
         let mut updated = candidate.data.clone();
         updated.state = DevboxState::Claimed;
-        updated.owner = Some(owner.clone());
+        updated.owner = Some(owner.to_string());
         updated.claimed_at = Some(jiff::Timestamp::now());
         updated.owner_tag_applied = false;
-        if let Some(ref name) = name_override {
-            updated.name = name.clone();
+
+        match name_override {
+            Some(ref name) => {
+                updated.name = name.clone();
+                match state
+                    .store
+                    .compare_and_update_unique(
+                        &candidate.id,
+                        candidate.version,
+                        &updated,
+                        "name",
+                        name,
+                    )
+                    .await?
+                {
+                    UpdateOutcome::Updated => {}
+                    // Another claimer took this box; try the next candidate.
+                    UpdateOutcome::VersionMismatch => continue,
+                    // The name is taken (possibly by a concurrent claim that the
+                    // DB serialized ahead of us): reject — no box was consumed.
+                    UpdateOutcome::DuplicateValue => {
+                        return Err(AppError::Conflict(format!(
+                            "name '{name}' is already in use"
+                        )));
+                    }
+                }
+            }
+            None => {
+                let success = state
+                    .store
+                    .compare_and_update(&candidate.id, candidate.version, &updated)
+                    .await?;
+                if !success {
+                    // Lost the version race for this box; try the next candidate.
+                    continue;
+                }
+            }
         }
 
-        let success = state
+        let refreshed = state
             .store
-            .compare_and_update(&candidate.id, candidate.version, &updated)
-            .await?;
-
-        if success {
-            let refreshed = state
-                .store
-                .get::<DevboxDoc>(&candidate.id)
-                .await?
-                .ok_or_else(|| {
-                    AppError::Internal(anyhow::anyhow!("devbox vanished after claim"))
-                })?;
-            return Ok(Json(refreshed.into()));
-        }
+            .get::<DevboxDoc>(&candidate.id)
+            .await?
+            .ok_or_else(|| AppError::Internal(anyhow::anyhow!("devbox vanished after claim")))?;
+        return Ok(refreshed);
     }
 
     Err(AppError::Conflict(
         "pool exhausted: all candidates failed concurrent claim".into(),
     ))
+}
+
+/// Claim an available devbox.
+async fn claim_devbox(
+    State(state): State<SharedState>,
+    Extension(principal): Extension<Principal>,
+    JsonBody(req): JsonBody<ClaimRequest>,
+) -> Result<Json<DevboxResponse>, AppError> {
+    let doc = claim_a_devbox(&state, &principal.0, req.name.as_deref()).await?;
+    Ok(Json(doc.into()))
 }
 
 /// Release a claimed devbox.
@@ -270,6 +297,8 @@ async fn release_devbox(
 
     let mut updated = doc.data.clone();
     updated.state = DevboxState::Terminating;
+    // Free the name immediately so it can be reused on a fresh claim.
+    updated.name = String::new();
 
     let success = state
         .store
@@ -564,6 +593,57 @@ mod tests {
             .await,
         );
         assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn concurrent_named_claims_do_not_duplicate_a_name() {
+        // Two ready boxes, two simultaneous claims for the same name. Exactly one
+        // must win the name; the other must be rejected and its box returned to
+        // the pool — never two boxes sharing a name (the selector guarantee).
+        let state = setup_state().await;
+        insert(&state, ready_devbox()).await;
+        insert(&state, ready_devbox_other()).await;
+
+        let (r1, r2) = tokio::join!(
+            claim_devbox(
+                State(state.clone()),
+                principal("jdoe"),
+                JsonBody(claim_named("shared")),
+            ),
+            claim_devbox(
+                State(state.clone()),
+                principal("jdoe"),
+                JsonBody(claim_named("shared")),
+            ),
+        );
+
+        let statuses = [status_of(r1), status_of(r2)];
+        assert!(
+            statuses
+                .iter()
+                .all(|s| *s == StatusCode::OK || *s == StatusCode::CONFLICT),
+            "each claim resolves to OK or CONFLICT, got {statuses:?}"
+        );
+        let ok = statuses.iter().filter(|s| **s == StatusCode::OK).count();
+        // A later committer always observes an earlier one, so at most one wins;
+        // a contended loser is rejected (and may, rarely, leave both rejected).
+        assert!(ok <= 1, "at most one named claim may win");
+
+        // The safety property: the name is held by exactly as many live boxes as
+        // claims won — never two (which would break the `ssh <name>` selector).
+        let holders = state
+            .store
+            .find_all::<DevboxDoc>("name", "shared")
+            .await
+            .unwrap();
+        let live = holders
+            .iter()
+            .filter(|d| d.data.state != DevboxState::Terminating)
+            .count();
+        assert_eq!(
+            live, ok,
+            "a name must be held by exactly the winner (0 or 1)"
+        );
     }
 
     #[tokio::test]

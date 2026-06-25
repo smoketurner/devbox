@@ -165,6 +165,64 @@ mod store_tests {
     }
 
     #[tokio::test]
+    async fn test_compare_and_update_unique_outcomes() {
+        use crate::db::store::UpdateOutcome;
+
+        let store = setup_store().await;
+
+        // Box A holds name "taken"; box B holds "free".
+        let mut a = sample_devbox();
+        a.name = "taken".to_string();
+        let a = store.insert(&a).await.unwrap();
+        let mut b = sample_devbox();
+        b.instance_id = "i-second".to_string();
+        b.name = "free".to_string();
+        let b = store.insert(&b).await.unwrap();
+
+        // Renaming B to A's name is rejected without touching B.
+        let mut want_taken = b.data.clone();
+        want_taken.name = "taken".to_string();
+        let outcome = store
+            .compare_and_update_unique(&b.id, b.version, &want_taken, "name", "taken")
+            .await
+            .unwrap();
+        assert_eq!(outcome, UpdateOutcome::DuplicateValue);
+        let fetched = store.get::<DevboxDoc>(&b.id).await.unwrap().unwrap();
+        assert_eq!(fetched.data.name, "free", "B must be untouched");
+        assert_eq!(fetched.version, b.version);
+
+        // A stale version is reported as a mismatch, even for a free name.
+        let mut want_fresh = b.data.clone();
+        want_fresh.name = "fresh".to_string();
+        let outcome = store
+            .compare_and_update_unique(&b.id, 99, &want_fresh, "name", "fresh")
+            .await
+            .unwrap();
+        assert_eq!(outcome, UpdateOutcome::VersionMismatch);
+
+        // A free name with the correct version succeeds.
+        let outcome = store
+            .compare_and_update_unique(&b.id, b.version, &want_fresh, "name", "fresh")
+            .await
+            .unwrap();
+        assert_eq!(outcome, UpdateOutcome::Updated);
+        let fetched = store.get::<DevboxDoc>(&b.id).await.unwrap().unwrap();
+        assert_eq!(fetched.data.name, "fresh");
+
+        // A's claim on "taken" is still intact.
+        assert_eq!(
+            store
+                .get::<DevboxDoc>(&a.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .data
+                .name,
+            "taken"
+        );
+    }
+
+    #[tokio::test]
     async fn test_delete() {
         let store = setup_store().await;
         let doc = sample_devbox();

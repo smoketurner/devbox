@@ -491,6 +491,8 @@ pub(super) async fn reap_unready_instances(
         // the AWS call and retry next tick without having touched AWS.
         let mut updated_doc = doc.data.clone();
         updated_doc.state = DevboxState::Terminating;
+        // Free the name immediately so it can be reused on a fresh claim.
+        updated_doc.name = String::new();
 
         match store
             .compare_and_update(&doc.id, doc.version, &updated_doc)

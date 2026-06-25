@@ -37,6 +37,23 @@ pub enum AppError {
     Internal(anyhow::Error),
 }
 
+impl AppError {
+    /// A message safe to show an end user. Mirrors the JSON `error` body, with
+    /// `Internal` details suppressed — used by the HTML dashboard to surface a
+    /// failed claim inline.
+    #[must_use]
+    pub fn user_message(&self) -> String {
+        match self {
+            Self::BadRequest(msg)
+            | Self::Unauthorized(msg)
+            | Self::Forbidden(msg)
+            | Self::NotFound(msg)
+            | Self::Conflict(msg) => msg.clone(),
+            Self::Internal(_) => "internal server error".to_string(),
+        }
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, message) = match self {

@@ -17,7 +17,7 @@ use crate::auth::{SessionUser, random_token};
 use crate::db::document_type::Document;
 use crate::documents::devbox::DevboxDoc;
 use crate::routes::{AppState, SharedState};
-use devbox_common::{DEVBOX_NAME_MAX_LEN, DevboxState, format_timestamp, is_valid_devbox_name};
+use devbox_common::{DevboxState, format_timestamp};
 
 /// Cookie holding the Vouch OIDC ID token after a successful dashboard login.
 const SESSION_COOKIE: &str = "devbox_session";
@@ -474,81 +474,17 @@ async fn submit_claim(
         Err(redirect) => return redirect,
     };
 
-    // Re-render the form with `error`, echoing back the typed name.
-    let entered = form.name.clone();
-    let render_err = |error: String| {
-        ClaimFormTemplate {
-            name: entered.clone(),
-            error: Some(error),
+    // Claim through the shared routine (validation, uniqueness, and the
+    // race-safe re-check all live there). On failure, re-render the form with
+    // the same message the API would return, echoing back the typed name.
+    match crate::routes::claim_a_devbox(&state, &owner, form.name.as_deref()).await {
+        Ok(doc) => Redirect::to(&format!("/devboxes/{}", doc.id)).into_response(),
+        Err(e) => ClaimFormTemplate {
+            name: form.name,
+            error: Some(e.user_message()),
         }
-        .into_response()
-    };
-
-    // Resolve the optional name override (blank → keep the auto name).
-    let name_override = match form
-        .name
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        None => None,
-        Some(name) => {
-            if !is_valid_devbox_name(name) {
-                return render_err(format!(
-                    "Invalid name '{name}': use 1-{DEVBOX_NAME_MAX_LEN} lowercase letters, \
-                     digits, '_' or '-', not starting with '-'."
-                ));
-            }
-            match state.store.find_all::<DevboxDoc>("name", name).await {
-                Ok(existing)
-                    if existing
-                        .iter()
-                        .any(|d| d.data.state != DevboxState::Terminating) =>
-                {
-                    return render_err(format!("The name '{name}' is already in use."));
-                }
-                Ok(_) => Some(name.to_string()),
-                Err(e) => return render_err(format!("Failed to check name: {e}")),
-            }
-        }
-    };
-
-    let ready_docs = match state.store.find_all::<DevboxDoc>("state", "ready").await {
-        Ok(docs) => docs,
-        Err(e) => return render_err(format!("Failed to query devboxes: {e}")),
-    };
-
-    if ready_docs.is_empty() {
-        return render_err("No devboxes available.".to_string());
+        .into_response(),
     }
-
-    let mut candidates = ready_docs;
-    candidates.sort_by_key(|a| a.data.created_at);
-
-    for candidate in candidates {
-        let mut updated = candidate.data.clone();
-        updated.state = DevboxState::Claimed;
-        updated.owner = Some(owner.clone());
-        updated.claimed_at = Some(jiff::Timestamp::now());
-        updated.owner_tag_applied = false;
-        if let Some(ref name) = name_override {
-            updated.name = name.clone();
-        }
-
-        match state
-            .store
-            .compare_and_update(&candidate.id, candidate.version, &updated)
-            .await
-        {
-            Ok(true) => {
-                return Redirect::to(&format!("/devboxes/{}", candidate.id)).into_response();
-            }
-            Ok(false) => continue,
-            Err(e) => return render_err(format!("Claim failed: {e}")),
-        }
-    }
-
-    render_err("No devboxes available (all claimed concurrently).".to_string())
 }
 
 /// Process the release form submission from the detail page.
@@ -604,6 +540,8 @@ async fn submit_release(
     let mut updated = doc.data.clone();
     updated.state = DevboxState::Terminating;
     updated.owner = None;
+    // Free the name immediately so it can be reused on a fresh claim.
+    updated.name = String::new();
 
     match state.store.update(&id, &updated).await {
         Ok(()) => Redirect::to(&format!("/devboxes/{id}")).into_response(),
