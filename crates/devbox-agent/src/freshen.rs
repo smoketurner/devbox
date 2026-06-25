@@ -69,14 +69,21 @@ pub(crate) async fn freshen_workspace(region: &str) {
     }
 
     let mut minter = build_minter(region).await;
+    // Resolve a token per repo *before* starting the fetch timer, so installation
+    // discovery/mint latency is not charged against the budget — only the git fetch
+    // is. Tokens last an hour, well beyond the fetch loop.
+    let mut tokens = Vec::with_capacity(repos.len());
+    for repo in &repos {
+        tokens.push(repo_token(minter.as_mut(), repo).await);
+    }
+
     // One shared budget. Each git op is given the time *left* in it (see `run_git`),
     // so once it's spent the remaining repos serve their snapshot-age checkout
     // (already near-HEAD) and the box still goes Ready — better than hanging warm-up
     // until the reaper kills the box.
     let start = Instant::now();
     let budget = fetch_budget();
-    for repo in &repos {
-        let token = repo_token(minter.as_mut(), repo).await;
+    for (repo, token) in repos.iter().zip(&tokens) {
         match freshen_repo(repo, token.as_deref(), start, budget).await {
             Ok(()) => tracing::info!(repo = %repo.display(), "freshened to upstream HEAD"),
             Err(e) => tracing::warn!(
