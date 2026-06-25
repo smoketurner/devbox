@@ -46,15 +46,15 @@ profile (override with `--profile`).
 
 ### IDE Remote-SSH (VS Code, JetBrains Gateway, Cursor)
 
-These connect with the system `ssh` against a `~/.ssh/config` Host entry. Point
-the `ProxyCommand` at `devbox ssm-proxy` instead of the old `aws ssm
-start-session`:
+These connect with the system `ssh` against a `~/.ssh/config` Host entry. Run
+`devbox ssh --print` to get the complete ProxyCommand (including the correct
+region) and copy it into your config:
 
 ```sshconfig
 Host devbox-<id>
     HostName <instance-id>
     User <principal>
-    ProxyCommand devbox ssm-proxy --target %h --port %p --region <region> [--profile <profile>]
+    ProxyCommand <output from: devbox ssh --print>
     # Optional: collapse VS Code's several connections into one SSM session.
     ControlMaster auto
     ControlPersist 5m
