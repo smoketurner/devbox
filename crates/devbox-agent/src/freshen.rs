@@ -130,7 +130,8 @@ fn classify(repos: &[PathBuf], require_workspace: bool) -> ReadyDecision {
     }
 }
 
-/// Fetch and hard-reset one repo to its upstream HEAD within the remaining budget.
+/// Freshen one repo, clearing lock files a killed git op may leave so the box
+/// never goes Ready with a wedged repo.
 async fn freshen_repo(
     repo: &Path,
     token: Option<&str>,
@@ -138,25 +139,50 @@ async fn freshen_repo(
     budget: Duration,
 ) -> Result<()> {
     clear_stale_locks(repo);
+    let outcome = fetch_and_reset(repo, token, start, budget).await;
+    // A git op killed at the budget (or one that exits mid-write) can leave a
+    // `.git/*.lock` behind; warm-up still tags the box ready, so clear it now or
+    // the claimant inherits "Unable to create '.git/index.lock'".
+    clear_stale_locks(repo);
+    outcome
+}
 
-    let remaining = budget.saturating_sub(start.elapsed());
-    if remaining.is_zero() {
-        anyhow::bail!("fetch budget exhausted before reaching {}", repo.display());
-    }
-    run_git(repo, token, &["fetch", "--prune", "origin"], remaining)
+/// Run fetch → reset → clean, charging every step against the shared deadline so
+/// the whole pass (across all repos) is bounded by `budget`, not just the fetch.
+async fn fetch_and_reset(
+    repo: &Path,
+    token: Option<&str>,
+    start: Instant,
+    budget: Duration,
+) -> Result<()> {
+    let fetch_timeout = budget_remaining(start, budget, repo, "fetch")?;
+    run_git(repo, token, &["fetch", "--prune", "origin"], fetch_timeout)
         .await
         .with_context(|| format!("git fetch in {}", repo.display()))?;
 
-    // reset/clean are local-only — no credentials, short fixed timeout. `clean -fd`
-    // (no `-x`) removes stray untracked files while preserving ignored build caches
-    // (e.g. `target/`) that the snapshot warmed.
-    run_git(repo, None, &["reset", "--hard", "@{u}"], LOCAL_GIT_TIMEOUT)
+    // reset/clean are local-only — no credentials. They are charged against the
+    // same budget (capped at LOCAL_GIT_TIMEOUT) so a large repo set cannot push
+    // warm-up past `ready_timeout`. `clean -fd` (no `-x`) drops stray untracked
+    // files while preserving ignored build caches (e.g. `target/`).
+    let reset_timeout = budget_remaining(start, budget, repo, "reset")?.min(LOCAL_GIT_TIMEOUT);
+    run_git(repo, None, &["reset", "--hard", "@{u}"], reset_timeout)
         .await
         .with_context(|| format!("git reset in {}", repo.display()))?;
-    run_git(repo, None, &["clean", "-fd"], LOCAL_GIT_TIMEOUT)
+
+    let clean_timeout = budget_remaining(start, budget, repo, "clean")?.min(LOCAL_GIT_TIMEOUT);
+    run_git(repo, None, &["clean", "-fd"], clean_timeout)
         .await
         .with_context(|| format!("git clean in {}", repo.display()))?;
     Ok(())
+}
+
+/// Time left in the shared budget, or an error (so the caller degrades) once spent.
+fn budget_remaining(start: Instant, budget: Duration, repo: &Path, step: &str) -> Result<Duration> {
+    let remaining = budget.saturating_sub(start.elapsed());
+    if remaining.is_zero() {
+        anyhow::bail!("fetch budget exhausted before {step} in {}", repo.display());
+    }
+    Ok(remaining)
 }
 
 /// Run `git -C <repo> <args>` with at most `timeout`, killing the child if it
@@ -239,8 +265,8 @@ fn parse_require(value: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_BUDGET, Duration, Path, PathBuf, ReadyDecision, classify, parse_budget,
-        parse_require, repos_under,
+        DEFAULT_BUDGET, Duration, Instant, Path, PathBuf, ReadyDecision, budget_remaining,
+        classify, parse_budget, parse_require, repos_under,
     };
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -319,6 +345,15 @@ mod tests {
         assert_eq!(parse_budget(None), DEFAULT_BUDGET);
         assert_eq!(parse_budget(Some("0")), DEFAULT_BUDGET);
         assert_eq!(parse_budget(Some("nonsense")), DEFAULT_BUDGET);
+    }
+
+    #[test]
+    fn budget_remaining_bails_once_spent() {
+        let repo = Path::new("/workspace/repo");
+        // A spent budget errors so the caller degrades rather than running unbounded.
+        assert!(budget_remaining(Instant::now(), Duration::ZERO, repo, "fetch").is_err());
+        // A fresh budget leaves time for the step.
+        assert!(budget_remaining(Instant::now(), Duration::from_secs(120), repo, "fetch").is_ok());
     }
 
     #[test]
