@@ -25,6 +25,7 @@
             <table class="w-full">
                 <thead>
                     <tr class="bg-devbox-raised">
+                        <th class="table-header">Name</th>
                         <th class="table-header">Instance ID</th>
                         <th class="table-header">State</th>
                         <th class="table-header">Instance Type</th>
@@ -35,6 +36,7 @@
                 <tbody>
                     {% for devbox in devboxes %}
                     <tr class="hover:bg-devbox-raised/50 transition-colors cursor-pointer" onclick="window.location='/devboxes/{{ devbox.id }}'">
+                        <td class="table-cell font-medium text-white">{{ devbox.name }}</td>
                         <td class="table-cell font-mono text-xs">{{ devbox.instance_id }}</td>
                         <td class="table-cell"><span class="status-{{ devbox.state }}">{{ devbox.state }}</span></td>
                         <td class="table-cell">{{ devbox.instance_type }}</td>
@@ -44,7 +46,7 @@
                     {% endfor %}
                     {% if devboxes.is_empty() %}
                     <tr>
-                        <td colspan="5" class="table-cell text-center text-gray-500 py-8">No devboxes found.</td>
+                        <td colspan="6" class="table-cell text-center text-gray-500 py-8">No devboxes found.</td>
                     </tr>
                     {% endif %}
                 </tbody>

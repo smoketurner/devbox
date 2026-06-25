@@ -17,7 +17,7 @@ use crate::auth::{SessionUser, random_token};
 use crate::db::document_type::Document;
 use crate::documents::devbox::DevboxDoc;
 use crate::routes::{AppState, SharedState};
-use devbox_common::{DevboxState, format_timestamp};
+use devbox_common::{DEVBOX_NAME_MAX_LEN, DevboxState, format_timestamp, is_valid_devbox_name};
 
 /// Cookie holding the Vouch OIDC ID token after a successful dashboard login.
 const SESSION_COOKIE: &str = "devbox_session";
@@ -83,6 +83,7 @@ pub struct DevboxDetail {
     /// Internal UUID, used only for routing (links, release form action). The
     /// instance ID is the user-facing identifier shown in the title and grid.
     pub id: String,
+    pub name: String,
     pub state: String,
     pub instance_type: String,
     pub region: String,
@@ -99,6 +100,7 @@ impl From<Document<DevboxDoc>> for DevboxDetail {
     fn from(doc: Document<DevboxDoc>) -> Self {
         DevboxDetail {
             id: doc.id,
+            name: doc.data.name,
             state: doc.data.state.to_string(),
             instance_type: doc.data.instance_type.to_string(),
             region: doc.data.region,
@@ -137,7 +139,8 @@ pub struct ErrorPageTemplate {
 #[derive(Template)]
 #[template(path = "claim_form.html")]
 pub struct ClaimFormTemplate {
-    pub instance_type: Option<String>,
+    /// The name the user typed, echoed back so an error re-render keeps it.
+    pub name: Option<String>,
     pub error: Option<String>,
 }
 
@@ -157,6 +160,7 @@ impl_template_into_response!(
 /// A devbox entry for the dashboard template.
 pub struct DashboardDevbox {
     pub id: String,
+    pub name: String,
     pub state: String,
     pub instance_type: String,
     pub instance_id: String,
@@ -169,10 +173,10 @@ pub struct DashboardDevbox {
 // ============================================================================
 
 /// Form data for claiming a devbox. The owner is always the signed-in user, so
-/// the form only carries the optional instance type.
+/// the form only carries the optional name override.
 #[derive(serde::Deserialize)]
 struct ClaimFormData {
-    instance_type: Option<String>,
+    name: Option<String>,
 }
 
 // ============================================================================
@@ -388,6 +392,7 @@ async fn dashboard(State(state): State<SharedState>, headers: HeaderMap) -> Resp
                 .into_iter()
                 .map(|doc| DashboardDevbox {
                     id: doc.id.clone(),
+                    name: doc.data.name.clone(),
                     state: doc.data.state.to_string(),
                     instance_type: doc.data.instance_type.to_string(),
                     instance_id: doc.data.instance_id.clone(),
@@ -449,7 +454,7 @@ async fn claim_form(State(state): State<SharedState>, headers: HeaderMap) -> Res
         return redirect;
     }
     ClaimFormTemplate {
-        instance_type: None,
+        name: None,
         error: None,
     }
     .into_response()
@@ -469,41 +474,66 @@ async fn submit_claim(
         Err(redirect) => return redirect,
     };
 
-    let ready_docs = match state.store.find_all::<DevboxDoc>("state", "ready").await {
-        Ok(docs) => docs,
-        Err(e) => {
-            return ClaimFormTemplate {
-                instance_type: form.instance_type,
-                error: Some(format!("Failed to query devboxes: {e}")),
+    // Re-render the form with `error`, echoing back the typed name.
+    let entered = form.name.clone();
+    let render_err = |error: String| {
+        ClaimFormTemplate {
+            name: entered.clone(),
+            error: Some(error),
+        }
+        .into_response()
+    };
+
+    // Resolve the optional name override (blank → keep the auto name).
+    let name_override = match form
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        None => None,
+        Some(name) => {
+            if !is_valid_devbox_name(name) {
+                return render_err(format!(
+                    "Invalid name '{name}': use 1-{DEVBOX_NAME_MAX_LEN} lowercase letters, \
+                     digits, '_' or '-', not starting with '-'."
+                ));
             }
-            .into_response();
+            match state.store.find_all::<DevboxDoc>("name", name).await {
+                Ok(existing)
+                    if existing
+                        .iter()
+                        .any(|d| d.data.state != DevboxState::Terminating) =>
+                {
+                    return render_err(format!("The name '{name}' is already in use."));
+                }
+                Ok(_) => Some(name.to_string()),
+                Err(e) => return render_err(format!("Failed to check name: {e}")),
+            }
         }
     };
 
+    let ready_docs = match state.store.find_all::<DevboxDoc>("state", "ready").await {
+        Ok(docs) => docs,
+        Err(e) => return render_err(format!("Failed to query devboxes: {e}")),
+    };
+
     if ready_docs.is_empty() {
-        return ClaimFormTemplate {
-            instance_type: form.instance_type,
-            error: Some("No devboxes available.".to_string()),
-        }
-        .into_response();
+        return render_err("No devboxes available.".to_string());
     }
 
     let mut candidates = ready_docs;
-    if let Some(ref pref) = form.instance_type
-        && !pref.is_empty()
-    {
-        candidates.sort_by(|a, b| {
-            let a_match = a.data.instance_type.as_ref() == pref.as_str();
-            let b_match = b.data.instance_type.as_ref() == pref.as_str();
-            b_match.cmp(&a_match)
-        });
-    }
+    candidates.sort_by_key(|a| a.data.created_at);
 
     for candidate in candidates {
         let mut updated = candidate.data.clone();
         updated.state = DevboxState::Claimed;
         updated.owner = Some(owner.clone());
         updated.claimed_at = Some(jiff::Timestamp::now());
+        updated.owner_tag_applied = false;
+        if let Some(ref name) = name_override {
+            updated.name = name.clone();
+        }
 
         match state
             .store
@@ -514,21 +544,11 @@ async fn submit_claim(
                 return Redirect::to(&format!("/devboxes/{}", candidate.id)).into_response();
             }
             Ok(false) => continue,
-            Err(e) => {
-                return ClaimFormTemplate {
-                    instance_type: form.instance_type,
-                    error: Some(format!("Claim failed: {e}")),
-                }
-                .into_response();
-            }
+            Err(e) => return render_err(format!("Claim failed: {e}")),
         }
     }
 
-    ClaimFormTemplate {
-        instance_type: form.instance_type,
-        error: Some("No devboxes available (all claimed concurrently).".to_string()),
-    }
-    .into_response()
+    render_err("No devboxes available (all claimed concurrently).".to_string())
 }
 
 /// Process the release form submission from the detail page.

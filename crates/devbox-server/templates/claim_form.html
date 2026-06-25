@@ -18,11 +18,14 @@
         <div class="card p-6">
             <form method="post" action="/devboxes/claim" class="space-y-4">
                 <div>
-                    <label for="instance_type" class="block text-sm text-gray-400 mb-1">Instance Type (optional)</label>
-                    <input type="text" id="instance_type" name="instance_type"
-                           value="{{ instance_type.as_deref().unwrap_or_default() }}"
-                           placeholder="e.g., m5.large"
+                    <label for="name" class="block text-sm text-gray-400 mb-1">Name (optional)</label>
+                    <input type="text" id="name" name="name"
+                           value="{{ name.as_deref().unwrap_or_default() }}"
+                           placeholder="leave blank for an auto name, e.g. calm-quilt"
+                           maxlength="32"
+                           pattern="[a-z0-9_][a-z0-9_-]*"
                            class="w-full bg-devbox-bg border border-gray-600 rounded px-3 py-2 text-white focus:outline-none focus:border-blue-500">
+                    <p class="text-xs text-gray-500 mt-1">Lowercase letters, numbers, <code>_</code> and <code>-</code>.</p>
                 </div>
                 <button type="submit" class="bg-blue-600 hover:bg-blue-700 text-white px-6 py-2 rounded transition-colors">Claim</button>
             </form>

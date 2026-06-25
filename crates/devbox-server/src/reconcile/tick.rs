@@ -193,6 +193,16 @@ async fn sync_docs_with_asg(
         }
     }
 
+    // Names already in use, so generation never collides within this tick.
+    let mut used_names: HashSet<String> = docs
+        .iter()
+        .map(|d| d.data.name.clone())
+        .filter(|n| !n.is_empty())
+        .collect();
+
+    // Backfill names onto surviving docs written before the field existed.
+    backfill_names(store, &docs, &asg_instance_ids, &mut used_names).await;
+
     // Build set of instance_ids that already have docs
     let doc_instance_ids: HashSet<String> =
         docs.iter().map(|d| d.data.instance_id.clone()).collect();
@@ -221,11 +231,26 @@ async fn sync_docs_with_asg(
             continue;
         };
 
+        // Give the box a unique friendly name up front. Generation effectively
+        // never fails; if it somehow does, fall back to the instance id (itself
+        // unique and a valid name) so the box is still created and named.
+        let name = crate::naming::generate_unique_name(store, &used_names)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(
+                    error = %e,
+                    instance_id = %inst.instance_id,
+                    "name generation failed; falling back to instance id"
+                );
+                inst.instance_id.clone()
+            });
+
         // Always create Warming: readiness is gated on devbox:ready tag, never
         // on lifecycle state alone. handle_warming_instances will flip to Ready
         // on the next tick once the tag is seen.
         let new_doc = DevboxDoc {
             instance_id: inst.instance_id.clone(),
+            name: name.clone(),
             state: DevboxState::Warming,
             instance_type: InstanceType(info.instance_type.clone()),
             ami_id: AmiId(info.ami_id.clone()),
@@ -239,12 +264,64 @@ async fn sync_docs_with_asg(
         };
 
         let doc_id = uuid::Uuid::now_v7().to_string();
-        if let Err(e) = store.insert_with_id(&doc_id, &new_doc).await {
-            tracing::error!(
-                error = %e,
-                instance_id = %inst.instance_id,
-                "failed to create doc for ASG instance"
-            );
+        match store.insert_with_id(&doc_id, &new_doc).await {
+            Ok(_) => {
+                used_names.insert(name);
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    instance_id = %inst.instance_id,
+                    "failed to create doc for ASG instance"
+                );
+            }
+        }
+    }
+}
+
+/// Assign a unique name to each surviving doc that lacks one.
+///
+/// Docs written before the `name` field existed deserialize with an empty name;
+/// this brings them up to the "every box has a unique name" invariant. Stale
+/// docs (not in the ASG, slated for deletion) are skipped. Each assigned name is
+/// added to `used_names` so later generations in the same tick don't collide.
+async fn backfill_names(
+    store: &DocumentStore,
+    docs: &[crate::db::document_type::Document<DevboxDoc>],
+    asg_instance_ids: &HashSet<&str>,
+    used_names: &mut HashSet<String>,
+) {
+    for doc in docs {
+        if !doc.data.name.is_empty() || !asg_instance_ids.contains(doc.data.instance_id.as_str()) {
+            continue;
+        }
+
+        let name = crate::naming::generate_unique_name(store, used_names)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(
+                    error = %e,
+                    doc_id = %doc.id,
+                    "backfill name generation failed; falling back to instance id"
+                );
+                doc.data.instance_id.clone()
+            });
+
+        let mut updated = doc.data.clone();
+        updated.name = name.clone();
+        match store
+            .compare_and_update(&doc.id, doc.version, &updated)
+            .await
+        {
+            Ok(true) => {
+                used_names.insert(name);
+            }
+            Ok(false) => {
+                tracing::warn!(doc_id = %doc.id, "version conflict backfilling name");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, doc_id = %doc.id, "failed to backfill name");
+            }
         }
     }
 }

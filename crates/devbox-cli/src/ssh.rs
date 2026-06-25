@@ -139,6 +139,7 @@ mod tests {
         DevboxResponse {
             id: "abc123".to_string(),
             instance_id: instance_id.to_string(),
+            name: "calm-quilt".to_string(),
             state: DevboxState::Claimed,
             instance_type: InstanceType("m5.large".to_string()),
             ami_id: AmiId("ami-123".to_string()),

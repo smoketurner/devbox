@@ -10,6 +10,7 @@ impl From<Document<DevboxDoc>> for DevboxResponse {
         DevboxResponse {
             id: doc.id,
             instance_id: doc.data.instance_id,
+            name: doc.data.name,
             state: doc.data.state,
             instance_type: doc.data.instance_type,
             ami_id: doc.data.ami_id,

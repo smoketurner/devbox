@@ -2,8 +2,8 @@
 //!
 //! `claim` records the new devbox here and `release` removes it, so that
 //! `ssh`/`status`/`release` can resolve the target devbox without an explicit
-//! `--id` when the user holds exactly one (or pick interactively when they hold
-//! several). The file lives under the XDG *state* directory — it is
+//! name or id when the user holds exactly one (or pick interactively when they
+//! hold several). The file lives under the XDG *state* directory — it is
 //! machine-managed runtime state, not user-edited config.
 //!
 //! Owner is intentionally never stored: it is always the authenticated

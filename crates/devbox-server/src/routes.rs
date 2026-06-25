@@ -10,8 +10,8 @@ use axum::routing::{get, post};
 use axum::{Extension, Router};
 
 use devbox_common::{
-    ClaimRequest, DevboxListResponse, DevboxResponse, DevboxState, HealthResponse,
-    PoolMetricsResponse, ProtectedResourceMetadata,
+    ClaimRequest, DEVBOX_NAME_MAX_LEN, DevboxListResponse, DevboxResponse, DevboxState,
+    HealthResponse, PoolMetricsResponse, ProtectedResourceMetadata, is_valid_devbox_name,
 };
 
 use crate::auth::{Authenticator, Principal};
@@ -155,6 +155,40 @@ async fn get_devbox(
     Ok(Json(doc.into()))
 }
 
+/// Validate and check a requested name override for a claim.
+///
+/// A blank or absent value yields `None` (the box keeps its auto name). A
+/// non-blank value must satisfy [`is_valid_devbox_name`] (`400` otherwise) and
+/// must not already be in use by a non-`Terminating` box (`409` otherwise) —
+/// names are globally unique so they unambiguously select a box.
+async fn resolve_name_override(
+    state: &AppState,
+    raw: Option<&str>,
+) -> Result<Option<String>, AppError> {
+    let Some(name) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+
+    if !is_valid_devbox_name(name) {
+        return Err(AppError::BadRequest(format!(
+            "invalid name '{name}': use 1-{DEVBOX_NAME_MAX_LEN} lowercase letters, \
+             digits, '_' or '-', not starting with '-'"
+        )));
+    }
+
+    let existing = state.store.find_all::<DevboxDoc>("name", name).await?;
+    if existing
+        .iter()
+        .any(|d| d.data.state != DevboxState::Terminating)
+    {
+        return Err(AppError::Conflict(format!(
+            "name '{name}' is already in use"
+        )));
+    }
+
+    Ok(Some(name.to_string()))
+}
+
 /// Claim an available devbox.
 async fn claim_devbox(
     State(state): State<SharedState>,
@@ -163,24 +197,18 @@ async fn claim_devbox(
 ) -> Result<Json<DevboxResponse>, AppError> {
     let owner = principal.0;
 
+    // Resolve the optional name override before consuming a box from the pool,
+    // so an invalid or already-taken name fails fast.
+    let name_override = resolve_name_override(&state, req.name.as_deref()).await?;
+
     let ready_docs = state.store.find_all::<DevboxDoc>("state", "ready").await?;
     if ready_docs.is_empty() {
         return Err(AppError::Conflict("no devboxes available".into()));
     }
 
-    // Sort candidates: prefer matching instance_type first, then by created_at
-    // ascending (longest-waiting first).
+    // Sort candidates by created_at ascending (longest-waiting first).
     let mut candidates = ready_docs;
-    candidates.sort_by(|a, b| {
-        if let Some(ref pref) = req.instance_type {
-            let a_match = a.data.instance_type == *pref;
-            let b_match = b.data.instance_type == *pref;
-            if a_match != b_match {
-                return b_match.cmp(&a_match);
-            }
-        }
-        a.data.created_at.cmp(&b.data.created_at)
-    });
+    candidates.sort_by_key(|a| a.data.created_at);
 
     for candidate in candidates {
         let mut updated = candidate.data.clone();
@@ -188,6 +216,9 @@ async fn claim_devbox(
         updated.owner = Some(owner.clone());
         updated.claimed_at = Some(jiff::Timestamp::now());
         updated.owner_tag_applied = false;
+        if let Some(ref name) = name_override {
+            updated.name = name.clone();
+        }
 
         let success = state
             .store
@@ -376,6 +407,7 @@ mod tests {
     fn ready_devbox() -> DevboxDoc {
         DevboxDoc {
             instance_id: "i-1234567890abcdef0".to_string(),
+            name: "calm-quilt".to_string(),
             state: DevboxState::Ready,
             instance_type: InstanceType("m5.large".to_string()),
             ami_id: AmiId("ami-12345678".to_string()),
@@ -402,9 +434,22 @@ mod tests {
     }
 
     fn claim() -> ClaimRequest {
+        ClaimRequest { name: None }
+    }
+
+    fn claim_named(name: &str) -> ClaimRequest {
         ClaimRequest {
-            instance_type: None,
+            name: Some(name.to_string()),
         }
+    }
+
+    /// A second ready box with a distinct instance id and name, so tests that
+    /// need two candidates don't collide on the unique `instance_id` index.
+    fn ready_devbox_other() -> DevboxDoc {
+        let mut doc = ready_devbox();
+        doc.instance_id = "i-0987654321fedcba0".to_string();
+        doc.name = "brave-otter".to_string();
+        doc
     }
 
     /// `Extension<Principal>` the auth middleware would have injected — supplied
@@ -429,6 +474,96 @@ mod tests {
         // The instance's region (from instance metadata, carried on the doc) is
         // surfaced so the CLI can open the SSM tunnel without client-side config.
         assert_eq!(body.region, "us-east-1");
+    }
+
+    #[tokio::test]
+    async fn claim_keeps_auto_name_when_no_override() {
+        let state = setup_state().await;
+        insert(&state, ready_devbox()).await;
+
+        let body = claim_devbox(State(state), principal("jdoe"), JsonBody(claim()))
+            .await
+            .ok()
+            .unwrap()
+            .0;
+
+        assert_eq!(body.name, "calm-quilt");
+    }
+
+    #[tokio::test]
+    async fn claim_applies_valid_name_override() {
+        let state = setup_state().await;
+        insert(&state, ready_devbox()).await;
+
+        let body = claim_devbox(
+            State(state),
+            principal("jdoe"),
+            JsonBody(claim_named("my-project")),
+        )
+        .await
+        .ok()
+        .unwrap()
+        .0;
+
+        assert_eq!(body.name, "my-project");
+        assert_eq!(body.state, DevboxState::Claimed);
+    }
+
+    #[tokio::test]
+    async fn claim_blank_override_keeps_auto_name() {
+        let state = setup_state().await;
+        insert(&state, ready_devbox()).await;
+
+        let body = claim_devbox(
+            State(state),
+            principal("jdoe"),
+            JsonBody(claim_named("   ")),
+        )
+        .await
+        .ok()
+        .unwrap()
+        .0;
+
+        assert_eq!(body.name, "calm-quilt");
+    }
+
+    #[tokio::test]
+    async fn claim_invalid_name_is_bad_request() {
+        let state = setup_state().await;
+        insert(&state, ready_devbox()).await;
+
+        let status = status_of(
+            claim_devbox(
+                State(state),
+                principal("jdoe"),
+                JsonBody(claim_named("Bad Name")),
+            )
+            .await,
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn claim_duplicate_name_is_conflict() {
+        let state = setup_state().await;
+        // An already-claimed box named "taken".
+        let mut existing = ready_devbox_other();
+        existing.state = DevboxState::Claimed;
+        existing.owner = Some("alice".to_string());
+        existing.name = "taken".to_string();
+        insert(&state, existing).await;
+        // A ready box to claim with the colliding name.
+        insert(&state, ready_devbox()).await;
+
+        let status = status_of(
+            claim_devbox(
+                State(state),
+                principal("jdoe"),
+                JsonBody(claim_named("taken")),
+            )
+            .await,
+        );
+        assert_eq!(status, StatusCode::CONFLICT);
     }
 
     #[tokio::test]
