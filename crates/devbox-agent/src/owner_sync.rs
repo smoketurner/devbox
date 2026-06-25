@@ -10,6 +10,10 @@
 //! Authorization stays with the `principals` command (always current,
 //! fail-closed). This service only makes the account *exist*; an extra account
 //! with no valid certificate cannot be logged into, so staleness is harmless.
+//!
+//! On provisioning it also reads the `devbox:owner-email` tag and writes the
+//! claimant's git identity (`user.email`/`user.name`) into their `~/.gitconfig`, so
+//! their first commit is attributed correctly with no manual setup.
 
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
@@ -101,6 +105,15 @@ async fn tick(client: &Client) -> Result<Pass> {
         }
         Decision::Provision(owner) => {
             ensure_user(&owner)?;
+            // Best-effort: the claimant's email rides on a separate tag. A read
+            // failure or absent tag just leaves the git identity unset.
+            match imds::instance_tag(client, "devbox:owner-email").await {
+                Ok(email) => configure_git_identity(&owner, email.as_deref()),
+                Err(e) => tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "could not read devbox:owner-email; skipping git identity"
+                ),
+            }
             Ok(Pass::Done)
         }
     }
@@ -155,6 +168,57 @@ fn ensure_user(user: &str) -> Result<()> {
     }
     tracing::info!(user, "provisioned claimant login account");
     Ok(())
+}
+
+/// Set the claimant's git identity from the `devbox:owner-email` tag so their first
+/// commit is attributed correctly. Best-effort: a missing email, unknown home, or
+/// `git` failure is logged, not fatal — the account is already usable.
+///
+/// Writes the user's own `~/.gitconfig` with `git config --file` (run as root, so no
+/// `$HOME` ambiguity) and hands the file to the claimant. `user.name` is the login;
+/// a real display name would need a separate tag.
+fn configure_git_identity(user: &str, email: Option<&str>) {
+    let Some(email) = email.map(str::trim).filter(|e| !e.is_empty()) else {
+        tracing::info!(
+            user,
+            "no devbox:owner-email tag; leaving git identity unset"
+        );
+        return;
+    };
+    let Some(home) = user_home(user) else {
+        tracing::warn!(
+            user,
+            "could not resolve home directory; skipping git identity"
+        );
+        return;
+    };
+    let gitconfig = format!("{home}/.gitconfig");
+    for (key, value) in [("user.email", email), ("user.name", user)] {
+        if let Err(e) = run_cmd("git", &["config", "--file", &gitconfig, key, value]) {
+            tracing::warn!(user, key, error = %e, "failed to set git identity");
+            return;
+        }
+    }
+    if let Err(e) = run_cmd("chown", &[&format!("{user}:{user}"), &gitconfig]) {
+        tracing::warn!(user, error = %e, "failed to hand .gitconfig to claimant");
+    }
+    tracing::info!(user, email, "configured git identity");
+}
+
+/// The home directory of an existing Unix account, read from `getent passwd`.
+fn user_home(user: &str) -> Option<String> {
+    let output = Command::new("getent")
+        .arg("passwd")
+        .arg(user)
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    // passwd format: name:passwd:uid:gid:gecos:home:shell
+    stdout.trim().split(':').nth(5).map(str::to_string)
 }
 
 /// The numeric UID of an existing Unix account named `user`, or `None` if no such

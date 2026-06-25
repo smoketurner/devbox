@@ -36,6 +36,11 @@ pub struct DevboxDoc {
     pub ebs_volume_id: Option<String>,
     /// Owner (user who claimed the devbox).
     pub owner: Option<String>,
+    /// Full email of the claimant, surfaced to the host as the `devbox:owner-email`
+    /// tag so `owner-sync` can configure the claimant's git identity. Defaults empty
+    /// for documents written before this field existed (not backfilled).
+    #[serde(default)]
+    pub owner_email: Option<String>,
     /// When the devbox was claimed.
     pub claimed_at: Option<Timestamp>,
     /// When the devbox record was created.
@@ -97,6 +102,7 @@ mod tests {
             region: "us-east-1".to_string(),
             ebs_volume_id: Some("vol-12345678".to_string()),
             owner: None,
+            owner_email: None,
             claimed_at: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,

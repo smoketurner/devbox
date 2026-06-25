@@ -54,8 +54,11 @@ Machines are **cattle, not pets**: each is used once and terminated on release.
     no principals authorized.
 - **The login user is the certificate principal.** There is no shared `dev`
   account: `devbox-agent owner-sync` provisions a Unix account named after the
-  `devbox:owner` principal (passwordless sudo, owns `/workspace`). `devbox ssh`
-  logs in as that principal over an SSM Session Manager tunnel (no public IP).
+  `devbox:owner` principal (passwordless sudo, owns `/workspace`). It also reads the
+  `devbox:owner-email` tag — set by `apply_pending_owner_tags` from the claimant's
+  token email, alongside `devbox:owner` — and writes the account's `~/.gitconfig`
+  (`user.email`/`user.name`) so commits are attributed without manual setup.
+  `devbox ssh` logs in as that principal over an SSM Session Manager tunnel (no public IP).
   The SSM data-channel protocol is implemented **natively in-process** (a hidden
   `devbox ssm-proxy` subcommand used as the ssh `ProxyCommand`): it calls
   `ssm:StartSession` for `AWS-StartSSHSession`, opens the WebSocket data channel

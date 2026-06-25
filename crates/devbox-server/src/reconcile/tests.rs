@@ -312,6 +312,7 @@ mod reconcile_tests {
             region: "us-east-1".to_string(),
             ebs_volume_id: None,
             owner: None,
+            owner_email: None,
             claimed_at: None,
             created_at: past,
             owner_tag_applied: false,
@@ -326,6 +327,7 @@ mod reconcile_tests {
             region: "us-east-1".to_string(),
             ebs_volume_id: None,
             owner: Some("alice".to_string()),
+            owner_email: None,
             claimed_at: None,
             created_at: past,
             owner_tag_applied: false,
@@ -378,6 +380,7 @@ mod reconcile_tests {
             region: "us-east-1".to_string(),
             ebs_volume_id: None,
             owner: Some("alice".to_string()),
+            owner_email: None,
             claimed_at: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
@@ -394,6 +397,7 @@ mod reconcile_tests {
             region: "us-east-1".to_string(),
             ebs_volume_id: None,
             owner: None,
+            owner_email: None,
             claimed_at: None,
             created_at: past,
             owner_tag_applied: false,
@@ -424,6 +428,48 @@ mod reconcile_tests {
             warming.data.instance_id.as_str(),
             warming_id.as_str(),
             "Warming doc must survive: reaper must not run without fresh tag data"
+        );
+    }
+
+    /// Test: a claimed box's `owner_email` is published as the `devbox:owner-email`
+    /// tag alongside `devbox:owner`, so `owner-sync` can set the git identity.
+    #[tokio::test]
+    async fn test_owner_email_tag_applied() {
+        let store = setup_store().await;
+        let compute = MockCompute::new();
+        let config = test_config();
+
+        compute.seed_asg(1, 5, 1);
+        let claimed_id = compute.add_instance("InService");
+
+        let claimed_doc = DevboxDoc {
+            instance_id: claimed_id.clone(),
+            name: "claimed-box".to_string(),
+            state: DevboxState::Claimed,
+            instance_type: InstanceType("m7g.large".to_string()),
+            ami_id: AmiId("ami-mock".to_string()),
+            subnet_id: SubnetId("subnet-mock".to_string()),
+            region: "us-east-1".to_string(),
+            ebs_volume_id: None,
+            owner: Some("alice".to_string()),
+            owner_email: Some("alice@example.com".to_string()),
+            claimed_at: None,
+            created_at: Timestamp::now(),
+            owner_tag_applied: false,
+        };
+        store.insert(&claimed_doc).await.unwrap();
+
+        reconciliation_tick(&store, &compute, &config)
+            .await
+            .unwrap();
+
+        let tags = compute
+            .get_instance_tags(&claimed_id)
+            .expect("claimed instance still in ASG");
+        assert_eq!(tags.get("devbox:owner").map(String::as_str), Some("alice"));
+        assert_eq!(
+            tags.get("devbox:owner-email").map(String::as_str),
+            Some("alice@example.com")
         );
     }
 
@@ -459,6 +505,7 @@ mod reconcile_tests {
             region: "us-east-1".to_string(),
             ebs_volume_id: None,
             owner: None,
+            owner_email: None,
             claimed_at: None,
             created_at: past,
             owner_tag_applied: false,

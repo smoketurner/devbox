@@ -12,7 +12,7 @@ One binary, three subcommands, each wired to a different host trigger:
 | Subcommand | Triggered by | Job |
 |------------|--------------|-----|
 | `principals <login-user>` | sshd `AuthorizedPrincipalsCommand`, per auth (as `nobody`) | Print the authorized principal, or nothing |
-| `owner-sync` | `devbox-owner-sync.service` (systemd) | Provision the claimant's Unix account, then exit |
+| `owner-sync` | `devbox-owner-sync.service` (systemd) | Provision the claimant's Unix account + git identity, then exit |
 | `warmup` | `devbox-warmup.service` (systemd, at boot) | Freshen `/workspace` repos, then self-tag `devbox:ready=true` |
 
 ## `principals` — per-claim SSH authorization
@@ -36,6 +36,12 @@ creates that account (`useradd -m -G docker`, passwordless sudo, ownership of
 `/workspace`) and **exits**. A devbox is claimed once and terminated on release,
 so there is nothing to do afterwards; the unit uses `Restart=on-failure` so a
 clean exit stays stopped.
+
+It then reads the `devbox:owner-email` tag (set by the reconciler from the
+claimant's token email, alongside `devbox:owner`) and writes their git identity —
+`user.email` and `user.name` — into the new account's `~/.gitconfig`, so the first
+commit is attributed correctly with no manual setup. Best-effort: an absent tag or
+a `git` failure is logged, not fatal.
 
 Polling is the only on-host option: there is no event for an instance-tag change,
 and the isolation rules forbid the control plane from pushing to the box.

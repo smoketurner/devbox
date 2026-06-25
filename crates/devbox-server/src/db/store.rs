@@ -760,6 +760,7 @@ mod tests {
             region: "us-east-1".to_string(),
             ebs_volume_id: Some("vol-12345678".to_string()),
             owner: None,
+            owner_email: None,
             claimed_at: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,

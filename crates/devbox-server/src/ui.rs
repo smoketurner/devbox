@@ -13,7 +13,7 @@ use axum::response::{AppendHeaders, Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use rust_embed::Embed;
 
-use crate::auth::{SessionUser, random_token};
+use crate::auth::{Principal, SessionUser, random_token};
 use crate::db::document_type::Document;
 use crate::documents::devbox::DevboxDoc;
 use crate::routes::{AppState, SharedState};
@@ -477,15 +477,19 @@ async fn submit_claim(
     Form(form): Form<ClaimFormData>,
 ) -> Response {
     // The owner is always the signed-in user.
-    let owner = match require_login(&state, &headers).await {
-        Ok(user) => user.principal,
+    let user = match require_login(&state, &headers).await {
+        Ok(user) => user,
         Err(redirect) => return redirect,
+    };
+    let claimant = Principal {
+        owner: user.principal,
+        email: user.display,
     };
 
     // Claim through the shared routine (validation, uniqueness, and the
     // race-safe re-check all live there). On failure, re-render the form with
     // the same message the API would return, echoing back the typed name.
-    match crate::service::claim_devbox(&state, &owner, form.name.as_deref()).await {
+    match crate::service::claim_devbox(&state, &claimant, form.name.as_deref()).await {
         Ok(doc) => Redirect::to(&format!("/devboxes/{}", doc.id)).into_response(),
         Err(e) => ClaimFormTemplate {
             name: form.name,

@@ -62,9 +62,16 @@ struct TokenResponse {
     id_token: String,
 }
 
-/// An authenticated principal (the `owner` a caller may act as).
+/// An authenticated principal: the `owner` a caller may act as, plus the full
+/// `email` it was derived from (carried so a claim can record the box owner's git
+/// identity).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Principal(pub String);
+pub struct Principal {
+    /// Unix-safe login derived from the email local part; the claim/release owner.
+    pub owner: String,
+    /// Full email address, used to set the claimant's git identity on the box.
+    pub email: String,
+}
 
 /// A signed-in dashboard user: the `principal` (the Unix-safe `owner`/login,
 /// derived from the email local part) plus the full `email` shown in the UI.
@@ -150,7 +157,10 @@ impl Authenticator {
     pub async fn authenticate(&self, headers: &HeaderMap) -> Result<Principal, AuthError> {
         #[cfg(test)]
         if let Some(owner) = &self.test_owner {
-            return Ok(Principal(owner.clone()));
+            return Ok(Principal {
+                owner: owner.clone(),
+                email: format!("{owner}@example.com"),
+            });
         }
 
         if let Some(value) = headers.get(ALB_OIDC_DATA_HEADER) {
@@ -186,8 +196,8 @@ impl Authenticator {
         // audience to pin. The boundary is issuer + signature + `email`.
         validation.validate_aud = false;
 
-        let (owner, _email) = decode_owner(token, &key, &validation)?;
-        Ok(Principal(owner))
+        let (owner, email) = decode_owner(token, &key, &validation)?;
+        Ok(Principal { owner, email })
     }
 
     /// Verify an ALB `x-amzn-oidc-data` JWT against the ALB's regional key.
@@ -213,8 +223,8 @@ impl Authenticator {
         let mut validation = Validation::new(Algorithm::ES256);
         validation.validate_aud = false;
 
-        let (owner, _email) = decode_owner(token, &key, &validation)?;
-        Ok(Principal(owner))
+        let (owner, email) = decode_owner(token, &key, &validation)?;
+        Ok(Principal { owner, email })
     }
 
     /// Look up a bearer signing key by `kid`, refreshing the JWKS on a miss.
