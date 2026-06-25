@@ -8,6 +8,7 @@
 //! - `warmup` — warm the host and self-tag `devbox:ready=true` so the reconciler
 //!   marks the `DevboxDoc` Ready; boxes that never tag ready are reaped.
 
+mod freshen;
 mod imds;
 mod owner_sync;
 mod principals;

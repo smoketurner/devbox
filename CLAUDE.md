@@ -195,11 +195,13 @@ SQLite/DSQL with optimistic concurrency, **adopt-only** ASG reconciler (adopts t
 Terraform ASG by name, syncs membership, maintains desired capacity, scale-in
 protection, `devbox:owner` tagging via `apply_pending_owner_tags`), graceful
 shutdown, Tailwind-styled HTML dashboard, unit tests. **Tag-based readiness gate:** instances
-auto-join the ASG (no launch lifecycle hook); `devbox-agent warmup` self-sets
-`devbox:ready=true` via `ec2:CreateTags`; the reconciler flips `DevboxDoc`
-`Warming → Ready` on that tag; boxes that never tag ready within `ready_timeout`
-(`POOL_READY_TIMEOUT_SECS`, default 300 s, validated 60–3600 s) are terminated and
-the ASG relaunches them. **SSH/Vouch-CA path:** `devbox-agent` (principals resolver
+auto-join the ASG (no launch lifecycle hook); `devbox-agent warmup` starts Docker,
+freshens the snapshot-seeded repos under `/workspace`
+(`crates/devbox-agent/src/freshen.rs`; see the "Workspace freshening" planned item
+below for the infra half), then self-sets `devbox:ready=true` via `ec2:CreateTags`; the reconciler flips
+`DevboxDoc` `Warming → Ready` on that tag; boxes that never tag ready within
+`ready_timeout` (`POOL_READY_TIMEOUT_SECS`, default 300 s, validated 60–3600 s) are
+terminated and the ASG relaunches them. **SSH/Vouch-CA path:** `devbox-agent` (principals resolver
 + per-principal account provisioning + warmup) baked into the AMI; Terraform `pool`
 module provides the host instance profile (SSM core + `ec2:CreateTags` for
 `devbox:ready`), `InstanceMetadataTags=enabled`, and sshd `AuthorizedPrincipalsCommand`
@@ -279,11 +281,27 @@ are tagged inline):
   above), but the Vouch config must still be set so `AUTH_PRINCIPAL_CLAIM` emits a
   Unix-safe username (not the default UUID `sub`) that equals the SSH cert
   principal. Verify end-to-end (OIDC claim == cert principal == `owner-sync` account).
-- **Snapshot-seeded EBS workspace** — attach a periodically-refreshed snapshot
-  (pre-cloned repos + warm caches) at launch, with **lazy write-gating** (reads
-  immediate, writes gated until a background `git` sync finishes). _(cf. Ramp Inspect)_
-- **Health-check gating of "warming"** — `devbox-agent warmup` should gate Ready on
-  real readiness (docker/repos/network), not just hook completion; **idle-claim
+- **Workspace freshening (snapshot-seeded EBS workspace)** — *Agent half
+  implemented:* `devbox-agent warmup` discovers git repos under `/workspace` and
+  `git fetch` + hard-resets each to upstream HEAD before tagging ready
+  (`crates/devbox-agent/src/freshen.rs`). Read-only credential via
+  `DEVBOX_GITHUB_TOKEN` (a GitHub App installation token minted off-box); the fetch
+  is time-budgeted (`WARMUP_FETCH_TIMEOUT_SECS`, default 120 s) and **degrades, does
+  not reap** — a too-large delta still becomes Ready on the snapshot-age checkout,
+  while an empty `/workspace` under `DEVBOX_REQUIRE_WORKSPACE` fails warm-up so the
+  box is reaped. Freshness is **warming-time only** (no claim-time fetch / lazy
+  write-gating — the claimant fetches HEAD themselves post-claim). *Still in
+  `devbox-infra`:* the periodic snapshot-builder pipeline + `/devbox/workspace-snapshot/latest`
+  SSM param + Launch Template block-device-mapping (per-instance volume, encrypted,
+  `DeleteOnTermination=true`) that seeds the volume, the off-box token broker, and the
+  GitHub egress allowlist. _(cf. Ramp Inspect)_
+- **Warm dependency/build caches** — warm language caches (Rust `target/` +
+  `CARGO_HOME`, Go/Node/Python equivalents) into the snapshot via a per-repo
+  `.devbox/warm.sh` hook run by the snapshot-builder, with shared caches on the data
+  volume and `CARGO_HOME` etc. set system-wide so they survive into the claimant's
+  fresh home. Optional remote cache (sccache / Bazel) through the allowlist. _(cf. Ramp Inspect)_
+- **Health-check gating of "warming"** — `devbox-agent warmup` already gates Ready on
+  Docker + repo freshen; extend to network and richer health, plus **idle-claim
   reclaim**.
 - **Durable agent sessions** — snapshot-on-release so a later follow-up restores
   even after the box is reclaimed. _(cf. Ramp Inspect)_
