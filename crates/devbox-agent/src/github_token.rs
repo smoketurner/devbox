@@ -109,11 +109,11 @@ impl TokenMinter {
     ///
     /// Returns an error if the box is configured but the SSM key fetch, key
     /// parsing, or HTTP client construction fails.
-    pub(crate) async fn new(region: &str) -> Result<Option<Self>> {
+    pub(crate) async fn new() -> Result<Option<Self>> {
         let Some(cfg) = config() else {
             return Ok(None);
         };
-        let pem = tokio::time::timeout(KEY_READ_TIMEOUT, read_key(region, &cfg.key_param))
+        let pem = tokio::time::timeout(KEY_READ_TIMEOUT, read_key(&cfg.key_param))
             .await
             .context("GitHub App key read timed out")??;
         let key = EncodingKey::from_rsa_pem(pem.as_bytes())
@@ -244,10 +244,15 @@ fn non_empty(key: &str) -> Option<String> {
 }
 
 /// Read the GitHub App private key (PEM) from an SSM SecureString parameter using
-/// the host instance profile.
-async fn read_key(region: &str, param: &str) -> Result<String> {
+/// the host instance profile. Resolves the region from IMDS so the SSM client is
+/// correctly bound even when `AWS_REGION` is not set (the Rust SDK's default
+/// config chain has no IMDS region fallback).
+async fn read_key(param: &str) -> Result<String> {
+    let region = crate::imds::region()
+        .await
+        .context("read region from IMDS for SSM client")?;
     let config = aws_config::defaults(BehaviorVersion::latest())
-        .region(Region::new(region.to_string()))
+        .region(Region::new(region))
         .load()
         .await;
     let ssm = aws_sdk_ssm::Client::new(&config);

@@ -22,14 +22,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use tokio::process::Command;
 
+use crate::git::{build_minter, run_git};
 use crate::github_token::TokenMinter;
 
 /// Where the snapshot-seeded repositories live.
 const WORKSPACE: &str = "/workspace";
-
-/// Env var the credential helper reads the token from; the agent sets it on the
-/// git child from the freshly minted token (it is never baked or inherited).
-const TOKEN_ENV: &str = "DEVBOX_GITHUB_TOKEN";
 
 /// Environment variable overriding the overall fetch time budget, in seconds.
 const BUDGET_ENV: &str = "WARMUP_FETCH_TIMEOUT_SECS";
@@ -47,18 +44,12 @@ const MIN_STEP: Duration = Duration::from_secs(1);
 /// while the working-tree reset is skipped.
 const LOCAL_GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Inline git credential helper: emit `x-access-token` plus the token from the
-/// child environment. The token itself never appears in the process arguments —
-/// only the variable name does.
-const CREDENTIAL_HELPER: &str =
-    "!f() { echo username=x-access-token; echo \"password=$DEVBOX_GITHUB_TOKEN\"; }; f";
-
 /// Freshen every repository under `/workspace`.
 ///
 /// Each repo is fetched and hard-reset to its upstream HEAD within the shared time
 /// budget; a repo that errors or times out is left at its snapshot-age state and
 /// logged. An absent or empty `/workspace` simply skips freshening.
-pub(crate) async fn freshen_workspace(region: &str) {
+pub(crate) async fn freshen_workspace() {
     let repos = repos_under(Path::new(WORKSPACE));
     if repos.is_empty() {
         tracing::info!(
@@ -68,7 +59,7 @@ pub(crate) async fn freshen_workspace(region: &str) {
         return;
     }
 
-    let mut minter = build_minter(region).await;
+    let mut minter = build_minter().await;
     // Resolve a token per repo *before* starting the fetch timer, so installation
     // discovery/mint latency is not charged against the budget — only the git fetch
     // is. Tokens last an hour, well beyond the fetch loop.
@@ -157,45 +148,6 @@ async fn fetch_reset_clean(
     Ok(())
 }
 
-/// Run `git -C <repo> <args>` under GNU `timeout <cap>`, so a stuck op is
-/// group-killed exactly at `cap` rather than orphaning git's process group the way
-/// an outer cancel-and-kill would.
-///
-/// `git fetch` spawns helpers (`git-remote-https`, …) in its process group; a
-/// parent-only kill would orphan them to keep doing network I/O and writing under
-/// `.git`. GNU `timeout` (AL2023 coreutils, like the `git`/`useradd`/`chown` the
-/// agent already shells out to) runs `git` in its own group and signals the whole
-/// group on expiry — SIGTERM first so `git` removes its own locks, then SIGKILL
-/// (`-k`) for stragglers.
-async fn run_git(repo: &Path, token: Option<&str>, args: &[&str], cap: Duration) -> Result<()> {
-    let mut cmd = Command::new("timeout");
-    cmd.arg("-k")
-        .arg("5")
-        .arg(cap.as_secs().max(1).to_string())
-        .arg("git")
-        .arg("-C")
-        .arg(repo);
-    if let Some(token) = token {
-        cmd.arg("-c")
-            .arg(format!("credential.helper={CREDENTIAL_HELPER}"))
-            .env(TOKEN_ENV, token);
-    }
-    // Never block on an interactive prompt if a credential is missing or rejected.
-    cmd.env("GIT_TERMINAL_PROMPT", "0")
-        .args(args)
-        .kill_on_drop(true);
-
-    let status = cmd
-        .status()
-        .await
-        .with_context(|| format!("run timeout git {}", args.join(" ")))?;
-    if status.success() {
-        Ok(())
-    } else {
-        anyhow::bail!("git {} exited with {:?}", args.join(" "), status.code())
-    }
-}
-
 /// Time left in the shared budget, or `None` once too little remains to be worth
 /// granting (below `MIN_STEP`), so the caller degrades instead of running.
 fn step_timeout(start: Instant, budget: Duration) -> Option<Duration> {
@@ -239,28 +191,6 @@ fn remove_lock_files(dir: &Path, recurse: bool) {
                     tracing::debug!(path = %path.display(), error = %e, "could not remove stale git lock");
                 }
             }
-        }
-    }
-}
-
-/// Build the GitHub App token minter, degrading to `None` (unauthenticated fetch)
-/// when the box isn't configured for it or construction fails — private repos then
-/// serve their snapshot-age checkout.
-async fn build_minter(region: &str) -> Option<TokenMinter> {
-    match TokenMinter::new(region).await {
-        Ok(Some(minter)) => Some(minter),
-        Ok(None) => {
-            tracing::warn!(
-                "GitHub App not configured; fetching without credentials (private repos won't freshen)"
-            );
-            None
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %format!("{e:#}"),
-                "failed to build GitHub token minter; fetching without credentials"
-            );
-            None
         }
     }
 }

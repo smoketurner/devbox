@@ -37,11 +37,14 @@ pub(crate) async fn run() -> Result<()> {
     let instance_id = imds::get(&imds_client, "/latest/meta-data/instance-id")
         .await?
         .context("instance-id unavailable from IMDS")?;
+    // Self-tagging must target this instance's placement region, not an AWS_REGION
+    // override — a mismatched region makes ec2:CreateTags fail and the box never goes
+    // Ready. (read_key uses the AWS_REGION-honoring imds::region for SSM access.)
     let region = imds::get(&imds_client, "/latest/meta-data/placement/region")
         .await?
         .context("region unavailable from IMDS")?;
 
-    freshen::freshen_workspace(&region).await;
+    freshen::freshen_workspace().await;
 
     let ec2_client = ec2_client(region).await;
     tag_ready(&ec2_client, &instance_id).await?;
@@ -50,8 +53,10 @@ pub(crate) async fn run() -> Result<()> {
     Ok(())
 }
 
-/// Build an EC2 client bound to the instance's region, using the host
-/// instance-profile credentials.
+/// Build an EC2 client bound to `region` — this instance's IMDS placement region.
+/// Self-tagging uses the placement region directly rather than the
+/// `AWS_REGION`-honoring `imds::region`, since `ec2:CreateTags` must target the
+/// region where this instance actually runs.
 async fn ec2_client(region: String) -> aws_sdk_ec2::Client {
     let config = aws_config::defaults(BehaviorVersion::latest())
         .region(Region::new(region))
