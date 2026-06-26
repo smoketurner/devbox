@@ -31,7 +31,7 @@ rust-ini = { workspace = true, features = ["inline-comment"] }
 rustls = { workspace = true, features = ["aws_lc_rs", "std", "tls12"] }
 serde = { workspace = true, features = ["std", "derive"] }
 serde_json = { workspace = true, features = ["std"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "io-util", "io-std"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "io-util", "io-std", "process"] }
 tokio-tungstenite = { workspace = true, features = ["connect", "rustls-tls-webpki-roots"] }
 uuid = { workspace = true, features = ["v7"] }
 webpki-roots = { workspace = true }

@@ -506,7 +506,7 @@ pub(crate) async fn cmd_ssh(
         print,
         extra: args,
     };
-    crate::ssh::connect(&devbox, &opts)
+    crate::ssh::connect(&devbox, &opts).await
 }
 
 /// Native SSM data-channel proxy used as an ssh `ProxyCommand`.
