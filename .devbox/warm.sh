@@ -9,4 +9,5 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
+make test
 make build
