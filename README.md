@@ -132,6 +132,78 @@ devbox release --server http://localhost:3000
 | [`devbox-common`](crates/devbox-common/) | Shared types: `DevboxId`, `DevboxState` enum, API request/response types, configuration |
 | [`devbox-server`](crates/devbox-server/) | Axum HTTP server with database layer (SQLite/DSQL), pool reconciliation, EC2 orchestration, HTML dashboard |
 | [`devbox-cli`](crates/devbox-cli/) | CLI binary with `claim`, `release`, `rename`, `list`, `status`, `ssh` subcommands via reqwest |
+| [`devbox-agent`](crates/devbox-agent/) | On-host binary baked into the golden AMI: `principals` (sshd resolver), `owner-sync` (provision the claimant's account), `warmup` (freshen `/workspace`, self-tag `devbox:ready=true`) |
+
+## Components and the AMI pipeline
+
+There is a hard ownership line between this repo and the Terraform substrate in
+[`devbox-infra`](https://github.com/smoketurner/devbox-infra). This repo owns
+*behavior* and ships two artifacts; `devbox-infra` owns *infrastructure* and
+consumes them. Neither side's code provisions the other's resources — the
+reconciler is **adopt-only**.
+
+| Repo | Owns | Produces |
+|------|------|----------|
+| **`devbox`** (this repo) | Control plane + on-host tooling | A **server container image** (→ ECR/ECS) and the **`devbox-agent` binary** (→ GitHub release) |
+| **`devbox-infra`** | AWS substrate: VPC, IAM, the golden-AMI pipeline, the pool ASG, the workspace snapshot, the ECS control plane | The **golden AMI** + the running ASG/ECS that consume the two artifacts |
+
+Where each crate runs determines how it reaches the host:
+
+- `devbox-server` is **deployed** to ECS/Fargate. It never logs into a box; it
+  adopts the Terraform-provisioned ASG and writes runtime state (desired
+  capacity, `devbox:owner` tags, terminations).
+- `devbox-cli` runs **off-box** on a laptop and reaches instances over an SSM
+  tunnel — no bastion, VPN, or public IP.
+- `devbox-agent` is the **only** crate baked into the AMI. It is the single seam
+  where this repo's code crosses into the image.
+
+### The `04-devbox` seam
+
+`devbox-infra` builds the AMI with EC2 Image Builder from an ordered component
+chain (`modules/image-builder/components/`): `01-base` (OS hardening) → `02-toolchain`
+(language runtimes) → `03-repos` (git access) → **`04-devbox`** → `05-docker-images`
+(pre-pulled images) → `99-validation`. The fourth component,
+`04-devbox.yml.tftpl`, is what binds `devbox-agent` into the image:
+
+1. **Downloads the agent** from a Terraform-injected `agent_url` + `agent_sha256`
+   to `/usr/local/sbin/devbox-agent`. CI in this repo builds the
+   `aarch64-unknown-linux-musl` binary (`make bake-agent`), publishes it to a
+   GitHub release, and `devbox-infra` pins that URL + SHA. A new agent version is
+   a new release + a recipe bump.
+2. **Installs the systemd units** that invoke `devbox-agent warmup` and
+   `devbox-agent owner-sync`, plus `/etc/devbox/warmup.env` baked from non-secret
+   Terraform vars (GitHub App id, the SSM parameter name holding the App key,
+   fetch timeout). The App private key itself is never baked — `warmup` reads it
+   from SSM at boot.
+3. **Configures sshd + the Vouch CA** — drops `TrustedUserCAKeys` and
+   `AuthorizedPrincipalsCommand /usr/local/sbin/devbox-agent principals %u`, and
+   fetches the Vouch CA public key. This is the host half of the access model in
+   [`CLAUDE.md`](CLAUDE.md).
+
+The pool launch template (`modules/pool`) then resolves the AMI lazily
+(`image_id = resolve:ssm:/devbox/ami/latest`), enables IMDSv2 with instance tags
+(read by `principals`/`owner-sync`), and clones the workspace snapshot
+(`modules/snapshot-builder`) as a per-instance volume that `warmup` freshens.
+
+### Runtime handshake
+
+```
+devbox-infra (Image Builder)                 devbox repo CI
+  01→05 components build the AMI                builds devbox-agent (musl)
+  04-devbox curls the agent from ───────────►  GitHub release (url + sha256)
+  publishes AMI id → /devbox/ami/latest
+
+devbox-infra (pool ASG + LT)                 devbox-server (ECS, adopt-only)
+  LT resolves AMI, clones workspace snap        reconciler keeps N warm
+  instance boots:
+    warmup.service ──► devbox-agent warmup
+        freshen /workspace, tag devbox:ready=true
+                                          reconciler sees tag → Ready
+  devbox claim (CLI) ──► server tags devbox:owner / devbox:owner-email
+    owner-sync.service ──► devbox-agent owner-sync (provisions account)
+  devbox ssh (CLI, native SSM tunnel)
+    sshd ──► devbox-agent principals %u ──► authorize iff login == owner
+```
 
 ## Configuration
 

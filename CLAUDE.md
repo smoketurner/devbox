@@ -89,6 +89,12 @@ component (sshd drop-in + Vouch CA key + `devbox-agent`); the SSH login itself i
 
 ## Architecture (30-second version)
 
+**Lifecycle:** `Launching → Warming → Ready → Claimed → Terminating` (`DevboxState`
+in `crates/devbox-common/src/lib.rs`). The ASG launches a box (`Launching`);
+`devbox-agent warmup` self-tags `devbox:ready=true` and the reconciler flips
+`Warming → Ready`; `claim` moves `Ready → Claimed` and applies the `devbox:owner`
+tag; `release` or the ready-timeout reaper drives `Terminating`.
+
 Rust workspace, four crates:
 
 | Crate | Role |
@@ -151,8 +157,18 @@ RUST_LOG=info,devbox_server=debug \
 cargo run --bin devbox-server          # serves http://localhost:3000
 ```
 
+The dashboard CSS is compiled by the **TailwindCSS v4 standalone CLI (not npm)**
+and embedded into the binary at compile time via `rust-embed`; `make build`
+includes that step, so after changing CSS you must rebuild the binary. `make
+test` needs neither Tailwind nor AWS — tests use a placeholder CSS asset and
+in-memory SQLite.
+
 ## Conventions (enforced — see `.kiro/steering/code-conventions.md`)
 
+- **Toolchain**: Rust `1.96.0`, edition 2024 (`rust-toolchain.toml`). Release
+  profile is `lto`/`codegen-units = 1`/`opt-level = "z"`/`strip`/**`panic =
+  "abort"`** — abort-on-panic is *why* the no-panic policy below is a hard lint,
+  not a preference (a panic is a process abort in release).
 - **No panics in production code**: `unwrap`/`expect`/`panic`/`unreachable`/
   `todo`/indexing/unchecked arithmetic are *denied* at the lint level. Use
   `.get()`, `checked_*`/`saturating_*`, and `try_into`. Tests opt out with
