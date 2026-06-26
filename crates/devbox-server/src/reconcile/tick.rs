@@ -646,10 +646,23 @@ async fn update_scale_in_protection(
     }
 }
 
-/// Step 9: Apply pending owner tags.
+/// Step 9: Re-assert owner tags every tick and apply them for the first time.
 ///
-/// For Claimed docs with `owner_tag_applied=false`, `instance_id` set, and
-/// `owner` set: call `tag_instance` and mark as applied on success.
+/// For each Claimed doc with an `owner` set, calls `tag_instance` with the
+/// doc-dictated owner (and optional owner-email) on **every** tick.
+/// `ec2:CreateTags` is idempotent — re-applying an unchanged value is a no-op,
+/// and re-applying a tampered value overwrites it within one tick.
+/// Keys present on the instance but absent from the doc (e.g. a stale
+/// `devbox:owner-email` when `owner_email` is later cleared) are not deleted.
+///
+/// `owner_tag_applied` gates first-application bookkeeping only:
+/// - When `false`: on a successful `tag_instance`, flip it via
+///   `compare_and_update` and emit an info log.
+/// - When `true`: the idempotent re-write still runs, but no DB update and no
+///   info log, to avoid per-tick churn and log spam.
+///
+/// Step 9 runs regardless of `describe_ok` (owner-tagging does not depend on
+/// the tick-start `DescribeInstances`).
 async fn apply_pending_owner_tags(
     store: &DocumentStore,
     compute: &(impl Compute + ?Sized),
@@ -657,9 +670,6 @@ async fn apply_pending_owner_tags(
 ) {
     for doc in all_docs {
         if doc.data.state != DevboxState::Claimed {
-            continue;
-        }
-        if doc.data.owner_tag_applied {
             continue;
         }
 
@@ -670,13 +680,14 @@ async fn apply_pending_owner_tags(
             None => continue,
         };
 
-        // The claimant's email rides alongside the owner so the host can set the
-        // git identity; older docs without it just carry `devbox:owner`.
+        // Build the full doc-dictated tag set: devbox:owner always, plus
+        // devbox:owner-email when present (for git identity on the host).
         let mut tags: Vec<(&str, &str)> = vec![("devbox:owner", owner)];
         if let Some(ref email) = doc.data.owner_email {
             tags.push(("devbox:owner-email", email.as_str()));
         }
 
+        // Re-assert unconditionally — idempotent on match, self-heals on divergence.
         if let Err(e) = compute.tag_instance(instance_id, &tags).await {
             tracing::error!(
                 error = %e,
@@ -687,7 +698,13 @@ async fn apply_pending_owner_tags(
             continue;
         }
 
-        // Update doc with owner_tag_applied = true
+        // Only flip owner_tag_applied and emit the info log on first application.
+        // For subsequent ticks (already true), the idempotent re-write above is
+        // sufficient — no DB update and no info log to avoid per-tick churn.
+        if doc.data.owner_tag_applied {
+            continue;
+        }
+
         let mut updated_doc = doc.data.clone();
         updated_doc.owner_tag_applied = true;
 
