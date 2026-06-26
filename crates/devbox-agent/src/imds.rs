@@ -4,7 +4,7 @@
 //! endpoint, and retries internally. All three subcommands read instance
 //! identity and tags through these helpers.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use aws_config::imds::client::Client;
 use aws_config::imds::client::error::ImdsError;
 
@@ -36,4 +36,28 @@ pub(crate) async fn get(client: &Client, path: &str) -> Result<Option<String>> {
 /// Returns an error on transport failure or an unexpected error response.
 pub(crate) async fn instance_tag(client: &Client, key: &str) -> Result<Option<String>> {
     get(client, &format!("/latest/meta-data/tags/instance/{key}")).await
+}
+
+/// Resolve the AWS region: `AWS_REGION` -> `AWS_DEFAULT_REGION` -> IMDS
+/// `placement/region`. The IMDS fallback is needed because the Rust SDK's
+/// default region chain checks only env + profile (no IMDS) and AWS_REGION is
+/// unset inside the `devbox-warmup.service` systemd unit.
+///
+/// # Errors
+///
+/// Returns an error on IMDS transport failure or if none of the sources
+/// provides a region.
+pub(crate) async fn region() -> Result<String> {
+    for key in ["AWS_REGION", "AWS_DEFAULT_REGION"] {
+        if let Ok(value) = std::env::var(key) {
+            let value = value.trim().to_string();
+            if !value.is_empty() {
+                return Ok(value);
+            }
+        }
+    }
+    let client = client();
+    get(&client, "/latest/meta-data/placement/region")
+        .await?
+        .context("region unavailable from IMDS")
 }

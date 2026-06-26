@@ -8,13 +8,16 @@
 //! - `warmup` — warm the host and self-tag `devbox:ready=true` so the reconciler
 //!   marks the `DevboxDoc` Ready; boxes that never tag ready are reaped.
 
+mod checkout;
 mod freshen;
+mod git;
 mod github_token;
 mod imds;
 mod owner_sync;
 mod principals;
 mod warmup;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -40,6 +43,15 @@ enum Command {
     OwnerSync,
     /// Warm the host and self-tag the instance `devbox:ready=true` via EC2.
     Warmup,
+    /// Clone the given repos onto the workspace, minting a read-only token per repo.
+    Checkout {
+        /// Target workspace directory.
+        #[arg(long, default_value = "/workspace")]
+        workspace: PathBuf,
+        /// Repo clone URLs (one checkout each under the workspace).
+        #[arg(required = true)]
+        repos: Vec<String>,
+    },
 }
 
 // Current-thread runtime: the agent reads IMDS / calls the AWS SDK (both async)
@@ -63,6 +75,16 @@ async fn main() -> ExitCode {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     tracing::error!(error = %format!("{e:#}"), "warm-up failed");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Command::Checkout { workspace, repos } => {
+            init_tracing();
+            match checkout::run(&workspace, &repos).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    tracing::error!(error = %format!("{e:#}"), "checkout failed");
                     ExitCode::FAILURE
                 }
             }

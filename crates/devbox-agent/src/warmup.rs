@@ -37,27 +37,33 @@ pub(crate) async fn run() -> Result<()> {
     let instance_id = imds::get(&imds_client, "/latest/meta-data/instance-id")
         .await?
         .context("instance-id unavailable from IMDS")?;
-    let region = imds::get(&imds_client, "/latest/meta-data/placement/region")
-        .await?
-        .context("region unavailable from IMDS")?;
 
-    freshen::freshen_workspace(&region).await;
+    freshen::freshen_workspace().await;
 
-    let ec2_client = ec2_client(region).await;
+    let ec2_client = ec2_client().await?;
     tag_ready(&ec2_client, &instance_id).await?;
 
     tracing::info!(instance_id, "warm-up complete; tagged devbox:ready=true");
     Ok(())
 }
 
-/// Build an EC2 client bound to the instance's region, using the host
-/// instance-profile credentials.
-async fn ec2_client(region: String) -> aws_sdk_ec2::Client {
+/// Build an EC2 client bound to the instance's region, resolving the region
+/// from IMDS. The Rust SDK's default config chain has no IMDS region fallback,
+/// so an explicit fetch is required when `AWS_REGION` is unset (the warmup
+/// systemd unit does not set it).
+///
+/// # Errors
+///
+/// Returns an error if the region cannot be read from IMDS.
+async fn ec2_client() -> Result<aws_sdk_ec2::Client> {
+    let region = imds::region()
+        .await
+        .context("read region from IMDS for EC2 client")?;
     let config = aws_config::defaults(BehaviorVersion::latest())
         .region(Region::new(region))
         .load()
         .await;
-    aws_sdk_ec2::Client::new(&config)
+    Ok(aws_sdk_ec2::Client::new(&config))
 }
 
 /// Set `devbox:ready=true` on this instance.
