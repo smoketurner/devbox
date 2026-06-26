@@ -233,13 +233,13 @@ pub(crate) async fn connect(devbox: &DevboxResponse, opts: &SshOptions) -> Resul
 /// second SSM tunnel. `ControlPersist` is added by [`SshCore::probe_args`]
 /// only — it governs the post-logout linger of the master socket.
 ///
-/// When `identity` is `Some` but either path cannot be represented as UTF-8,
-/// the identity and multiplexing options are silently omitted and ssh falls
-/// back to unconstrained identity selection (the pre-change behaviour).
+/// `identity` carries already-validated UTF-8 paths (see [`vouch_identity_for`]),
+/// so a `Some` identity always yields the options — there is no in-band UTF-8
+/// check here that could diverge from the caller's probe gate.
 fn build_core(
     devbox: &DevboxResponse,
     opts: &SshOptions,
-    identity: Option<&(PathBuf, PathBuf)>,
+    identity: Option<&(String, String)>,
 ) -> Result<SshCore> {
     let instance_id = devbox.instance_id.as_str();
 
@@ -276,21 +276,21 @@ fn build_core(
 
     let mut pre_host = vec!["-o".to_string(), format!("ProxyCommand={proxy}")];
 
-    // When the Vouch default key/cert pair is present and both paths are
-    // representable as UTF-8, constrain ssh to that single identity so the
-    // box's sshd is not flooded with every agent key before reaching the cert.
-    // When absent (non-default path, cert-only in agent, non-UTF-8 home, etc.)
-    // fall back to today's unconstrained behaviour.
-    if let Some((key, cert)) = identity
-        && let (Some(key_str), Some(cert_str)) = (key.to_str(), cert.to_str())
-    {
+    // When the Vouch default key/cert pair is pinned (vouch_identity already
+    // verified both files exist and their paths are valid UTF-8), constrain ssh
+    // to that single identity so the box's sshd is not flooded with every agent
+    // key before reaching the cert, and enable connection multiplexing so the
+    // probe and interactive session share one SSM tunnel. When absent
+    // (non-default path, cert-only in agent, non-UTF-8 home, etc.) fall back to
+    // today's unconstrained behaviour, and connect() skips the probe.
+    if let Some((key, cert)) = identity {
         pre_host.extend([
             "-o".to_string(),
             "IdentitiesOnly=yes".to_string(),
             "-o".to_string(),
-            format!("IdentityFile={key_str}"),
+            format!("IdentityFile={key}"),
             "-o".to_string(),
-            format!("CertificateFile={cert_str}"),
+            format!("CertificateFile={cert}"),
             // ControlMaster=auto: probe opens the master; interactive joins it.
             // ControlPath uses ssh token %C (hash of host+port+user) so probe
             // and interactive always resolve to the same socket. ssh expands
@@ -301,7 +301,6 @@ fn build_core(
             "-o".to_string(),
             "ControlPath=~/.ssh/devbox-ssm-%C".to_string(),
         ]);
-        // Non-UTF-8 path: silently omit identity and multiplexing options.
     }
 
     Ok(SshCore {
@@ -318,7 +317,7 @@ fn build_core(
 fn build_args(
     devbox: &DevboxResponse,
     opts: &SshOptions,
-    identity: Option<&(PathBuf, PathBuf)>,
+    identity: Option<&(String, String)>,
 ) -> Result<Vec<String>> {
     let core = build_core(devbox, opts, identity)?;
     Ok(core.interactive_args(&opts.extra))
@@ -328,24 +327,29 @@ fn build_args(
 ///
 /// Returns `Some((key, cert))` only when both
 /// `<home>/.ssh/id_ed25519_vouch` and `<home>/.ssh/id_ed25519_vouch-cert.pub`
-/// exist on disk. Returns `None` if either is absent (non-default layout,
-/// cert held only in the agent, etc.) — callers fall back to unconstrained
-/// identity selection.
-fn vouch_identity_for(home: &Path) -> Option<(PathBuf, PathBuf)> {
+/// exist on disk **and** their paths are valid UTF-8 (so they can be passed as
+/// `ssh -o` values). Returns `None` if either is absent (non-default layout,
+/// cert held only in the agent, etc.) or non-UTF-8 — callers fall back to
+/// unconstrained identity selection and skip the readiness probe. Validating
+/// UTF-8 here (rather than in the caller) keeps a single signal: a `Some`
+/// identity always yields the `IdentitiesOnly` options, so the probe can never
+/// run without them and flood every agent key.
+fn vouch_identity_for(home: &Path) -> Option<(String, String)> {
     let key = home.join(".ssh").join("id_ed25519_vouch");
     let cert = home.join(".ssh").join("id_ed25519_vouch-cert.pub");
-    if key.exists() && cert.exists() {
-        Some((key, cert))
-    } else {
-        None
+    if !(key.exists() && cert.exists()) {
+        return None;
     }
+    let key = key.into_os_string().into_string().ok()?;
+    let cert = cert.into_os_string().into_string().ok()?;
+    Some((key, cert))
 }
 
 /// Resolve the Vouch SSH identity from `$HOME` (falling back to `$USERPROFILE`).
 ///
 /// Returns `None` when the home directory cannot be determined or when either
 /// of the Vouch default paths is absent.
-fn vouch_identity() -> Option<(PathBuf, PathBuf)> {
+fn vouch_identity() -> Option<(String, String)> {
     let home = std::env::var_os("HOME")
         .filter(|v| !v.is_empty())
         .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
@@ -508,8 +512,8 @@ mod tests {
 
     #[test]
     fn identity_options_precede_destination() {
-        let key = PathBuf::from("/home/jdoe/.ssh/id_ed25519_vouch");
-        let cert = PathBuf::from("/home/jdoe/.ssh/id_ed25519_vouch-cert.pub");
+        let key = "/home/jdoe/.ssh/id_ed25519_vouch".to_string();
+        let cert = "/home/jdoe/.ssh/id_ed25519_vouch-cert.pub".to_string();
         let devbox = claimed("i-0abc", Some("jdoe"));
         let args = build_args(&devbox, &opts(), Some(&(key, cert))).expect("args");
 
@@ -663,8 +667,20 @@ mod tests {
         std::fs::File::create(ssh_dir.join("id_ed25519_vouch-cert.pub")).expect("create cert");
         let result = vouch_identity_for(&dir);
         let (key, cert) = result.expect("both files present => Some");
-        assert_eq!(key, ssh_dir.join("id_ed25519_vouch"));
-        assert_eq!(cert, ssh_dir.join("id_ed25519_vouch-cert.pub"));
+        assert_eq!(
+            key,
+            ssh_dir
+                .join("id_ed25519_vouch")
+                .to_str()
+                .expect("utf8 key path")
+        );
+        assert_eq!(
+            cert,
+            ssh_dir
+                .join("id_ed25519_vouch-cert.pub")
+                .to_str()
+                .expect("utf8 cert path")
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -684,8 +700,8 @@ mod tests {
 
     #[test]
     fn control_master_present_in_both_args_when_identity_some() {
-        let key = PathBuf::from("/home/jdoe/.ssh/id_ed25519_vouch");
-        let cert = PathBuf::from("/home/jdoe/.ssh/id_ed25519_vouch-cert.pub");
+        let key = "/home/jdoe/.ssh/id_ed25519_vouch".to_string();
+        let cert = "/home/jdoe/.ssh/id_ed25519_vouch-cert.pub".to_string();
         let devbox = claimed("i-0abc", Some("jdoe"));
         let core = build_core(&devbox, &opts(), Some(&(key, cert))).expect("core");
 
@@ -738,8 +754,8 @@ mod tests {
 
     #[test]
     fn control_persist_in_probe_but_not_interactive() {
-        let key = PathBuf::from("/home/jdoe/.ssh/id_ed25519_vouch");
-        let cert = PathBuf::from("/home/jdoe/.ssh/id_ed25519_vouch-cert.pub");
+        let key = "/home/jdoe/.ssh/id_ed25519_vouch".to_string();
+        let cert = "/home/jdoe/.ssh/id_ed25519_vouch-cert.pub".to_string();
         let devbox = claimed("i-0abc", Some("jdoe"));
         let core = build_core(&devbox, &opts(), Some(&(key, cert))).expect("core");
 
@@ -758,8 +774,8 @@ mod tests {
 
     #[test]
     fn control_persist_value_matches_const() {
-        let key = PathBuf::from("/home/jdoe/.ssh/id_ed25519_vouch");
-        let cert = PathBuf::from("/home/jdoe/.ssh/id_ed25519_vouch-cert.pub");
+        let key = "/home/jdoe/.ssh/id_ed25519_vouch".to_string();
+        let cert = "/home/jdoe/.ssh/id_ed25519_vouch-cert.pub".to_string();
         let devbox = claimed("i-0abc", Some("jdoe"));
         let core = build_core(&devbox, &opts(), Some(&(key, cert))).expect("core");
         let probe = core.probe_args();
