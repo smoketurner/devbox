@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 rust-version = "1.96.0"
 license = "Apache-2.0 OR MIT"
@@ -115,7 +115,7 @@ similar_names = "allow"
 allow_attributes_without_reason = "deny"
 
 [workspace.dependencies]
-anyhow = { version = "=1.0.102", default-features = false }
+anyhow = { version = "=1.0.103", default-features = false }
 askama = { version = "=0.16.0", default-features = false }
 aws-config = { version = "=1.8.18", default-features = false }
 aws-credential-types = { version = "=1.2.14", default-features = false }

@@ -25,9 +25,9 @@ checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
 name = "arc-swap"
@@ -1052,7 +1052,7 @@ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 
 [[package]]
 name = "devbox-agent"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -1073,7 +1073,7 @@ dependencies = [
 
 [[package]]
 name = "devbox-cli"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -1102,7 +1102,7 @@ dependencies = [
 
 [[package]]
 name = "devbox-common"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "jiff",
@@ -1113,7 +1113,7 @@ dependencies = [
 
 [[package]]
 name = "devbox-server"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "askama",
