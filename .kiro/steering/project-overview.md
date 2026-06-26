@@ -43,8 +43,8 @@ direct `RunInstances` calls. A leader-locked background loop reconciles each tic
 - Apply the `devbox:owner` tag to newly claimed instances; manage warming,
   scale-in protection, and termination of released instances
 
-The Launch Template, ASG, and lifecycle hook are provisioned by Terraform in
-`devbox-infra`; the control plane only adopts the ASG and writes runtime state.
+The Launch Template and ASG are provisioned by Terraform in `devbox-infra`; the
+control plane only adopts the ASG and writes runtime state.
 
 ### Document Store
 
