@@ -37,33 +37,32 @@ pub(crate) async fn run() -> Result<()> {
     let instance_id = imds::get(&imds_client, "/latest/meta-data/instance-id")
         .await?
         .context("instance-id unavailable from IMDS")?;
+    // Self-tagging must target this instance's placement region, not an AWS_REGION
+    // override — a mismatched region makes ec2:CreateTags fail and the box never goes
+    // Ready. (read_key uses the AWS_REGION-honoring imds::region for SSM access.)
+    let region = imds::get(&imds_client, "/latest/meta-data/placement/region")
+        .await?
+        .context("region unavailable from IMDS")?;
 
     freshen::freshen_workspace().await;
 
-    let ec2_client = ec2_client().await?;
+    let ec2_client = ec2_client(region).await;
     tag_ready(&ec2_client, &instance_id).await?;
 
     tracing::info!(instance_id, "warm-up complete; tagged devbox:ready=true");
     Ok(())
 }
 
-/// Build an EC2 client bound to the instance's region, resolving the region
-/// from IMDS. The Rust SDK's default config chain has no IMDS region fallback,
-/// so an explicit fetch is required when `AWS_REGION` is unset (the warmup
-/// systemd unit does not set it).
-///
-/// # Errors
-///
-/// Returns an error if the region cannot be read from IMDS.
-async fn ec2_client() -> Result<aws_sdk_ec2::Client> {
-    let region = imds::region()
-        .await
-        .context("read region from IMDS for EC2 client")?;
+/// Build an EC2 client bound to `region` — this instance's IMDS placement region.
+/// Self-tagging uses the placement region directly rather than the
+/// `AWS_REGION`-honoring `imds::region`, since `ec2:CreateTags` must target the
+/// region where this instance actually runs.
+async fn ec2_client(region: String) -> aws_sdk_ec2::Client {
     let config = aws_config::defaults(BehaviorVersion::latest())
         .region(Region::new(region))
         .load()
         .await;
-    Ok(aws_sdk_ec2::Client::new(&config))
+    aws_sdk_ec2::Client::new(&config)
 }
 
 /// Set `devbox:ready=true` on this instance.
