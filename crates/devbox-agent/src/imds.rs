@@ -59,5 +59,7 @@ pub(crate) async fn region() -> Result<String> {
     let client = client();
     get(&client, "/latest/meta-data/placement/region")
         .await?
+        .map(|region| region.trim().to_string())
+        .filter(|region| !region.is_empty())
         .context("region unavailable from IMDS")
 }

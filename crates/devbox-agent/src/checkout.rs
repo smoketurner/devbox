@@ -45,13 +45,19 @@ pub(crate) async fn run(workspace: &Path, repos: &[String]) -> Result<()> {
     };
 
     // Pre-flight: derive and validate all dest names before touching the filesystem.
-    // Catching duplicates here converts an opaque mid-build git failure into a clear
-    // config error, and ensures no partial clone is left behind on collision.
-    let dest_names: Vec<Option<String>> = repos.iter().map(|url| dest_name(url)).collect();
+    // An unresolvable URL is a fatal config error (not skipped) so the build can never
+    // succeed with an empty workspace; duplicates are rejected here too, turning an
+    // opaque mid-build git failure into a clear config error.
+    let mut dest_names: Vec<String> = Vec::with_capacity(repos.len());
+    for url in repos {
+        let name = dest_name(url).with_context(|| {
+            format!("could not derive a destination directory name from repo URL {url:?}")
+        })?;
+        dest_names.push(name);
+    }
     {
         let mut seen: HashMap<&str, &str> = HashMap::new();
-        for (url, name_opt) in repos.iter().zip(&dest_names) {
-            let Some(name) = name_opt else { continue };
+        for (url, name) in repos.iter().zip(&dest_names) {
             if let Some(prior) = seen.insert(name.as_str(), url.as_str()) {
                 anyhow::bail!(
                     "repos {prior:?} and {url:?} both produce destination name {name:?}; \
@@ -63,11 +69,7 @@ pub(crate) async fn run(workspace: &Path, repos: &[String]) -> Result<()> {
 
     let mut minter = build_minter().await;
 
-    for (url, name_opt) in repos.iter().zip(&dest_names) {
-        let Some(name) = name_opt else {
-            tracing::warn!(url, "could not derive destination name from URL; skipping");
-            continue;
-        };
+    for (url, name) in repos.iter().zip(&dest_names) {
         let dest = workspace.join(name);
 
         let token = resolve_token(minter.as_mut(), url).await;
