@@ -12,6 +12,7 @@ mod reconcile_tests {
 
     use jiff::Timestamp;
 
+    use crate::compute::Compute as _;
     use crate::compute::mock::MockCompute;
     use crate::db::migrations::run_sqlite_migrations;
     use crate::db::pool::{Pool, PoolConfig};
@@ -528,6 +529,289 @@ mod reconcile_tests {
         assert!(
             compute.get_instance_tags(&instance_id).is_some(),
             "instance must not be terminated"
+        );
+    }
+
+    // =========================================================================
+    // Owner-tag re-assert tests (Step 9 defense-in-depth)
+    // =========================================================================
+
+    /// Test (a): Self-heal — a tampered `devbox:owner` tag is corrected within
+    /// one reconcile tick.
+    ///
+    /// Simulates an IAM regression or manual edit that changed the instance's
+    /// `devbox:owner` and `devbox:owner-email` tags to wrong values. After one
+    /// tick, both tags must equal the doc's `owner` / `owner_email` fields.
+    #[tokio::test]
+    async fn test_owner_tag_self_heals_on_divergence() {
+        let store = setup_store().await;
+        let compute = MockCompute::new();
+        let config = test_config();
+
+        compute.seed_asg(1, 5, 1);
+        let instance_id = compute.add_instance("InService");
+
+        // Seed a Claimed doc with owner_tag_applied = true (first apply done).
+        let claimed_doc = DevboxDoc {
+            instance_id: instance_id.clone(),
+            name: "claimed-box".to_string(),
+            state: DevboxState::Claimed,
+            instance_type: InstanceType("m7g.large".to_string()),
+            ami_id: AmiId("ami-mock".to_string()),
+            subnet_id: SubnetId("subnet-mock".to_string()),
+            region: "us-east-1".to_string(),
+            ebs_volume_id: None,
+            owner: Some("alice".to_string()),
+            owner_email: Some("alice@example.com".to_string()),
+            claimed_at: None,
+            created_at: Timestamp::now(),
+            owner_tag_applied: true,
+        };
+        store.insert(&claimed_doc).await.unwrap();
+
+        // Pre-seed WRONG owner tags on the mock instance (simulates tampering).
+        compute
+            .tag_instance(
+                &instance_id,
+                &[
+                    ("devbox:owner", "tampered-user"),
+                    ("devbox:owner-email", "bad@actor.com"),
+                ],
+            )
+            .await
+            .unwrap();
+
+        // One tick must overwrite the tampered tags with the doc's values.
+        reconciliation_tick(&store, &compute, &config)
+            .await
+            .unwrap();
+
+        let tags = compute
+            .get_instance_tags(&instance_id)
+            .expect("instance still in ASG");
+        assert_eq!(
+            tags.get("devbox:owner").map(String::as_str),
+            Some("alice"),
+            "devbox:owner must be corrected to the doc's owner after one tick"
+        );
+        assert_eq!(
+            tags.get("devbox:owner-email").map(String::as_str),
+            Some("alice@example.com"),
+            "devbox:owner-email must be corrected to the doc's owner_email after one tick"
+        );
+    }
+
+    /// Test (b): First-apply — a fresh Claimed doc gets its owner tag applied and
+    /// `owner_tag_applied` flipped to true within one tick.
+    #[tokio::test]
+    async fn test_owner_tag_first_apply_sets_flag() {
+        let store = setup_store().await;
+        let compute = MockCompute::new();
+        let config = test_config();
+
+        compute.seed_asg(1, 5, 1);
+        let instance_id = compute.add_instance("InService");
+
+        // A freshly claimed doc — owner_tag_applied is false.
+        let claimed_doc = DevboxDoc {
+            instance_id: instance_id.clone(),
+            name: "claimed-box".to_string(),
+            state: DevboxState::Claimed,
+            instance_type: InstanceType("m7g.large".to_string()),
+            ami_id: AmiId("ami-mock".to_string()),
+            subnet_id: SubnetId("subnet-mock".to_string()),
+            region: "us-east-1".to_string(),
+            ebs_volume_id: None,
+            owner: Some("bob".to_string()),
+            owner_email: None,
+            claimed_at: None,
+            created_at: Timestamp::now(),
+            owner_tag_applied: false,
+        };
+        store.insert(&claimed_doc).await.unwrap();
+
+        reconciliation_tick(&store, &compute, &config)
+            .await
+            .unwrap();
+
+        // Tag must be applied on the instance.
+        let tags = compute
+            .get_instance_tags(&instance_id)
+            .expect("instance still in ASG");
+        assert_eq!(
+            tags.get("devbox:owner").map(String::as_str),
+            Some("bob"),
+            "devbox:owner must be applied on the first tick"
+        );
+
+        // The doc must have owner_tag_applied flipped to true.
+        let all = store.list_all::<DevboxDoc>().await.unwrap();
+        let doc = all
+            .iter()
+            .find(|d| d.data.instance_id == instance_id)
+            .expect("doc must still exist after tick");
+        assert!(
+            doc.data.owner_tag_applied,
+            "owner_tag_applied must be true after first tag application"
+        );
+    }
+
+    /// Test (c): Steady-state idempotency — when `owner_tag_applied` is already
+    /// true, no `compare_and_update` is issued, so the doc version does not advance.
+    ///
+    /// The idempotent tag re-write still runs (expected and intentional); only the
+    /// DB write is suppressed to avoid per-tick churn.
+    #[tokio::test]
+    async fn test_owner_tag_no_db_update_when_already_applied() {
+        let store = setup_store().await;
+        let compute = MockCompute::new();
+        let config = test_config();
+
+        compute.seed_asg(1, 5, 1);
+        let instance_id = compute.add_instance("InService");
+
+        // Claimed doc already past first-apply.
+        let claimed_doc = DevboxDoc {
+            instance_id: instance_id.clone(),
+            name: "claimed-box".to_string(),
+            state: DevboxState::Claimed,
+            instance_type: InstanceType("m7g.large".to_string()),
+            ami_id: AmiId("ami-mock".to_string()),
+            subnet_id: SubnetId("subnet-mock".to_string()),
+            region: "us-east-1".to_string(),
+            ebs_volume_id: None,
+            owner: Some("carol".to_string()),
+            owner_email: None,
+            claimed_at: None,
+            created_at: Timestamp::now(),
+            owner_tag_applied: true,
+        };
+        store.insert(&claimed_doc).await.unwrap();
+
+        // Capture the doc's version before the tick.
+        let all_before = store.list_all::<DevboxDoc>().await.unwrap();
+        let before = all_before
+            .iter()
+            .find(|d| d.data.instance_id == instance_id)
+            .expect("doc must exist before tick");
+        let version_before = before.version;
+
+        reconciliation_tick(&store, &compute, &config)
+            .await
+            .unwrap();
+
+        // Doc version must not have advanced — no compare_and_update was issued.
+        let all_after = store.list_all::<DevboxDoc>().await.unwrap();
+        let after = all_after
+            .iter()
+            .find(|d| d.data.instance_id == instance_id)
+            .expect("doc must still exist after tick");
+        assert_eq!(
+            after.version, version_before,
+            "doc version must not advance when owner_tag_applied is already true"
+        );
+    }
+
+    /// MUST-FIX 2: Non-Claimed docs (Ready, Warming) must not receive owner tags.
+    ///
+    /// Guards the `if doc.data.state != DevboxState::Claimed { continue; }` gate.
+    /// A bug removing that guard would silently tag Ready/Warming instances with
+    /// `devbox:owner`, which `AuthorizedPrincipalsCommand` trusts — a security
+    /// regression. Verified by seeding a Ready doc with `owner` set and asserting
+    /// no `devbox:owner` tag appears on the instance after a tick.
+    #[tokio::test]
+    async fn test_non_claimed_doc_is_not_re_tagged() {
+        let store = setup_store().await;
+        let compute = MockCompute::new();
+        let config = test_config();
+
+        compute.seed_asg(1, 5, 1);
+        let instance_id = compute.add_instance("InService");
+        // Mark ready so the reconciler's tag-dependent steps see it correctly.
+        compute.set_instance_ready(&instance_id, true);
+
+        // A Ready doc that still carries an owner field (edge case from a prior
+        // state transition), but is NOT in Claimed state.
+        let ready_doc = DevboxDoc {
+            instance_id: instance_id.clone(),
+            name: "ready-box".to_string(),
+            state: DevboxState::Ready,
+            instance_type: InstanceType("m7g.large".to_string()),
+            ami_id: AmiId("ami-mock".to_string()),
+            subnet_id: SubnetId("subnet-mock".to_string()),
+            region: "us-east-1".to_string(),
+            ebs_volume_id: None,
+            owner: Some("sneaky".to_string()),
+            owner_email: None,
+            claimed_at: None,
+            created_at: Timestamp::now(),
+            owner_tag_applied: false,
+        };
+        store.insert(&ready_doc).await.unwrap();
+
+        reconciliation_tick(&store, &compute, &config)
+            .await
+            .unwrap();
+
+        let tags = compute
+            .get_instance_tags(&instance_id)
+            .expect("instance still in ASG");
+        assert_eq!(
+            tags.get("devbox:owner"),
+            None,
+            "devbox:owner must not be set on a non-Claimed instance"
+        );
+    }
+
+    /// MUST-FIX 3: A `tag_instance` error leaves `owner_tag_applied` false.
+    ///
+    /// Guards the error path at `tick.rs` where `Err(e)` from `tag_instance`
+    /// causes a `continue` without flipping the flag. A future regression that
+    /// accidentally sets `owner_tag_applied=true` on failure would suppress all
+    /// future re-assert attempts for that box, defeating the defense-in-depth.
+    #[tokio::test]
+    async fn test_tag_instance_error_leaves_flag_false() {
+        let store = setup_store().await;
+        let compute = MockCompute::new();
+        let config = test_config();
+
+        compute.seed_asg(1, 5, 1);
+        let instance_id = compute.add_instance("InService");
+
+        let claimed_doc = DevboxDoc {
+            instance_id: instance_id.clone(),
+            name: "claimed-box".to_string(),
+            state: DevboxState::Claimed,
+            instance_type: InstanceType("m7g.large".to_string()),
+            ami_id: AmiId("ami-mock".to_string()),
+            subnet_id: SubnetId("subnet-mock".to_string()),
+            region: "us-east-1".to_string(),
+            ebs_volume_id: None,
+            owner: Some("dave".to_string()),
+            owner_email: None,
+            claimed_at: None,
+            created_at: Timestamp::now(),
+            owner_tag_applied: false,
+        };
+        store.insert(&claimed_doc).await.unwrap();
+
+        // Inject a one-shot tag_instance failure.
+        compute.set_error("tag_instance", "injected error".to_string());
+
+        // The tick must continue to completion (not abort) despite the error.
+        reconciliation_tick(&store, &compute, &config)
+            .await
+            .unwrap();
+
+        // owner_tag_applied must still be false — the error path must not flip it.
+        let all = store.list_all::<DevboxDoc>().await.unwrap();
+        let doc = all
+            .iter()
+            .find(|d| d.data.instance_id == instance_id)
+            .expect("doc must still exist after failed tick");
+        assert!(
+            !doc.data.owner_tag_applied,
+            "owner_tag_applied must remain false when tag_instance fails"
         );
     }
 }
