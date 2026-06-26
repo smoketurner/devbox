@@ -174,12 +174,6 @@ pub(crate) async fn connect(devbox: &DevboxResponse, opts: &SshOptions) -> Resul
         let started = Instant::now();
         let mut attempt: u32 = 0;
         loop {
-            // Print before each probe so feedback is immediate on the first attempt.
-            eprintln!(
-                "waiting for box to finish provisioning ({}s)",
-                started.elapsed().as_secs()
-            );
-
             let probe = tokio::process::Command::new("ssh")
                 .args(core.probe_args())
                 .stdout(Stdio::null())
@@ -190,7 +184,10 @@ pub(crate) async fn connect(devbox: &DevboxResponse, opts: &SshOptions) -> Resul
             match probe {
                 Ok(s) if s.success() => break,
                 Ok(_) => {
-                    // Non-zero exit: box not yet ready; retry within budget.
+                    // Non-zero exit: box not yet ready; retry within budget. We
+                    // announce the wait only here — after a probe has actually
+                    // failed — so a box that is already up connects with no
+                    // spurious "waiting" line.
                     let elapsed = started.elapsed();
                     if elapsed >= PROBE_TIMEOUT {
                         eprintln!(
@@ -200,6 +197,10 @@ pub(crate) async fn connect(devbox: &DevboxResponse, opts: &SshOptions) -> Resul
                         );
                         break;
                     }
+                    eprintln!(
+                        "waiting for box to finish provisioning... ({}s)",
+                        elapsed.as_secs()
+                    );
                     tokio::time::sleep(probe_backoff(attempt)).await;
                     attempt = attempt.saturating_add(1);
                 }
