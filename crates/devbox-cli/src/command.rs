@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use dialoguer::Select;
 
 use devbox_common::{
-    ClaimRequest, DevboxListResponse, DevboxResponse, DevboxState, RenameRequest,
+    ClaimRequest, DevboxListResponse, DevboxResponse, DevboxState, ErrorBody, RenameRequest,
     is_valid_devbox_name,
 };
 
@@ -48,6 +48,18 @@ pub(crate) fn resolve_server(explicit: Option<String>) -> Result<String> {
 /// token is always present.
 pub(crate) fn with_auth(builder: reqwest::RequestBuilder, token: &str) -> reqwest::RequestBuilder {
     builder.bearer_auth(token)
+}
+
+/// Turn a non-success API response into a user-facing error. Prefers the
+/// server's `{ "error": "..." }` message; falls back to `<status> <body>` for
+/// non-JSON responses.
+async fn http_error(resp: reqwest::Response) -> anyhow::Error {
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    match serde_json::from_str::<ErrorBody>(&body) {
+        Ok(parsed) => anyhow::anyhow!("{}", parsed.error),
+        Err(_) => anyhow::anyhow!("{} {}", status.as_u16(), body),
+    }
 }
 
 /// Whether we can safely open an interactive prompt. `dialoguer` renders to and
@@ -351,9 +363,7 @@ pub(crate) async fn cmd_claim(
         println!("{}", format::format_claim_success(&devbox));
         Ok(())
     } else {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        bail!("{} {}", status.as_u16(), body)
+        Err(http_error(resp).await)
     }
 }
 
@@ -377,9 +387,7 @@ pub(crate) async fn cmd_release(
         println!("{}", format::format_release_success(&devbox));
         Ok(())
     } else {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        bail!("{} {}", status.as_u16(), body)
+        Err(http_error(resp).await)
     }
 }
 
@@ -415,9 +423,7 @@ pub(crate) async fn cmd_rename(
         println!("{}", format::format_rename_success(&devbox));
         Ok(())
     } else {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        bail!("{} {}", status.as_u16(), body)
+        Err(http_error(resp).await)
     }
 }
 
@@ -440,9 +446,7 @@ pub(crate) async fn cmd_list(http: &reqwest::Client, server: &str) -> Result<()>
         }
         Ok(())
     } else {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        bail!("{} {}", status.as_u16(), body)
+        Err(http_error(resp).await)
     }
 }
 
@@ -465,9 +469,7 @@ pub(crate) async fn cmd_status(
         println!("{}", format::format_status(&devbox));
         Ok(())
     } else {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        bail!("{} {}", status.as_u16(), body)
+        Err(http_error(resp).await)
     }
 }
 
@@ -489,9 +491,7 @@ pub(crate) async fn cmd_ssh(
         .context("failed to look up devbox")?;
 
     if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        bail!("{} {}", status.as_u16(), body)
+        return Err(http_error(resp).await);
     }
 
     let devbox: DevboxResponse = resp.json().await.context("failed to parse response")?;
@@ -506,7 +506,7 @@ pub(crate) async fn cmd_ssh(
         print,
         extra: args,
     };
-    crate::ssh::connect(&devbox, &opts)
+    crate::ssh::connect(&devbox, &opts).await
 }
 
 /// Native SSM data-channel proxy used as an ssh `ProxyCommand`.

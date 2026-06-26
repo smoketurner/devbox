@@ -9,14 +9,8 @@
 use axum::extract::{FromRequest, Request};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use serde::Serialize;
+use devbox_common::ErrorBody;
 use serde::de::DeserializeOwned;
-
-/// Structured JSON error body returned by all API error responses.
-#[derive(Serialize)]
-pub struct ErrorBody {
-    pub error: String,
-}
 
 /// Application-level error type for route handlers.
 ///
