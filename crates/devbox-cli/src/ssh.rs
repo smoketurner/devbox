@@ -167,6 +167,10 @@ pub(crate) async fn connect(devbox: &DevboxResponse, opts: &SshOptions) -> Resul
         return Ok(());
     }
 
+    // Opening the SSM tunnel (and, on a fresh box, waiting out provisioning)
+    // takes a moment with no output, so signal that work has started.
+    eprintln!("connecting...");
+
     // Only probe when a pinned identity is available. Without `IdentitiesOnly=yes`
     // the probe would flood MaxAuthTries with every agent key and always fail,
     // adding a misleading ~60s delay before falling through to the same result.
