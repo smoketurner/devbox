@@ -308,8 +308,9 @@ are tagged inline):
   in-agent** (`crates/devbox-agent/src/github_token.rs`): the agent reads the GitHub
   App private key from an **SSM SecureString** via the host instance profile, signs
   an RS256 JWT, and exchanges it for a fresh 1 h `contents:read` installation token
-  (config via `DEVBOX_GITHUB_APP_ID` / `DEVBOX_GITHUB_INSTALLATION_ID` /
-  `DEVBOX_GITHUB_KEY_PARAM` / optional `DEVBOX_GITHUB_API_BASE`). Nothing baked, no
+  (installation discovered per repo; config via `DEVBOX_GITHUB_APP_ID` /
+  `DEVBOX_GITHUB_KEY_PARAM` / optional `DEVBOX_GITHUB_API_BASE`, read from the
+  environment). Nothing baked, no
   off-box broker, no control-plane callback — the only stored secret is the App key
   in SSM (IAM + KMS gated). The fetch is time-budgeted (`WARMUP_FETCH_TIMEOUT_SECS`,
   default 120 s) and **degrades, does not reap** — a too-large delta, a mint/fetch

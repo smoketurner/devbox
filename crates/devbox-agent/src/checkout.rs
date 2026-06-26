@@ -2,8 +2,10 @@
 //!
 //! Mints a per-repo read-only GitHub App installation token for each clone, runs
 //! optional per-repo warm hooks under a time budget, then compacts the object store
-//! with `git gc`. Intended to be run by the snapshot-builder pipeline to seed the
-//! EBS workspace volume before a new AMI is cut.
+//! with `git gc`. Run by the snapshot-builder pipeline to seed the EBS workspace
+//! volume before a new AMI is cut, and by a developer or agent on a claimed box to
+//! add a repo under `/workspace` (the App config is read from the environment — see
+//! [`crate::github_token`]).
 
 use std::collections::HashMap;
 use std::path::Path;

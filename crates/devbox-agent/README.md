@@ -7,13 +7,14 @@ never calls the devbox control plane — it only reads its own instance metadata
 (IMDS) and calls the AWS Auto Scaling API for its own instance, using the host
 instance profile.
 
-One binary, three subcommands, each wired to a different host trigger:
+One binary, four subcommands, each wired to a different host trigger:
 
 | Subcommand | Triggered by | Job |
 |------------|--------------|-----|
 | `principals <login-user>` | sshd `AuthorizedPrincipalsCommand`, per auth (as `nobody`) | Print the authorized principal, or nothing |
 | `owner-sync` | `devbox-owner-sync.service` (systemd) | Provision the claimant's Unix account + git identity, then exit |
 | `warmup` | `devbox-warmup.service` (systemd, at boot) | Freshen `/workspace` repos, then self-tag `devbox:ready=true` |
+| `checkout <urls>` | the snapshot-builder, or a developer/agent on a claimed box | Clone repos into `/workspace`, minting a read-only token per repo |
 
 ## `principals` — per-claim SSH authorization
 
@@ -79,10 +80,12 @@ private key from an **SSM SecureString** (via the host instance profile), signs 
 short JWT, and exchanges it for a fresh `contents:read` installation token used
 only for the fetch (`src/github_token.rs`). The host instance profile therefore
 needs `ssm:GetParameter` + `kms:Decrypt` on that parameter, and egress to the SSM
-and `api.github.com` endpoints. Config is non-secret, via the environment:
+and `api.github.com` endpoints. The installation is **discovered per repo** (the
+agent asks GitHub which installation covers each `owner/repo`), so there is no
+installation id to configure. Config is non-secret, read from the process
+environment:
 
 - `DEVBOX_GITHUB_APP_ID` — App ID or Client ID (the JWT issuer).
-- `DEVBOX_GITHUB_INSTALLATION_ID` — installation to mint against.
 - `DEVBOX_GITHUB_KEY_PARAM` — SSM SecureString parameter holding the RSA PEM.
 - `DEVBOX_GITHUB_API_BASE` — optional; defaults to `https://api.github.com` (set
   for GitHub Enterprise).
