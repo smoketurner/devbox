@@ -92,7 +92,17 @@ pub(crate) async fn claim_devbox(
 
     let ready_docs = state.store.find_all::<DevboxDoc>("state", "ready").await?;
     if ready_docs.is_empty() {
-        return Err(AppError::Conflict("no devboxes available".into()));
+        let warming = state
+            .store
+            .find_all::<DevboxDoc>("state", "warming")
+            .await?
+            .len();
+        let msg = if warming > 0 {
+            format!("no devboxes ready for use ({warming} warming)")
+        } else {
+            "no devboxes ready for use".to_string()
+        };
+        return Err(AppError::Conflict(msg));
     }
 
     // Sort candidates by created_at ascending (longest-waiting first).
@@ -619,6 +629,23 @@ mod tests {
             .unwrap();
 
         assert!(matches!(err, AppError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn claim_with_only_warming_boxes_reports_count() {
+        let state = setup_state().await;
+        let mut doc = ready_devbox();
+        doc.state = DevboxState::Warming;
+        insert(&state, doc).await;
+
+        let err = claim_devbox(&state, &claimant("jdoe"), None)
+            .await
+            .err()
+            .unwrap();
+
+        assert!(matches!(err, AppError::Conflict(_)));
+        let msg = err.user_message();
+        assert!(msg.contains("1 warming"), "unexpected message: {msg}");
     }
 
     #[tokio::test]

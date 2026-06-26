@@ -408,6 +408,12 @@ pub struct DevboxListResponse {
     pub devboxes: Vec<DevboxResponse>,
 }
 
+/// JSON error body returned by every API error response: `{ "error": "..." }`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorBody {
+    pub error: String,
+}
+
 /// Health check response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResponse {
