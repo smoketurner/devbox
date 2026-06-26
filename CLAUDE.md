@@ -327,8 +327,10 @@ are tagged inline):
 - **Warm dependency/build caches** — warm language caches (Rust `target/` +
   `CARGO_HOME`, Go/Node/Python equivalents) into the snapshot via a per-repo
   `.devbox/warm.sh` hook run by the snapshot-builder, with shared caches on the data
-  volume and `CARGO_HOME` etc. set system-wide so they survive into the claimant's
-  fresh home. Optional remote cache (sccache / Bazel) through the allowlist. _(cf. Ramp Inspect)_
+  volume and `RUSTUP_HOME`/`CARGO_HOME` etc. set system-wide (all on the
+  `/workspace` volume) so the pinned toolchain and caches survive into the
+  claimant's fresh home. Optional remote cache (sccache / Bazel) through the
+  allowlist. _(cf. Ramp Inspect)_
 - **Health-check gating of "warming"** — `devbox-agent warmup` already gates Ready on
   Docker + repo freshen; extend to network and richer health, plus **idle-claim
   reclaim**.
