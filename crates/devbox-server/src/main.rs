@@ -219,7 +219,13 @@ async fn build_agent_auth_config(http: &reqwest::Client) -> Result<Option<AgentA
             format!("{name} is required when DEVBOX_AGENT_OIDC_ISSUER is set (agent auth)")
         })
     };
-    let audience = require("DEVBOX_AGENT_AUDIENCE")?;
+    // Trim trailing slashes to match the agent, which derives its token audience
+    // from DEVBOX_SERVER_URL with trailing slashes trimmed. Without this, a
+    // slash-only difference between the two env values would fail every `aud`
+    // check even when both are "correctly" configured.
+    let audience = require("DEVBOX_AGENT_AUDIENCE")?
+        .trim_end_matches('/')
+        .to_string();
     let platform_account_id = require("AWS_ACCOUNT_ID")?;
 
     // Trusted role ARNs are comma-separated: the pool is one role today, but there

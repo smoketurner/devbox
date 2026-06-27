@@ -12,7 +12,8 @@
 //!
 //! - `DEVBOX_SERVER_URL` — the control-plane base URL. Also the **audience** the
 //!   web-identity token is minted for; it must equal the server's
-//!   `DEVBOX_AGENT_AUDIENCE`. When unset the agent is not configured for
+//!   `DEVBOX_AGENT_AUDIENCE` (trailing slashes are trimmed on both sides). When
+//!   unset the agent is not configured for
 //!   server-backed minting ([`ServerTokenClient::new`] returns `Ok(None)`) and
 //!   callers fetch unauthenticated.
 
