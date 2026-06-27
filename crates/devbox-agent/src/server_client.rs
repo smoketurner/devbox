@@ -22,7 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use aws_config::BehaviorVersion;
 use aws_sdk_sts::config::Region;
-use devbox_common::{GitTokenRequest, GitTokenResponse};
+use devbox_common::{GitTokenRequest, GitTokenResponse, env_non_empty};
 
 const SERVER_URL_ENV: &str = "DEVBOX_SERVER_URL";
 
@@ -72,7 +72,7 @@ impl ServerTokenClient {
     /// Returns an error when the box is configured but the region cannot be read
     /// from IMDS (needed to bind the STS client) or the HTTP client cannot build.
     pub(crate) async fn new() -> Result<Option<Self>> {
-        let Some(server_url) = non_empty(SERVER_URL_ENV) else {
+        let Some(server_url) = env_non_empty(SERVER_URL_ENV) else {
             return Ok(None);
         };
         // Resolve the region from IMDS so the STS client is bound even when
@@ -195,14 +195,6 @@ fn unix_now() -> Result<u64> {
         .duration_since(UNIX_EPOCH)
         .context("system clock is before the unix epoch")?
         .as_secs())
-}
-
-/// Trimmed value of env var `key`, or `None` if unset or blank.
-fn non_empty(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]

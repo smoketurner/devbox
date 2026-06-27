@@ -307,6 +307,23 @@ pub fn is_valid_devbox_name(name: &str) -> bool {
 }
 
 // ============================================================================
+// Environment helpers
+// ============================================================================
+
+/// Trimmed value of environment variable `key`, or `None` when it is unset,
+/// non-UTF-8, or blank after trimming.
+///
+/// Non-secret configuration is supplied through the environment across the
+/// server, agent, and minter; this is the shared "present and non-blank" read.
+#[must_use]
+pub fn env_non_empty(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+// ============================================================================
 // Display helpers
 // ============================================================================
 

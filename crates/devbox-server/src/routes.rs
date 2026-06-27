@@ -93,8 +93,8 @@ async fn require_agent_iam(
     Ok(next.run(req).await)
 }
 
-/// Extract a `Bearer` token from the `Authorization` header (case-insensitive
-/// scheme), or a 401 when absent/malformed.
+/// Extract a `Bearer` token from the `Authorization` header (accepting the
+/// `Bearer ` or `bearer ` scheme prefix), or a 401 when absent/malformed.
 fn bearer_token(headers: &HeaderMap) -> Result<String, AppError> {
     let header = headers
         .get(AUTHORIZATION)

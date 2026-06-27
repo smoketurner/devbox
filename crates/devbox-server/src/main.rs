@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
+use devbox_common::env_non_empty;
 use devbox_server::auth::{
     AgentAuthConfig, AuthConfig, AuthError, Authenticator, OidcConfig, OidcEndpoints, discover,
 };
@@ -208,15 +209,13 @@ async fn build_authenticator() -> Result<Authenticator> {
 /// is missing, or issuer discovery fails — a misconfiguration that must fail fast
 /// rather than silently leaving the agent path unverifiable.
 async fn build_agent_auth_config(http: &reqwest::Client) -> Result<Option<AgentAuthConfig>> {
-    let nonempty = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
-
-    let Some(issuer) = nonempty("DEVBOX_AGENT_OIDC_ISSUER") else {
+    let Some(issuer) = env_non_empty("DEVBOX_AGENT_OIDC_ISSUER") else {
         tracing::info!("agent OIDC auth disabled (DEVBOX_AGENT_OIDC_ISSUER unset)");
         return Ok(None);
     };
 
     let require = |name: &str| -> Result<String> {
-        nonempty(name).with_context(|| {
+        env_non_empty(name).with_context(|| {
             format!("{name} is required when DEVBOX_AGENT_OIDC_ISSUER is set (agent auth)")
         })
     };
@@ -229,7 +228,7 @@ async fn build_agent_auth_config(http: &reqwest::Client) -> Result<Option<AgentA
     if pool_role_arns.is_empty() {
         anyhow::bail!("DEVBOX_POOL_ROLE_ARNS must list at least one role ARN");
     }
-    let builder_role_arns = nonempty("DEVBOX_BUILDER_ROLE_ARNS")
+    let builder_role_arns = env_non_empty("DEVBOX_BUILDER_ROLE_ARNS")
         .map(|raw| csv_list(&raw))
         .unwrap_or_default();
 
@@ -243,8 +242,8 @@ async fn build_agent_auth_config(http: &reqwest::Client) -> Result<Option<AgentA
         platform_account_id,
         pool_role_arns,
         builder_role_arns,
-        org_id: nonempty("DEVBOX_AGENT_ORG_ID"),
-        vpc_id: nonempty("DEVBOX_AGENT_VPC_ID"),
+        org_id: env_non_empty("DEVBOX_AGENT_ORG_ID"),
+        vpc_id: env_non_empty("DEVBOX_AGENT_VPC_ID"),
     }))
 }
 

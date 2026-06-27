@@ -27,6 +27,9 @@ pub enum AppError {
     NotFound(String),
     /// 409 Conflict — state conflict (e.g., no available devboxes).
     Conflict(String),
+    /// 503 Service Unavailable — a required dependency is not configured or ready
+    /// (e.g., GitHub token minting is not configured on this server).
+    ServiceUnavailable(String),
     /// 500 Internal Server Error — database or serialization failure.
     Internal(anyhow::Error),
 }
@@ -42,7 +45,8 @@ impl AppError {
             | Self::Unauthorized(msg)
             | Self::Forbidden(msg)
             | Self::NotFound(msg)
-            | Self::Conflict(msg) => msg.clone(),
+            | Self::Conflict(msg)
+            | Self::ServiceUnavailable(msg) => msg.clone(),
             Self::Internal(_) => "internal server error".to_string(),
         }
     }
@@ -56,6 +60,7 @@ impl IntoResponse for AppError {
             Self::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
             Self::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
             Self::Conflict(msg) => (StatusCode::CONFLICT, msg),
+            Self::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
             Self::Internal(err) => {
                 tracing::error!("internal error: {err:#}");
                 (

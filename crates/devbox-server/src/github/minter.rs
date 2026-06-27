@@ -29,7 +29,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use aws_config::SdkConfig;
-use devbox_common::GitHubRepository;
+use devbox_common::{GitHubRepository, env_non_empty};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -106,11 +106,12 @@ impl Minter {
     /// Returns an error when the server is configured but the SSM key read, PEM
     /// parsing, or HTTP client construction fails.
     pub async fn from_env(aws_config: &SdkConfig) -> Result<Option<Self>> {
-        let (Some(issuer), Some(key_param)) = (non_empty(APP_ID_ENV), non_empty(KEY_PARAM_ENV))
+        let (Some(issuer), Some(key_param)) =
+            (env_non_empty(APP_ID_ENV), env_non_empty(KEY_PARAM_ENV))
         else {
             return Ok(None);
         };
-        let api_base = non_empty(API_BASE_ENV).unwrap_or_else(|| DEFAULT_API_BASE.to_string());
+        let api_base = env_non_empty(API_BASE_ENV).unwrap_or_else(|| DEFAULT_API_BASE.to_string());
         let pem = read_key(aws_config, &key_param).await?;
         let key = EncodingKey::from_rsa_pem(pem.as_bytes())
             .context("parse GitHub App private key (expected an RSA PEM)")?;
@@ -228,14 +229,6 @@ impl Minter {
             .context("parse installation-token response")?
             .token)
     }
-}
-
-/// Trimmed value of env var `key`, or `None` if unset or blank.
-fn non_empty(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
 }
 
 /// Read the GitHub App private key (PEM) from an SSM SecureString parameter.
