@@ -28,6 +28,7 @@ aws-lc-rs = { workspace = true }
 aws-sdk-autoscaling = { workspace = true, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
 aws-sdk-dsql = { workspace = true, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
 aws-sdk-ec2 = { workspace = true, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
+aws-sdk-ssm = { workspace = true, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
 axum = { workspace = true, features = ["json", "tokio", "http1", "form", "query"] }
 base64 = { workspace = true }
 devbox-common = { path = "../devbox-common" }

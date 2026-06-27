@@ -6,6 +6,7 @@ pub mod convert;
 pub mod db;
 pub mod documents;
 pub mod error;
+pub mod github;
 pub mod naming;
 pub mod reconcile;
 pub mod routes;

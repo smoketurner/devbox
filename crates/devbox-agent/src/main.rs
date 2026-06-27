@@ -11,10 +11,10 @@
 mod checkout;
 mod freshen;
 mod git;
-mod github_token;
 mod imds;
 mod owner_sync;
 mod principals;
+mod server_client;
 mod warmup;
 
 use std::path::PathBuf;

@@ -4,8 +4,8 @@
 //! optional per-repo warm hooks under a time budget, then compacts the object store
 //! with `git gc`. Run by the snapshot-builder pipeline to seed the EBS workspace
 //! volume before a new AMI is cut, and by a developer or agent on a claimed box to
-//! add a repo under `/workspace` (the App config is read from the environment — see
-//! [`crate::github_token`]).
+//! add a repo under `/workspace`. Tokens are fetched from the control plane (see
+//! [`crate::server_client`]); `DEVBOX_SERVER_URL` is read from the environment.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -14,7 +14,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use crate::git::{build_minter, run_git, run_git_clone};
-use crate::github_token::TokenMinter;
+use crate::server_client::ServerTokenClient;
 
 /// Time budget for a single `git clone` operation.
 const CLONE_TIMEOUT: Duration = Duration::from_mins(10);
@@ -140,7 +140,7 @@ fn dest_name(url: &str) -> Option<String> {
 
 /// Resolve a read-only token for `url` via the minter, logging at the appropriate
 /// level when unavailable so the caller can proceed unauthenticated.
-async fn resolve_token(minter: Option<&mut TokenMinter>, url: &str) -> Option<String> {
+async fn resolve_token(minter: Option<&mut ServerTokenClient>, url: &str) -> Option<String> {
     let minter = minter?;
     match minter.token_for(url).await {
         Ok(Some(token)) => Some(token),
@@ -190,8 +190,11 @@ fn is_executable(path: &Path) -> bool {
 }
 
 /// Run the hook script under GNU `timeout` with `cwd = dest`, inheriting the
-/// process environment minus GitHub App credentials so a repo-controlled warm hook
-/// cannot use the agent's instance profile to re-read the private key from SSM.
+/// process environment minus `DEVBOX_SERVER_URL` so a repo-controlled warm hook
+/// can't trivially reach the control plane to mint tokens. (The GitHub App key is
+/// no longer on the box, so the worst a hook could obtain via the instance profile
+/// is a bounded, repo-scoped, read-only token — but withholding the server URL is
+/// cheap defense-in-depth.)
 async fn run_hook_process(hook: &Path, dest: &Path) -> Result<()> {
     let status = tokio::process::Command::new("timeout")
         .arg("-k")
@@ -199,9 +202,7 @@ async fn run_hook_process(hook: &Path, dest: &Path) -> Result<()> {
         .arg(WARM_HOOK_TIMEOUT.as_secs().to_string())
         .arg(hook)
         .current_dir(dest)
-        .env_remove("DEVBOX_GITHUB_APP_ID")
-        .env_remove("DEVBOX_GITHUB_KEY_PARAM")
-        .env_remove("DEVBOX_GITHUB_API_BASE")
+        .env_remove("DEVBOX_SERVER_URL")
         .kill_on_drop(true)
         .status()
         .await

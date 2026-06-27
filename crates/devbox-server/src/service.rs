@@ -10,9 +10,11 @@
 //! status codes, or JSON types cross this boundary. Error cases are expressed via
 //! [`AppError`] variants so the callers decide how to render them.
 
-use devbox_common::{DEVBOX_NAME_MAX_LEN, DevboxState, PoolMetricsResponse, is_valid_devbox_name};
+use devbox_common::{
+    DEVBOX_NAME_MAX_LEN, DevboxState, GitTokenResponse, PoolMetricsResponse, is_valid_devbox_name,
+};
 
-use crate::auth::Principal;
+use crate::auth::{AgentIdentity, Principal};
 use crate::db::UpdateOutcome;
 use crate::db::document_type::Document;
 use crate::documents::devbox::DevboxDoc;
@@ -65,6 +67,58 @@ pub(crate) fn validate_rename_name(raw: &str) -> Result<String, AppError> {
         )));
     }
     Ok(name.to_string())
+}
+
+// ============================================================================
+// Agent git-token minting
+// ============================================================================
+
+/// Mint a short-lived, repo-scoped, read-only GitHub token for a verified devbox
+/// host.
+///
+/// Authorization is the verified [`AgentIdentity`] itself — a trusted devbox box
+/// (its `sub` matched a trusted role ARN and `aws_account` the platform account in
+/// [`crate::auth`]). There is deliberately **no** owner check (a warming box has
+/// no owner yet) and **no** devbox-side repo allowlist: the GitHub App
+/// installation is the authorization boundary, so a remote the App can't access
+/// fails at GitHub rather than here.
+///
+/// Returns a response with `token: None` when `remote` is not a repository on the
+/// App's GitHub host (the agent then fetches unauthenticated, as before).
+///
+/// # Errors
+///
+/// [`AppError::ServiceUnavailable`] when the server has no minter configured
+/// (`DEVBOX_GITHUB_APP_ID`/`DEVBOX_GITHUB_KEY_PARAM` unset); [`AppError::Internal`]
+/// when a GitHub API call fails (including when the App is not installed on the
+/// requested repo).
+pub(crate) async fn mint_git_token(
+    state: &AppState,
+    agent: &AgentIdentity,
+    remote: &str,
+) -> Result<GitTokenResponse, AppError> {
+    let minter = state.minter.as_ref().ok_or_else(|| {
+        AppError::ServiceUnavailable("GitHub token minting is not configured".to_string())
+    })?;
+
+    match minter.mint_for_remote(remote).await {
+        Ok(Some((repository, token))) => {
+            tracing::info!(
+                instance_id = %agent.instance_id,
+                repository = %repository,
+                "minted repo-scoped GitHub token"
+            );
+            Ok(GitTokenResponse {
+                repository: Some(repository),
+                token: Some(token),
+            })
+        }
+        Ok(None) => Ok(GitTokenResponse {
+            repository: None,
+            token: None,
+        }),
+        Err(e) => Err(AppError::Internal(e)),
+    }
 }
 
 // ============================================================================
@@ -364,11 +418,11 @@ pub(crate) async fn pool_metrics(state: &AppState) -> Result<PoolMetricsResponse
 mod tests {
     use std::time::Duration;
 
-    use devbox_common::{AmiId, InstanceType, SubnetId};
+    use devbox_common::{AmiId, InstanceId, InstanceType, SubnetId};
     use jiff::Timestamp;
 
     use super::*;
-    use crate::auth::{Authenticator, Principal};
+    use crate::auth::{AgentRole, Authenticator, Principal};
     use crate::db::DocumentStore;
     use crate::db::migrations::run_sqlite_migrations;
     use crate::db::pool::Pool;
@@ -407,6 +461,7 @@ mod tests {
             reconciler_config: test_config(),
             auth: Authenticator::with_test_owner("jdoe"),
             aws_account_id: None,
+            minter: None,
         }
     }
 
@@ -444,6 +499,31 @@ mod tests {
 
     async fn insert(state: &AppState, doc: DevboxDoc) -> String {
         state.store.insert(&doc).await.unwrap().id
+    }
+
+    fn pool_agent() -> AgentIdentity {
+        AgentIdentity {
+            instance_id: InstanceId("i-1234567890abcdef0".to_string()),
+            role: AgentRole::Pool,
+            owner: None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // git-token tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn mint_git_token_without_minter_is_service_unavailable() {
+        // The default test state configures no minter; mint_git_token must report
+        // 503 Service Unavailable (not 500), so a box can distinguish "minting not
+        // configured" from a genuine server fault.
+        let state = setup_state().await;
+        let err = mint_git_token(&state, &pool_agent(), "https://github.com/o/r.git")
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, AppError::ServiceUnavailable(_)));
     }
 
     // -----------------------------------------------------------------------
