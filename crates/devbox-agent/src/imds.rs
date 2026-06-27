@@ -1,7 +1,7 @@
 //! IMDSv2 access via the AWS SDK's metadata client.
 //!
 //! Wraps [`aws_config::imds::Client`], which manages the IMDSv2 session token,
-//! endpoint, and retries internally. All three subcommands read instance
+//! endpoint, and retries internally. All subcommands read instance
 //! identity and tags through these helpers.
 
 use anyhow::{Context, Result};

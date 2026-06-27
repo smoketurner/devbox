@@ -102,7 +102,7 @@ Rust workspace, four crates:
 | `devbox-common` | Shared types: `DevboxId`, `DevboxState`, API request/response |
 | `devbox-server` | Axum API (`/api/v1/devboxes/*`) + HTML dashboard, document store (SQLite dev / Aurora DSQL prod), ASG-adopting pool reconciler, AWS compute layer |
 | `devbox-cli`    | `claim` / `release` / `rename` / `list` / `status` / `ssh` |
-| `devbox-agent`  | On-host binary baked into the AMI: `principals` (sshd resolver), `owner-sync` (provision the claimant's account), `warmup` (self-tags `devbox:ready=true` once warmed). musl static; built/released by CI, downloaded into the golden AMI |
+| `devbox-agent`  | On-host binary baked into the AMI: `principals` (sshd resolver), `owner-sync` (provision the claimant's account), `warmup` (self-tags `devbox:ready=true` once warmed), `checkout` (clone repos into `/workspace`). musl static; built/released by CI, downloaded into the golden AMI |
 
 **Pool management is ASG-based and the reconciler is adopt-only.** The Launch
 Template and ASG are **provisioned by Terraform** in `devbox-infra`; there is no
@@ -185,7 +185,7 @@ in-memory SQLite.
 |------|----------|
 | Shared types | `crates/devbox-common/src/lib.rs` |
 | CLI (incl. `ssh` over SSM) | `crates/devbox-cli/src/main.rs` (Clap definitions), `crates/devbox-cli/src/command.rs` (handlers), `crates/devbox-cli/src/ssh.rs`, `crates/devbox-cli/src/ssm.rs` (native data channel) |
-| On-host agent (principals / owner-sync / warmup) | `crates/devbox-agent/src/` |
+| On-host agent (principals / owner-sync / warmup / checkout) | `crates/devbox-agent/src/` |
 | Server entry / config / shutdown | `crates/devbox-server/src/main.rs` |
 | HTTP routes | `crates/devbox-server/src/routes.rs`, `crates/devbox-server/src/service.rs` (domain logic) |
 | Dashboard UI | `crates/devbox-server/src/ui.rs` |

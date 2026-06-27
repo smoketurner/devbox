@@ -132,7 +132,7 @@ devbox release --server http://localhost:3000
 | [`devbox-common`](crates/devbox-common/) | Shared types: `DevboxId`, `DevboxState` enum, API request/response types, configuration |
 | [`devbox-server`](crates/devbox-server/) | Axum HTTP server with database layer (SQLite/DSQL), pool reconciliation, EC2 orchestration, HTML dashboard |
 | [`devbox-cli`](crates/devbox-cli/) | CLI binary with `claim`, `release`, `rename`, `list`, `status`, `ssh` subcommands via reqwest |
-| [`devbox-agent`](crates/devbox-agent/) | On-host binary baked into the golden AMI: `principals` (sshd resolver), `owner-sync` (provision the claimant's account), `warmup` (freshen `/workspace`, self-tag `devbox:ready=true`) |
+| [`devbox-agent`](crates/devbox-agent/) | On-host binary baked into the golden AMI: `principals` (sshd resolver), `owner-sync` (provision the claimant's account), `warmup` (freshen `/workspace`, self-tag `devbox:ready=true`), `checkout` (clone repos into `/workspace`) |
 
 ## Components and the AMI pipeline
 
