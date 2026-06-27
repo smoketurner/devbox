@@ -1,7 +1,8 @@
 # devbox-common
 
-Shared types for [devbox](../../README.md), used by both `devbox-server` and
-`devbox-cli` so the API wire format stays in sync. Pure library — no I/O.
+Shared types for [devbox](../../README.md), used by `devbox-server`,
+`devbox-cli`, and `devbox-agent` so the API wire format stays in sync. Pure
+library — no I/O.
 
 ## Contents
 
