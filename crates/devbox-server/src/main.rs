@@ -222,7 +222,16 @@ async fn build_agent_auth_config(http: &reqwest::Client) -> Result<Option<AgentA
     };
     let audience = require("DEVBOX_AGENT_AUDIENCE")?;
     let platform_account_id = require("AWS_ACCOUNT_ID")?;
-    let pool_role_arn = require("DEVBOX_POOL_ROLE_ARN")?;
+
+    // Trusted role ARNs are comma-separated: the pool is one role today, but there
+    // are several builder roles (snapshot-builder + image-builder instances).
+    let pool_role_arns = csv_list(&require("DEVBOX_POOL_ROLE_ARNS")?);
+    if pool_role_arns.is_empty() {
+        anyhow::bail!("DEVBOX_POOL_ROLE_ARNS must list at least one role ARN");
+    }
+    let builder_role_arns = nonempty("DEVBOX_BUILDER_ROLE_ARNS")
+        .map(|raw| csv_list(&raw))
+        .unwrap_or_default();
 
     let endpoints = discover_with_retry(http, &issuer).await?;
     tracing::info!(issuer = %issuer, "agent OIDC auth enabled (AWS web-identity tokens)");
@@ -232,11 +241,20 @@ async fn build_agent_auth_config(http: &reqwest::Client) -> Result<Option<AgentA
         jwks_uri: endpoints.jwks_uri,
         audience,
         platform_account_id,
-        pool_role_arn,
-        builder_role_arn: nonempty("DEVBOX_BUILDER_ROLE_ARN"),
+        pool_role_arns,
+        builder_role_arns,
         org_id: nonempty("DEVBOX_AGENT_ORG_ID"),
         vpc_id: nonempty("DEVBOX_AGENT_VPC_ID"),
     }))
+}
+
+/// Split a comma-separated env value into trimmed, non-empty items.
+fn csv_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Resolve the issuer's OIDC endpoints, retrying transient failures at boot.

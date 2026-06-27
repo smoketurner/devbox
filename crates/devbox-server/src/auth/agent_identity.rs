@@ -50,10 +50,13 @@ pub struct AgentAuthConfig {
     pub audience: String,
     /// The platform AWS account; the token's `aws_account` must equal it.
     pub platform_account_id: String,
-    /// IAM role ARN of warm-pool hosts (`sub` == this ⇒ [`AgentRole::Pool`]).
-    pub pool_role_arn: String,
-    /// IAM role ARN of builder hosts, when builders use this path.
-    pub builder_role_arn: Option<String>,
+    /// IAM role ARNs of warm-pool hosts (`sub` ∈ this ⇒ [`AgentRole::Pool`]). The
+    /// pool is one ASG/role today, but a list keeps it symmetric with builders.
+    pub pool_role_arns: Vec<String>,
+    /// IAM role ARNs of builder hosts (`sub` ∈ this ⇒ [`AgentRole::Builder`]).
+    /// There is more than one — the snapshot-builder and image-builder instances
+    /// run the agent under distinct roles.
+    pub builder_role_arns: Vec<String>,
     /// Optional defense-in-depth: require the token's `org_id` to equal this.
     pub org_id: Option<String>,
     /// Optional defense-in-depth: require `ec2_instance_source_vpc` to equal this.
@@ -63,9 +66,9 @@ pub struct AgentAuthConfig {
 impl AgentAuthConfig {
     /// Resolve the [`AgentRole`] for a `sub` role ARN, or `None` if untrusted.
     fn role_for(&self, sub: &str) -> Option<AgentRole> {
-        if sub == self.pool_role_arn {
+        if self.pool_role_arns.iter().any(|arn| arn == sub) {
             Some(AgentRole::Pool)
-        } else if self.builder_role_arn.as_deref() == Some(sub) {
+        } else if self.builder_role_arns.iter().any(|arn| arn == sub) {
             Some(AgentRole::Builder)
         } else {
             None
@@ -166,8 +169,8 @@ mod tests {
             jwks_uri: "https://uuid.tokens.sts.global.api.aws/.well-known/jwks.json".to_string(),
             audience: "https://cp.devbox.farm".to_string(),
             platform_account_id: ACCOUNT.to_string(),
-            pool_role_arn: POOL_ROLE.to_string(),
-            builder_role_arn: Some(BUILDER_ROLE.to_string()),
+            pool_role_arns: vec![POOL_ROLE.to_string()],
+            builder_role_arns: vec![BUILDER_ROLE.to_string()],
             org_id: None,
             vpc_id: None,
         }
