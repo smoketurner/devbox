@@ -1058,17 +1058,14 @@ dependencies = [
  "aws-config",
  "aws-lc-rs",
  "aws-sdk-ec2",
- "aws-sdk-ssm",
+ "aws-sdk-sts",
  "clap",
  "devbox-common",
- "jsonwebtoken",
  "reqwest",
  "rustls",
- "serde",
  "tokio",
  "tracing",
  "tracing-subscriber",
- "url",
 ]
 
 [[package]]
@@ -1122,6 +1119,7 @@ dependencies = [
  "aws-sdk-autoscaling",
  "aws-sdk-dsql",
  "aws-sdk-ec2",
+ "aws-sdk-ssm",
  "axum",
  "base64",
  "devbox-common",

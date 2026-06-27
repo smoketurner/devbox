@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tokio::process::Command;
 
-use crate::github_token::TokenMinter;
+use crate::server_client::ServerTokenClient;
 
 /// Env var the credential helper reads the token from. The agent sets it on the
 /// git child process — the token is never baked into the binary, logged, or placed
@@ -62,15 +62,15 @@ pub(crate) async fn run_git_clone(
     await_git(cmd, &format!("git clone {url}")).await
 }
 
-/// Build a GitHub App token minter from the environment, or `None` when the box is
-/// not configured for GitHub App auth. Degrades gracefully so callers can proceed
-/// unauthenticated.
-pub(crate) async fn build_minter() -> Option<TokenMinter> {
-    match TokenMinter::new().await {
-        Ok(Some(minter)) => Some(minter),
+/// Build the control-plane token client from the environment, or `None` when the
+/// box is not configured for server-backed minting (`DEVBOX_SERVER_URL` unset).
+/// Degrades gracefully so callers can proceed unauthenticated.
+pub(crate) async fn build_minter() -> Option<ServerTokenClient> {
+    match ServerTokenClient::new().await {
+        Ok(Some(client)) => Some(client),
         Ok(None) => {
             tracing::warn!(
-                "GitHub App not configured; proceeding without credentials \
+                "DEVBOX_SERVER_URL not set; proceeding without credentials \
                  (private repos require authentication)"
             );
             None
@@ -78,7 +78,7 @@ pub(crate) async fn build_minter() -> Option<TokenMinter> {
         Err(e) => {
             tracing::warn!(
                 error = %format!("{e:#}"),
-                "failed to build GitHub token minter; proceeding without credentials"
+                "failed to build control-plane token client; proceeding without credentials"
             );
             None
         }

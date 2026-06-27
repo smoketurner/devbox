@@ -146,6 +146,58 @@ impl AsRef<str> for SecurityGroupId {
 }
 
 // ============================================================================
+// InstanceId
+// ============================================================================
+
+/// A strongly-typed EC2 instance ID (e.g., "i-0123456789abcdef0").
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct InstanceId(pub String);
+
+impl InstanceId {
+    /// Get the inner string value.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Parse the instance ID out of an EC2 instance ARN of the form
+    /// `arn:aws:ec2:<region>:<account>:instance/<instance-id>`.
+    ///
+    /// Returns `None` unless the input is an `arn:…:ec2:…:instance/<id>` ARN with
+    /// a non-empty id. Partition-agnostic (matches `:instance/` rather than a
+    /// fixed prefix). Used to lift the STS-asserted `ec2_source_instance_arn`
+    /// claim of an AWS web-identity token into a typed id.
+    #[must_use]
+    pub fn from_ec2_arn(arn: &str) -> Option<Self> {
+        if !arn.starts_with("arn:") || !arn.contains(":ec2:") {
+            return None;
+        }
+        let (_head, id) = arn.split_once(":instance/")?;
+        let id = id.trim();
+        (!id.is_empty()).then(|| Self(id.to_string()))
+    }
+}
+
+impl std::fmt::Display for InstanceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for InstanceId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl AsRef<str> for InstanceId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+// ============================================================================
 // Principal / username validation
 // ============================================================================
 
@@ -375,6 +427,75 @@ pub struct ClaimRequest {
 pub struct RenameRequest {
     /// New name for the box. Must satisfy [`is_valid_devbox_name`].
     pub name: String,
+}
+
+// ============================================================================
+// Agent git-token API
+// ============================================================================
+
+/// A GitHub repository identified by `owner/repo`.
+///
+/// The unit the server scopes a minted installation token to. Distinct from a
+/// git remote URL (which the server parses into this); see [`GitHubRepository::parse`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct GitHubRepository {
+    pub owner: String,
+    pub repo: String,
+}
+
+impl GitHubRepository {
+    /// Parse an `owner/repo` string (a trailing `.git` is stripped).
+    ///
+    /// Returns `None` unless there are exactly two non-empty segments split on a
+    /// single `/`. This parses the canonical `owner/repo` form only — git remote
+    /// URLs (`https://…`, scp-like) are parsed server-side by the minter.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        let (owner, repo) = s.trim().split_once('/')?;
+        let repo = repo.strip_suffix(".git").unwrap_or(repo);
+        if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+            return None;
+        }
+        Some(Self {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+        })
+    }
+}
+
+impl std::fmt::Display for GitHubRepository {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.owner, self.repo)
+    }
+}
+
+/// Request body for `POST /api/v1/agent/git-token`.
+///
+/// The agent sends the git remote URL it needs a token for; the server parses
+/// `owner/repo`, gates on the GitHub App's host, and mints. The agent cannot
+/// decide locally whether a remote is mintable — the App's host config lives on
+/// the server, not the box.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitTokenRequest {
+    /// A git remote URL (`https://…`, `ssh://…`, or scp-like `git@host:owner/repo`).
+    pub remote: String,
+}
+
+/// Response body for `POST /api/v1/agent/git-token`.
+///
+/// `token` is `None` when `remote` is not a repository on the App's GitHub host —
+/// the agent then fetches unauthenticated, matching the prior on-box behavior. A
+/// repository that *is* on the host but isn't covered by the App installation is
+/// an error (the GitHub installation lookup 404s), not a `None` token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitTokenResponse {
+    /// The repository the token is scoped to, when one was minted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<GitHubRepository>,
+    /// A short-lived `contents:read`+`metadata:read` token scoped to `repository`,
+    /// or `None` when the remote isn't a mintable GitHub repo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 // ============================================================================
@@ -757,5 +878,128 @@ mod tests {
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(!json.contains("aws_account_id"), "got: {json}");
+    }
+
+    #[test]
+    fn instance_id_serde_transparent() {
+        let id = InstanceId("i-0123456789abcdef0".to_string());
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, "\"i-0123456789abcdef0\"");
+        let parsed: InstanceId = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, id);
+    }
+
+    #[test]
+    fn instance_id_from_ec2_arn_parses() {
+        assert_eq!(
+            InstanceId::from_ec2_arn("arn:aws:ec2:us-east-1:123456789012:instance/i-abc123def456"),
+            Some(InstanceId("i-abc123def456".to_string()))
+        );
+        // Partition-agnostic.
+        assert_eq!(
+            InstanceId::from_ec2_arn("arn:aws-us-gov:ec2:us-gov-west-1:123456789012:instance/i-1"),
+            Some(InstanceId("i-1".to_string()))
+        );
+    }
+
+    #[test]
+    fn instance_id_from_ec2_arn_rejects_non_instance_arns() {
+        // Wrong service, wrong resource, empty id, and non-ARN inputs all fail.
+        assert_eq!(
+            InstanceId::from_ec2_arn("arn:aws:ec2:us-east-1:123456789012:volume/vol-abc"),
+            None
+        );
+        assert_eq!(
+            InstanceId::from_ec2_arn("arn:aws:iam::123456789012:role/PoolRole"),
+            None
+        );
+        assert_eq!(
+            InstanceId::from_ec2_arn("arn:aws:ec2:us-east-1:123456789012:instance/"),
+            None
+        );
+        assert_eq!(InstanceId::from_ec2_arn("not-an-arn"), None);
+    }
+
+    #[test]
+    fn github_repository_parse_accepts() {
+        assert_eq!(
+            GitHubRepository::parse("smoketurner/devbox"),
+            Some(GitHubRepository {
+                owner: "smoketurner".to_string(),
+                repo: "devbox".to_string(),
+            })
+        );
+        // Trailing .git is stripped; surrounding whitespace trimmed.
+        assert_eq!(
+            GitHubRepository::parse("  smoketurner/devbox.git "),
+            Some(GitHubRepository {
+                owner: "smoketurner".to_string(),
+                repo: "devbox".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn github_repository_parse_rejects() {
+        assert_eq!(GitHubRepository::parse("owner-only"), None);
+        assert_eq!(GitHubRepository::parse("/repo"), None);
+        assert_eq!(GitHubRepository::parse("owner/"), None);
+        assert_eq!(GitHubRepository::parse("a/b/c"), None);
+        assert_eq!(GitHubRepository::parse(""), None);
+    }
+
+    #[test]
+    fn github_repository_display_roundtrips_parse() {
+        let repo = GitHubRepository {
+            owner: "smoketurner".to_string(),
+            repo: "devbox".to_string(),
+        };
+        assert_eq!(repo.to_string(), "smoketurner/devbox");
+        assert_eq!(GitHubRepository::parse(&repo.to_string()), Some(repo));
+    }
+
+    #[test]
+    fn git_token_request_serde() {
+        let req = GitTokenRequest {
+            remote: "https://github.com/smoketurner/devbox.git".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: GitTokenRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.remote, req.remote);
+    }
+
+    #[test]
+    fn git_token_response_omits_none_fields() {
+        // A non-mintable remote returns an empty object, not nulls.
+        let resp = GitTokenResponse {
+            repository: None,
+            token: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(json, "{}");
+        let parsed: GitTokenResponse = serde_json::from_str(&json).unwrap();
+        assert!(parsed.token.is_none() && parsed.repository.is_none());
+    }
+
+    #[test]
+    fn git_token_response_roundtrips_minted() {
+        let resp = GitTokenResponse {
+            repository: Some(GitHubRepository {
+                owner: "smoketurner".to_string(),
+                repo: "devbox".to_string(),
+            }),
+            token: Some("ghs_exampletoken".to_string()),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: GitTokenResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.token.as_deref(), Some("ghs_exampletoken"));
+        assert_eq!(
+            parsed
+                .repository
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("smoketurner/devbox")
+        );
     }
 }

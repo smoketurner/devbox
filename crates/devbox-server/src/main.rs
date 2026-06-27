@@ -8,7 +8,7 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use devbox_server::auth::{
-    AuthConfig, AuthError, Authenticator, OidcConfig, OidcEndpoints, discover,
+    AgentAuthConfig, AuthConfig, AuthError, Authenticator, OidcConfig, OidcEndpoints, discover,
 };
 use devbox_server::compute::ec2::Ec2;
 use devbox_server::db::{DocumentStore, Pool, PoolConfig};
@@ -114,12 +114,21 @@ async fn main() -> Result<()> {
         .ok()
         .filter(|s| !s.is_empty());
 
+    // Build the GitHub token minter, which reads the App private key from SSM via
+    // the task role. `None` when unconfigured (local/dev), so the server boots
+    // without AWS and the agent git-token endpoint reports minting unavailable.
+    let minter = devbox_server::github::Minter::from_env(&aws_config)
+        .await
+        .context("initialize GitHub token minter")?
+        .map(Arc::new);
+
     // Build router. State is shared as a single Arc<AppState>.
     let app = build_router(Arc::new(AppState {
         store: Arc::clone(&store),
         reconciler_config,
         auth: build_authenticator().await?,
         aws_account_id,
+        minter,
     }));
 
     // Start server
@@ -163,19 +172,71 @@ async fn build_authenticator() -> Result<Authenticator> {
     let endpoints = discover_with_retry(&http, &issuer).await?;
 
     let oidc = build_oidc_config(&endpoints)?;
+    let agent = build_agent_auth_config(&http).await?;
     let config = AuthConfig {
         issuer,
         jwks_uri: endpoints.jwks_uri,
         alb_region: std::env::var("AWS_REGION").ok().filter(|s| !s.is_empty()),
         alb_arn: std::env::var("AUTH_ALB_ARN").ok().filter(|s| !s.is_empty()),
         oidc,
+        agent,
     };
     tracing::info!(
         issuer = %config.issuer,
         dashboard_login = config.oidc.is_some(),
+        agent_auth = config.agent.is_some(),
         "API authentication enabled (owner = email local part)"
     );
     Ok(Authenticator::new(config))
+}
+
+/// Build the agent-token trust config from the environment, or `Ok(None)` when
+/// `DEVBOX_AGENT_OIDC_ISSUER` is unset (agent path disabled — `/api/v1/agent/*`
+/// reports it unconfigured).
+///
+/// Agent tokens are AWS web-identity (IAM Outbound Identity Federation) JWTs; the
+/// issuer's `jwks_uri` is discovered the same way as Vouch's. The other knobs are
+/// non-secret trust parameters: the expected audience (the control-plane
+/// resource), the platform AWS account (`AWS_ACCOUNT_ID`), and the trusted pool /
+/// builder role ARNs. `DEVBOX_AGENT_ORG_ID` and `DEVBOX_AGENT_VPC_ID` are optional
+/// defense-in-depth.
+///
+/// # Errors
+///
+/// Returns an error when `DEVBOX_AGENT_OIDC_ISSUER` is set but a required
+/// companion (`DEVBOX_AGENT_AUDIENCE`, `AWS_ACCOUNT_ID`, `DEVBOX_POOL_ROLE_ARN`)
+/// is missing, or issuer discovery fails — a misconfiguration that must fail fast
+/// rather than silently leaving the agent path unverifiable.
+async fn build_agent_auth_config(http: &reqwest::Client) -> Result<Option<AgentAuthConfig>> {
+    let nonempty = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
+
+    let Some(issuer) = nonempty("DEVBOX_AGENT_OIDC_ISSUER") else {
+        tracing::info!("agent OIDC auth disabled (DEVBOX_AGENT_OIDC_ISSUER unset)");
+        return Ok(None);
+    };
+
+    let require = |name: &str| -> Result<String> {
+        nonempty(name).with_context(|| {
+            format!("{name} is required when DEVBOX_AGENT_OIDC_ISSUER is set (agent auth)")
+        })
+    };
+    let audience = require("DEVBOX_AGENT_AUDIENCE")?;
+    let platform_account_id = require("AWS_ACCOUNT_ID")?;
+    let pool_role_arn = require("DEVBOX_POOL_ROLE_ARN")?;
+
+    let endpoints = discover_with_retry(http, &issuer).await?;
+    tracing::info!(issuer = %issuer, "agent OIDC auth enabled (AWS web-identity tokens)");
+
+    Ok(Some(AgentAuthConfig {
+        issuer,
+        jwks_uri: endpoints.jwks_uri,
+        audience,
+        platform_account_id,
+        pool_role_arn,
+        builder_role_arn: nonempty("DEVBOX_BUILDER_ROLE_ARN"),
+        org_id: nonempty("DEVBOX_AGENT_ORG_ID"),
+        vpc_id: nonempty("DEVBOX_AGENT_VPC_ID"),
+    }))
 }
 
 /// Resolve the issuer's OIDC endpoints, retrying transient failures at boot.

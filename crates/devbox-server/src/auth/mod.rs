@@ -16,9 +16,11 @@
 //! `owner` to that principal, so a caller can only act as the identity they
 //! authenticated as — the same Vouch identity namespace the SSH cert uses.
 
+mod agent_identity;
 mod discovery;
 mod jwt;
 
+pub use agent_identity::{AgentAuthConfig, AgentIdentity, AgentRole};
 pub use discovery::{OidcEndpoints, discover};
 pub(crate) use jwt::random_token;
 pub use jwt::{AuthConfig, AuthError, Authenticator, OidcConfig, Principal, SessionUser};

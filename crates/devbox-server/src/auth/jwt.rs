@@ -12,6 +12,8 @@ use secrecy::{ExposeSecret, SecretString};
 
 use devbox_common::username_from_email;
 
+use super::agent_identity::{AgentAuthConfig, AgentIdentity, from_claims};
+
 /// Header the ALB injects with a signed JWT for OIDC-authenticated requests.
 const ALB_OIDC_DATA_HEADER: &str = "x-amzn-oidc-data";
 
@@ -33,6 +35,11 @@ pub struct AuthConfig {
     /// renders the login page unusable (shows an error); all dashboard routes
     /// require a valid session.
     pub oidc: Option<OidcConfig>,
+    /// Trust parameters for AWS web-identity (Outbound Identity Federation) agent
+    /// tokens on `/api/v1/agent/*`. `None` disables the agent path (those routes
+    /// report agent auth as unconfigured); set in production to verify devbox-host
+    /// tokens against the AWS account issuer.
+    pub agent: Option<AgentAuthConfig>,
 }
 
 /// OIDC Authorization Code parameters for the dashboard login flow.
@@ -109,6 +116,10 @@ pub struct Authenticator {
     jwks: RwLock<HashMap<String, DecodingKey>>,
     /// Cached ALB signing keys, keyed by `kid`.
     alb_keys: RwLock<HashMap<String, DecodingKey>>,
+    /// Cached AWS web-identity (agent issuer) signing keys, keyed by `kid`. A
+    /// separate cache from `jwks` because agent tokens come from a different
+    /// issuer (the AWS account) than human Vouch tokens.
+    agent_jwks: RwLock<HashMap<String, DecodingKey>>,
     /// Test-only: when set, [`authenticate`](Self::authenticate) resolves every
     /// request to this owner without touching the network (mocks the JWKS
     /// boundary so sibling-module handler tests need not mint real tokens).
@@ -126,6 +137,7 @@ impl Authenticator {
             http: reqwest::Client::new(),
             jwks: RwLock::new(HashMap::new()),
             alb_keys: RwLock::new(HashMap::new()),
+            agent_jwks: RwLock::new(HashMap::new()),
             #[cfg(test)]
             test_owner: None,
         }
@@ -143,6 +155,7 @@ impl Authenticator {
             alb_region: None,
             alb_arn: None,
             oidc: None,
+            agent: None,
         });
         auth.test_owner = Some(owner.to_string());
         auth
@@ -200,6 +213,39 @@ impl Authenticator {
         Ok(Principal { owner, email })
     }
 
+    /// Verify an AWS web-identity (Outbound Identity Federation) agent token and
+    /// resolve the calling devbox host's [`AgentIdentity`].
+    ///
+    /// Validates the JWKS signature against the **AWS account** issuer (a separate
+    /// issuer and key cache from Vouch), and — unlike the Vouch path — **enforces
+    /// the audience** (`GetWebIdentityToken` always sets one), pinning it to the
+    /// control-plane resource so a token minted for another service can't be
+    /// replayed here. Identity is then extracted from STS-asserted claims by
+    /// [`from_claims`].
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Invalid`] when agent auth is unconfigured, the token fails
+    /// signature/issuer/audience/expiry validation, or its claims don't resolve to
+    /// a trusted devbox host.
+    pub async fn verify_agent_token(&self, token: &str) -> Result<AgentIdentity, AuthError> {
+        let agent =
+            self.config.agent.as_ref().ok_or_else(|| {
+                AuthError::Invalid("agent authentication not configured".to_string())
+            })?;
+
+        let kid = key_id(token)?;
+        let key = self.agent_key(&kid, &agent.jwks_uri).await?;
+
+        let mut validation = Validation::new(token_algorithm(token)?);
+        validation.set_issuer(&[agent.issuer.as_str()]);
+        validation.set_audience(&[agent.audience.as_str()]);
+
+        let data = decode::<serde_json::Value>(token, &key, &validation)
+            .map_err(|e| AuthError::Invalid(format!("agent token validation failed: {e}")))?;
+        from_claims(&data.claims, agent)
+    }
+
     /// Verify an ALB `x-amzn-oidc-data` JWT against the ALB's regional key.
     ///
     /// Pins the token's `signer` (the issuing ALB's ARN) to the configured
@@ -232,16 +278,33 @@ impl Authenticator {
         if let Some(key) = read_key(&self.jwks, kid) {
             return Ok(key);
         }
-        self.refresh_jwks().await?;
+        self.fetch_jwks_into(&self.config.jwks_uri, &self.jwks)
+            .await?;
         read_key(&self.jwks, kid)
             .ok_or_else(|| AuthError::Invalid(format!("unknown signing key id {kid}")))
     }
 
-    /// Fetch the JWKS and replace the cache (handles key rotation).
-    async fn refresh_jwks(&self) -> Result<(), AuthError> {
+    /// Look up an agent (AWS web-identity) signing key by `kid`, refreshing the
+    /// agent issuer's JWKS on a miss.
+    async fn agent_key(&self, kid: &str, jwks_uri: &str) -> Result<DecodingKey, AuthError> {
+        if let Some(key) = read_key(&self.agent_jwks, kid) {
+            return Ok(key);
+        }
+        self.fetch_jwks_into(jwks_uri, &self.agent_jwks).await?;
+        read_key(&self.agent_jwks, kid)
+            .ok_or_else(|| AuthError::Invalid(format!("unknown agent signing key id {kid}")))
+    }
+
+    /// Fetch a JWKS from `uri` and replace `cache` (handles key rotation). Shared
+    /// by the Vouch bearer and AWS agent key paths, each with its own cache + URI.
+    async fn fetch_jwks_into(
+        &self,
+        uri: &str,
+        cache: &RwLock<HashMap<String, DecodingKey>>,
+    ) -> Result<(), AuthError> {
         let set: JwkSet = self
             .http
-            .get(&self.config.jwks_uri)
+            .get(uri)
             .send()
             .await
             .map_err(|e| AuthError::Invalid(format!("fetch JWKS: {e}")))?
@@ -258,7 +321,7 @@ impl Authenticator {
             }
         }
 
-        if let Ok(mut guard) = self.jwks.write() {
+        if let Ok(mut guard) = cache.write() {
             *guard = keys;
         }
         Ok(())
@@ -489,21 +552,22 @@ fn alb_signer(token: &str) -> Result<String, AuthError> {
         .ok_or_else(|| AuthError::Invalid("ALB token header missing signer".to_string()))
 }
 
-/// Read a token's signing algorithm, restricted to the asymmetric algorithms
-/// Vouch issues (`RS256`, `ES256`).
+/// Read a token's signing algorithm, restricted to the asymmetric algorithms we
+/// accept: `RS256`/`ES256` (Vouch) and `ES384` (AWS web-identity agent tokens).
 ///
 /// Validation must use the token's own algorithm rather than a fixed list:
 /// `jsonwebtoken` rejects a decoding key whose family differs from *any*
-/// algorithm in `Validation::algorithms`, so a mixed `[RS256, ES256]` list fails
-/// an `ES256` (EC-key) token with `InvalidAlgorithm`. Restricting to the
-/// allow-listed header algorithm — with the key looked up by `kid` from the
-/// trusted JWKS — keeps a single family and blocks algorithm-confusion.
+/// algorithm in `Validation::algorithms`, so a mixed list fails an EC-key token
+/// with `InvalidAlgorithm`. Restricting to the allow-listed header algorithm —
+/// with the key looked up by `kid` from the trusted JWKS — keeps a single family
+/// and blocks algorithm-confusion. (`ES384` is what `GetWebIdentityToken` signs
+/// with for this deployment; the AWS issuer advertises only `RS256`/`ES384`.)
 fn token_algorithm(token: &str) -> Result<Algorithm, AuthError> {
     let alg = decode_header(token)
         .map_err(|e| AuthError::Invalid(format!("bad token header: {e}")))?
         .alg;
     match alg {
-        Algorithm::RS256 | Algorithm::ES256 => Ok(alg),
+        Algorithm::RS256 | Algorithm::ES256 | Algorithm::ES384 => Ok(alg),
         unsupported => Err(AuthError::Invalid(format!(
             "unsupported token algorithm {unsupported:?}"
         ))),
@@ -614,6 +678,7 @@ mod tests {
             alb_region: None,
             alb_arn: None,
             oidc,
+            agent: None,
         }
     }
 
@@ -728,6 +793,19 @@ mod tests {
         // algorithm — token_algorithm must reject it.
         let token = sign(json!({ "sub": "jdoe", "iss": ISSUER, "exp": 9_999_999_999_u64 }));
         assert!(token_algorithm(&token).is_err());
+    }
+
+    #[test]
+    fn token_algorithm_accepts_es384_for_agent_tokens() {
+        // AWS web-identity (GetWebIdentityToken) tokens are ES384; token_algorithm
+        // reads the header alg, so a token with an ES384 header is accepted (only
+        // the header segment is decoded — payload/signature are placeholders here).
+        use base64::Engine as _;
+        let header = json!({ "alg": "ES384", "kid": "k1", "typ": "JWT" });
+        let header_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&header).unwrap());
+        let token = format!("{header_b64}.e30.sig");
+        assert_eq!(token_algorithm(&token).unwrap(), Algorithm::ES384);
     }
 
     #[test]

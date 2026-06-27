@@ -6,9 +6,9 @@
 //! the snapshot was cut and resets each repo to its upstream HEAD, so a claimant
 //! gets a near-HEAD checkout without paying a full clone at launch.
 //!
-//! The fetch is **read-only** — the agent mints a short-lived GitHub App
-//! installation token per repo, discovering the installation from each repo's
-//! `origin` (see [`crate::github_token`]) — and
+//! The fetch is **read-only** — the agent requests a short-lived, repo-scoped
+//! token per repo from the control plane, which mints it from each repo's `origin`
+//! (see [`crate::server_client`]) — and
 //! **time-budgeted**: if the delta is too large to land within the budget, the box
 //! still becomes Ready serving the snapshot-age checkout (degrade, don't reap) — a
 //! slightly-stale box beats no box, and the claimant can fetch HEAD themselves. An
@@ -23,7 +23,7 @@ use anyhow::{Context, Result};
 use tokio::process::Command;
 
 use crate::git::{build_minter, run_git};
-use crate::github_token::TokenMinter;
+use crate::server_client::ServerTokenClient;
 
 /// Where the snapshot-seeded repositories live.
 const WORKSPACE: &str = "/workspace";
@@ -197,7 +197,7 @@ fn remove_lock_files(dir: &Path, recurse: bool) {
 
 /// A read-only token for `repo`'s `origin` owner, or `None` to fetch unauthenticated
 /// (no minter, no/non-GitHub remote, or the App isn't installed on the owner).
-async fn repo_token(minter: Option<&mut TokenMinter>, repo: &Path) -> Option<String> {
+async fn repo_token(minter: Option<&mut ServerTokenClient>, repo: &Path) -> Option<String> {
     let minter = minter?;
     let url = repo_origin_url(repo).await?;
     match minter.token_for(&url).await {

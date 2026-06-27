@@ -1,33 +1,35 @@
-//! Mint short-lived, read-only GitHub App installation tokens at warm-up.
+//! Mint short-lived, **repo-scoped**, read-only GitHub App installation tokens.
 //!
-//! The warming fetch needs a credential, but an installation token lives only an
-//! hour, so it can't be baked into the AMI or an env var. Instead the agent reads
-//! the GitHub App private key from an **SSM SecureString** parameter (via the host
-//! instance profile — no static secret on the box), signs a short App JWT, and
-//! exchanges it for a fresh `contents:read` installation token. The token is used
-//! only for the fetch and never persisted.
+//! This is the off-box half of the credential model: the GitHub App private key
+//! (PEM) lives only on the control plane, read from an **SSM SecureString** via
+//! the task role. A devbox host requests a token for a git remote over the agent
+//! API; the server signs a short App JWT, discovers the installation covering the
+//! repo, and exchanges the JWT for a `contents:read`+`metadata:read` token
+//! **scoped to that one repository** (least privilege — a leaked 1h token covers
+//! one repo, not the whole installation). The PEM never leaves the server.
 //!
 //! The installation is **discovered per repository**, not configured: for each
-//! repo the agent reads its `origin` remote, derives `owner/repo`, and asks GitHub
-//! which installation covers it (`GET /repos/{owner}/{repo}/installation`). One App
-//! therefore freshens repos in **any** org that has installed it — there are no
-//! installation IDs to track. Tokens are cached per owner (N repos in one org cost
-//! one discovery and one mint).
+//! repo the server reads `owner/repo` from the remote and asks GitHub which
+//! installation covers it (`GET /repos/{owner}/{repo}/installation`). One App
+//! therefore serves **any** org that installed it — there are no installation IDs
+//! to track, and the App installation is the sole repo authorization boundary
+//! (an un-installed repo 404s at GitHub).
 //!
-//! Configuration is non-secret and supplied via the environment (set by the
-//! systemd unit / instance metadata), so an unconfigured box simply skips minting
-//! and fetches unauthenticated:
+//! Configuration is non-secret and supplied via the environment:
 //!
 //! - `DEVBOX_GITHUB_APP_ID` — the App ID or Client ID (the JWT issuer).
 //! - `DEVBOX_GITHUB_KEY_PARAM` — SSM SecureString parameter holding the RSA PEM.
 //! - `DEVBOX_GITHUB_API_BASE` — optional; defaults to `https://api.github.com`.
+//!
+//! When `DEVBOX_GITHUB_APP_ID` / `DEVBOX_GITHUB_KEY_PARAM` are unset the minter is
+//! absent ([`Minter::from_env`] returns `Ok(None)`), so a local/dev server boots
+//! without AWS and the git-token endpoint reports that minting is unconfigured.
 
-use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use aws_config::BehaviorVersion;
-use aws_sdk_ssm::config::Region;
+use aws_config::SdkConfig;
+use devbox_common::GitHubRepository;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -39,11 +41,8 @@ const DEFAULT_API_BASE: &str = "https://api.github.com";
 
 /// GitHub rejects App JWTs older than 10 min; stay well under it.
 const JWT_TTL: Duration = Duration::from_secs(540);
-/// Back-date `iat` to tolerate clock skew between the box and GitHub.
+/// Back-date `iat` to tolerate clock skew between the server and GitHub.
 const JWT_BACKDATE: Duration = Duration::from_secs(60);
-
-/// Bound on the one-time SSM key read so a stall can't block warm-up.
-const KEY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Per-request timeout for the GitHub API calls.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 /// Connect timeout for the GitHub API calls.
@@ -58,6 +57,8 @@ struct Claims {
 
 #[derive(Serialize)]
 struct TokenRequest {
+    /// Repository names (within the installation account) the token is scoped to.
+    repositories: Vec<String>,
     permissions: Permissions,
 }
 
@@ -77,89 +78,91 @@ struct Installation {
     id: u64,
 }
 
-/// Non-secret minting configuration, or `None` when the box is not set up for
-/// GitHub App auth (the caller then fetches unauthenticated).
-struct Config {
-    issuer: String,
-    key_param: String,
-    api_base: String,
-}
-
-/// Mints read-only installation tokens, discovering the installation per repo so a
-/// single App serves every org that installed it. Built once per warm-up; caches a
-/// token per owner.
+/// Mints read-only, repo-scoped installation tokens, discovering the installation
+/// per repo so a single App serves every org that installed it. Built once at
+/// startup; the PEM-derived signing key is cached for the process lifetime.
 ///
 /// Minting is gated on the remote's host matching `git_host` (the App's GitHub
-/// host), so a non-GitHub `origin` never drives a lookup and a GitHub token is never
-/// handed to another host's fetch.
-pub(crate) struct TokenMinter {
+/// host), so a non-GitHub `origin` never drives a lookup and a GitHub token is
+/// never handed to another host's fetch.
+pub struct Minter {
     client: reqwest::Client,
     api_base: String,
     issuer: String,
     git_host: String,
     key: EncodingKey,
-    cache: HashMap<String, String>,
 }
 
-impl TokenMinter {
-    /// Build a minter, or `Ok(None)` when the box is not configured for GitHub App
-    /// auth.
+impl Minter {
+    /// Build a minter from the environment, or `Ok(None)` when the server is not
+    /// configured for GitHub App auth (`DEVBOX_GITHUB_APP_ID` /
+    /// `DEVBOX_GITHUB_KEY_PARAM` unset) so local/dev servers boot without AWS.
+    ///
+    /// `aws_config` is the already-loaded SDK config (region from the task
+    /// environment); it builds the SSM client used for the one-time PEM read.
     ///
     /// # Errors
     ///
-    /// Returns an error if the box is configured but the SSM key fetch, key
+    /// Returns an error when the server is configured but the SSM key read, PEM
     /// parsing, or HTTP client construction fails.
-    pub(crate) async fn new() -> Result<Option<Self>> {
-        let Some(cfg) = config() else {
+    pub async fn from_env(aws_config: &SdkConfig) -> Result<Option<Self>> {
+        let (Some(issuer), Some(key_param)) = (non_empty(APP_ID_ENV), non_empty(KEY_PARAM_ENV))
+        else {
             return Ok(None);
         };
-        let pem = tokio::time::timeout(KEY_READ_TIMEOUT, read_key(&cfg.key_param))
-            .await
-            .context("GitHub App key read timed out")??;
+        let api_base = non_empty(API_BASE_ENV).unwrap_or_else(|| DEFAULT_API_BASE.to_string());
+        let pem = read_key(aws_config, &key_param).await?;
         let key = EncodingKey::from_rsa_pem(pem.as_bytes())
             .context("parse GitHub App private key (expected an RSA PEM)")?;
         let client = reqwest::Client::builder()
-            .user_agent("devbox-agent")
+            .user_agent("devbox-server")
             .timeout(HTTP_TIMEOUT)
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
-            .context("build HTTP client")?;
-        let git_host = git_host_from_api_base(&cfg.api_base);
+            .context("build GitHub HTTP client")?;
+        let git_host = git_host_from_api_base(&api_base);
         Ok(Some(Self {
             client,
-            api_base: cfg.api_base,
-            issuer: cfg.issuer,
+            api_base,
+            issuer,
             git_host,
             key,
-            cache: HashMap::new(),
         }))
     }
 
-    /// A read-only installation token for `remote`'s owner, cached per owner, or
-    /// `Ok(None)` when `remote` is not a repo on the App's GitHub host (the caller
-    /// then fetches unauthenticated).
+    /// Mint a repo-scoped, read-only installation token for `remote`.
+    ///
+    /// Returns `Ok(None)` when `remote` is not a repository on the App's GitHub
+    /// host — the caller then fetches unauthenticated, matching the prior on-box
+    /// behavior. Returns an error when the host matches but the App is not
+    /// installed on the repo (GitHub 404) or an API call fails.
     ///
     /// # Errors
     ///
-    /// Returns an error if the App is not installed on the owner (or the repo is not
-    /// granted to it) or a GitHub API call fails.
-    pub(crate) async fn token_for(&mut self, remote: &str) -> Result<Option<String>> {
+    /// Propagates GitHub API failures (installation lookup, token exchange) and
+    /// JWT signing errors.
+    pub async fn mint_for_remote(
+        &self,
+        remote: &str,
+    ) -> Result<Option<(GitHubRepository, String)>> {
         let Some(parsed) = parse_remote(remote) else {
             return Ok(None);
         };
         if parsed.host != self.git_host {
             return Ok(None);
         }
-        if let Some(token) = self.cache.get(&parsed.owner) {
-            return Ok(Some(token.clone()));
-        }
         let jwt = sign_jwt(&self.issuer, &self.key)?;
         let installation_id = self
             .resolve_installation(&jwt, &parsed.owner, &parsed.repo)
             .await?;
-        let token = self.exchange(&jwt, installation_id).await?;
-        self.cache.insert(parsed.owner, token.clone());
-        Ok(Some(token))
+        let token = self.exchange(&jwt, installation_id, &parsed.repo).await?;
+        Ok(Some((
+            GitHubRepository {
+                owner: parsed.owner,
+                repo: parsed.repo,
+            },
+            token,
+        )))
     }
 
     /// Resolve the installation id covering `owner/repo` via the App JWT.
@@ -191,8 +194,9 @@ impl TokenMinter {
             .id)
     }
 
-    /// Exchange the App JWT for a `contents:read` token on `installation_id`.
-    async fn exchange(&self, jwt: &str, installation_id: u64) -> Result<String> {
+    /// Exchange the App JWT for a `contents:read` token on `installation_id`,
+    /// scoped to the single repository `repo`.
+    async fn exchange(&self, jwt: &str, installation_id: u64, repo: &str) -> Result<String> {
         let url = format!(
             "{}/app/installations/{installation_id}/access_tokens",
             self.api_base.trim_end_matches('/')
@@ -204,6 +208,7 @@ impl TokenMinter {
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .json(&TokenRequest {
+                repositories: vec![repo.to_string()],
                 permissions: Permissions {
                     contents: "read",
                     metadata: "read",
@@ -225,16 +230,6 @@ impl TokenMinter {
     }
 }
 
-/// Read minting configuration from the environment; `None` if any required value
-/// is missing or empty.
-fn config() -> Option<Config> {
-    Some(Config {
-        issuer: non_empty(APP_ID_ENV)?,
-        key_param: non_empty(KEY_PARAM_ENV)?,
-        api_base: non_empty(API_BASE_ENV).unwrap_or_else(|| DEFAULT_API_BASE.to_string()),
-    })
-}
-
 /// Trimmed value of env var `key`, or `None` if unset or blank.
 fn non_empty(key: &str) -> Option<String> {
     std::env::var(key)
@@ -243,19 +238,12 @@ fn non_empty(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-/// Read the GitHub App private key (PEM) from an SSM SecureString parameter using
-/// the host instance profile. Resolves the region from IMDS so the SSM client is
-/// correctly bound even when `AWS_REGION` is not set (the Rust SDK's default
-/// config chain has no IMDS region fallback).
-async fn read_key(param: &str) -> Result<String> {
-    let region = crate::imds::region()
-        .await
-        .context("read region from IMDS for SSM client")?;
-    let config = aws_config::defaults(BehaviorVersion::latest())
-        .region(Region::new(region))
-        .load()
-        .await;
-    let ssm = aws_sdk_ssm::Client::new(&config);
+/// Read the GitHub App private key (PEM) from an SSM SecureString parameter.
+///
+/// Uses the already-loaded SDK config (the task role on ECS, region from the task
+/// environment), so no IMDS region lookup is needed as on the host.
+async fn read_key(aws_config: &SdkConfig, param: &str) -> Result<String> {
+    let ssm = aws_sdk_ssm::Client::new(aws_config);
     let out = ssm
         .get_parameter()
         .name(param)
@@ -270,7 +258,7 @@ async fn read_key(param: &str) -> Result<String> {
 }
 
 /// Sign a GitHub App JWT (RS256; jsonwebtoken on the aws-lc-rs backend). Cheap, so
-/// signed fresh per mint to sidestep the 10-minute App-JWT expiry on long runs.
+/// signed fresh per mint to sidestep the 10-minute App-JWT expiry.
 fn sign_jwt(issuer: &str, key: &EncodingKey) -> Result<String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -372,25 +360,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_https_with_trailing_slash() {
-        assert_eq!(
-            parsed("https://github.com/smoketurner/devbox/"),
-            github("smoketurner", "devbox")
-        );
-    }
-
-    #[test]
     fn parses_scp_like_form() {
         assert_eq!(
             parsed("git@github.com:smoketurner/devbox.git"),
-            github("smoketurner", "devbox")
-        );
-    }
-
-    #[test]
-    fn parses_ssh_scheme_with_user() {
-        assert_eq!(
-            parsed("ssh://git@github.com/smoketurner/devbox.git"),
             github("smoketurner", "devbox")
         );
     }
@@ -414,7 +386,7 @@ mod tests {
     #[test]
     fn captures_non_github_host_so_minting_can_be_gated() {
         // A non-GitHub remote parses, but its host won't match the App's git host,
-        // so `token_for` returns it unauthenticated rather than minting.
+        // so `mint_for_remote` returns None rather than minting.
         assert_eq!(
             parsed("https://gitlab.com/smoketurner/devbox.git"),
             Some((

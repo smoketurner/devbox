@@ -8,17 +8,18 @@ use std::sync::Arc;
 
 use axum::extract::{Path, Request, State};
 use axum::http::HeaderMap;
+use axum::http::header::AUTHORIZATION;
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{Json, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Router};
 
 use devbox_common::{
-    ClaimRequest, DevboxListResponse, DevboxResponse, HealthResponse, PoolMetricsResponse,
-    ProtectedResourceMetadata, RenameRequest,
+    ClaimRequest, DevboxListResponse, DevboxResponse, GitTokenRequest, GitTokenResponse,
+    HealthResponse, PoolMetricsResponse, ProtectedResourceMetadata, RenameRequest,
 };
 
-use crate::auth::{Authenticator, Principal};
+use crate::auth::{AgentIdentity, Authenticator, Principal};
 use crate::documents::devbox::DevboxDoc;
 use crate::error::{AppError, JsonBody};
 use crate::reconcile::ReconcilerConfig;
@@ -43,6 +44,11 @@ pub struct AppState {
     /// 9728 discovery document so `devbox ssh` can auto-select the local AWS
     /// profile for the SSM tunnel. `None` leaves the field out of the document.
     pub aws_account_id: Option<String>,
+    /// GitHub App token minter for the agent path. `None` when the server is not
+    /// configured for GitHub App auth (`DEVBOX_GITHUB_APP_ID` /
+    /// `DEVBOX_GITHUB_KEY_PARAM` unset), in which case `/api/v1/agent/git-token`
+    /// reports minting unavailable.
+    pub minter: Option<Arc<crate::github::Minter>>,
 }
 
 /// Handle to the shared application state, passed to every handler.
@@ -69,6 +75,39 @@ async fn require_auth(
     Ok(next.run(req).await)
 }
 
+/// Authenticate an agent request at the edge of the `/api/v1/agent` router: verify
+/// the AWS web-identity (Outbound Identity Federation) Bearer token and stash the
+/// resolved [`AgentIdentity`]. This is a **distinct** path from human
+/// [`require_auth`] — a different issuer (the AWS account, not Vouch), a different
+/// token type, and a different extracted identity — so a devbox host can never
+/// reach the human endpoints (`claim`/`release`) and a human token can never reach
+/// the agent endpoints (`git-token`).
+async fn require_agent_iam(
+    State(state): State<SharedState>,
+    mut req: Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    let token = bearer_token(req.headers())?;
+    let agent = state.auth.verify_agent_token(&token).await?;
+    req.extensions_mut().insert(agent);
+    Ok(next.run(req).await)
+}
+
+/// Extract a `Bearer` token from the `Authorization` header (case-insensitive
+/// scheme), or a 401 when absent/malformed.
+fn bearer_token(headers: &HeaderMap) -> Result<String, AppError> {
+    let header = headers
+        .get(AUTHORIZATION)
+        .ok_or_else(|| AppError::Unauthorized("no authentication credential".to_string()))?
+        .to_str()
+        .map_err(|_| AppError::Unauthorized("invalid authentication credential".to_string()))?;
+    header
+        .strip_prefix("Bearer ")
+        .or_else(|| header.strip_prefix("bearer "))
+        .map(|token| token.trim().to_string())
+        .ok_or_else(|| AppError::Unauthorized("invalid authentication credential".to_string()))
+}
+
 /// Build the Axum router with all routes.
 ///
 /// Every `/api/v1` route sits behind [`require_auth`]; only `/health`
@@ -85,6 +124,13 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/api/v1/pool/metrics", get(handle_pool_metrics))
         .route_layer(from_fn_with_state(state.clone(), require_auth));
 
+    // The agent subtree authenticates devbox hosts by their AWS web-identity
+    // token (a separate issuer/identity from the human path), so it carries its
+    // own edge layer rather than sharing `require_auth`.
+    let agent = Router::new()
+        .route("/api/v1/agent/git-token", post(handle_agent_git_token))
+        .route_layer(from_fn_with_state(state.clone(), require_agent_iam));
+
     Router::new()
         .route("/health", get(health_check))
         .route(
@@ -92,6 +138,7 @@ pub fn build_router(state: SharedState) -> Router {
             get(protected_resource_metadata),
         )
         .merge(api)
+        .merge(agent)
         .merge(build_ui_router())
         .with_state(state)
 }
@@ -199,6 +246,19 @@ async fn handle_pool_metrics(
     Ok(Json(metrics))
 }
 
+/// HTTP adapter: mint a short-lived, repo-scoped GitHub token for a verified
+/// devbox host. The agent is already authenticated by [`require_agent_iam`]; the
+/// GitHub App installation is the repo authorization boundary (see
+/// [`service::mint_git_token`]).
+async fn handle_agent_git_token(
+    State(state): State<SharedState>,
+    Extension(agent): Extension<AgentIdentity>,
+    JsonBody(req): JsonBody<GitTokenRequest>,
+) -> Result<Json<GitTokenResponse>, AppError> {
+    let resp = service::mint_git_token(&state, &agent, &req.remote).await?;
+    Ok(Json(resp))
+}
+
 #[cfg(test)]
 #[expect(
     clippy::unwrap_used,
@@ -234,6 +294,7 @@ mod tests {
             reconciler_config: test_config(),
             auth: Authenticator::with_test_owner(owner),
             aws_account_id: None,
+            minter: None,
         })
     }
 
@@ -253,12 +314,14 @@ mod tests {
             alb_region: None,
             alb_arn: None,
             oidc: None,
+            agent: None,
         });
         Arc::new(AppState {
             store: Arc::new(test_store().await),
             reconciler_config: test_config(),
             auth,
             aws_account_id: None,
+            minter: None,
         })
     }
 
@@ -345,6 +408,7 @@ mod tests {
             reconciler_config: test_config(),
             auth: Authenticator::with_test_owner("jdoe"),
             aws_account_id: Some("123456789012".to_string()),
+            minter: None,
         });
 
         let Json(meta) = protected_resource_metadata(State(state), HeaderMap::new()).await;
@@ -405,6 +469,34 @@ mod tests {
                 "expected 401 for {method} {uri}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn agent_git_token_requires_agent_credential() {
+        // The agent endpoint sits behind require_agent_iam (a separate edge layer
+        // from the human require_auth). With no Bearer credential it returns 401,
+        // and it is wired (not 404) — pinning the route-separated agent path.
+        let state = setup_state_no_principal().await;
+        let status = router_status(state, "POST", "/api/v1/agent/git-token").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn agent_git_token_rejects_human_test_principal() {
+        // A mocked human principal (with_test_owner) authenticates the human path
+        // only; the agent endpoint uses verify_agent_token, which is unconfigured
+        // here, so a request still fails closed with 401 — a human token cannot
+        // reach the agent endpoints.
+        let state = setup_state().await;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/agent/git-token")
+            .header(AUTHORIZATION, "Bearer some-human-looking-token")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"remote":"https://github.com/o/r.git"}"#))
+            .unwrap();
+        let status = build_router(state).oneshot(req).await.unwrap().status();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
