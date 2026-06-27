@@ -47,6 +47,9 @@ const JWT_BACKDATE: Duration = Duration::from_secs(60);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 /// Connect timeout for the GitHub API calls.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound on the one-time SSM key read so a stalled `ssm:GetParameter` can't block
+/// server start-up (this runs in `main` before the listener binds).
+const KEY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Serialize)]
 struct Claims {
@@ -112,7 +115,9 @@ impl Minter {
             return Ok(None);
         };
         let api_base = env_non_empty(API_BASE_ENV).unwrap_or_else(|| DEFAULT_API_BASE.to_string());
-        let pem = read_key(aws_config, &key_param).await?;
+        let pem = tokio::time::timeout(KEY_READ_TIMEOUT, read_key(aws_config, &key_param))
+            .await
+            .context("GitHub App key read from SSM timed out")??;
         let key = EncodingKey::from_rsa_pem(pem.as_bytes())
             .context("parse GitHub App private key (expected an RSA PEM)")?;
         let client = reqwest::Client::builder()
