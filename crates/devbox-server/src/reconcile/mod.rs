@@ -12,6 +12,10 @@ mod tick;
 mod tests;
 
 pub use config::ReconcilerConfig;
+/// Shared with the claim handler so a freshly-claimed box is tagged inline
+/// instead of waiting for the next reconciler tick (the reconciler still
+/// re-asserts as the idempotent fallback).
+pub(crate) use tick::apply_owner_tag;
 
 use std::sync::Arc;
 

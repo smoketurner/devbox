@@ -45,10 +45,30 @@ pub struct DevboxDoc {
     pub claimed_at: Option<Timestamp>,
     /// When the devbox record was created.
     pub created_at: Timestamp,
-    /// Whether the EC2 "devbox:owner" tag has been applied after claiming.
-    /// Tagging is deferred to the reconciler tick; this flag enables retry.
+    /// Whether the EC2 "devbox:owner" tag has been applied after claiming. The
+    /// claim handler applies it inline (so the box is loginable without waiting
+    /// for a reconciler tick) and sets this true; if that inline call fails it
+    /// stays false and the reconciler re-applies it on its next tick.
     #[serde(default)]
     pub owner_tag_applied: bool,
+}
+
+impl DevboxDoc {
+    /// The instance tag set dictated by this doc's ownership: `devbox:owner`
+    /// always (when an owner is set), plus `devbox:owner-email` when present (for
+    /// the claimant's git identity on the host). Empty when the box is unowned, so
+    /// callers can skip tagging. Shared by the claim handler (inline, at claim
+    /// time) and the reconciler (idempotent fallback) so both tag identically.
+    pub(crate) fn owner_tags(&self) -> Vec<(&str, &str)> {
+        let mut tags = Vec::new();
+        if let Some(owner) = self.owner.as_deref() {
+            tags.push(("devbox:owner", owner));
+            if let Some(email) = self.owner_email.as_deref() {
+                tags.push(("devbox:owner-email", email));
+            }
+        }
+        tags
+    }
 }
 
 impl DocumentType for DevboxDoc {

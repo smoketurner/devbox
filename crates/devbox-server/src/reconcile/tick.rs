@@ -661,66 +661,82 @@ async fn apply_pending_owner_tags(
         if doc.data.state != DevboxState::Claimed {
             continue;
         }
+        apply_owner_tag(store, compute, doc).await;
+    }
+}
 
-        let instance_id = doc.data.instance_id.as_str();
+/// Apply a single Claimed box's owner tags to its instance and record it.
+///
+/// Shared by the claim handler (which calls it inline so the box is loginable
+/// without waiting for a reconciler tick) and [`apply_pending_owner_tags`] (which
+/// re-asserts every tick as the idempotent fallback). Both the host's `owner-sync`
+/// and `principals` resolver read these tags from IMDS, so a box can only be
+/// logged into once they are present.
+///
+/// Re-applies the tag on every call — `ec2:CreateTags` is idempotent on an
+/// unchanged value and overwrites a tampered one. `owner_tag_applied` gates only
+/// the bookkeeping write: it is flipped (with an info log) on first success and
+/// left alone thereafter, so steady-state re-assertion causes no DB churn. A tag
+/// failure leaves it `false` so the next tick retries; the box has no owner (empty
+/// tag set) is a no-op.
+pub(crate) async fn apply_owner_tag(
+    store: &DocumentStore,
+    compute: &(impl Compute + ?Sized),
+    doc: &crate::db::document_type::Document<DevboxDoc>,
+) {
+    let instance_id = doc.data.instance_id.as_str();
 
-        let owner = match doc.data.owner {
-            Some(ref o) => o.as_str(),
-            None => continue,
-        };
+    // The doc-dictated tag set (devbox:owner, plus devbox:owner-email when
+    // present). Empty when the box has no owner — nothing to apply yet.
+    let tags = doc.data.owner_tags();
+    if tags.is_empty() {
+        return;
+    }
 
-        // Build the full doc-dictated tag set: devbox:owner always, plus
-        // devbox:owner-email when present (for git identity on the host).
-        let mut tags: Vec<(&str, &str)> = vec![("devbox:owner", owner)];
-        if let Some(ref email) = doc.data.owner_email {
-            tags.push(("devbox:owner-email", email.as_str()));
-        }
+    // Re-assert unconditionally — idempotent on match, self-heals on divergence.
+    if let Err(e) = compute.tag_instance(instance_id, &tags).await {
+        tracing::warn!(
+            error = %e,
+            instance_id = %instance_id,
+            doc_id = %doc.id,
+            "failed to apply owner tag; will retry on the next reconciler tick"
+        );
+        return;
+    }
 
-        // Re-assert unconditionally — idempotent on match, self-heals on divergence.
-        if let Err(e) = compute.tag_instance(instance_id, &tags).await {
-            tracing::error!(
-                error = %e,
+    // Only flip owner_tag_applied and emit the info log on first application.
+    // For subsequent calls (already true), the idempotent re-write above is
+    // sufficient — no DB update and no info log to avoid per-tick churn.
+    if doc.data.owner_tag_applied {
+        return;
+    }
+
+    let mut updated_doc = doc.data.clone();
+    updated_doc.owner_tag_applied = true;
+
+    match store
+        .compare_and_update(&doc.id, doc.version, &updated_doc)
+        .await
+    {
+        Ok(true) => {
+            tracing::info!(
                 instance_id = %instance_id,
                 doc_id = %doc.id,
-                "failed to apply owner tag"
+                "applied owner tag"
             );
-            continue;
         }
-
-        // Only flip owner_tag_applied and emit the info log on first application.
-        // For subsequent ticks (already true), the idempotent re-write above is
-        // sufficient — no DB update and no info log to avoid per-tick churn.
-        if doc.data.owner_tag_applied {
-            continue;
+        Ok(false) => {
+            tracing::warn!(
+                doc_id = %doc.id,
+                "version conflict updating owner_tag_applied"
+            );
         }
-
-        let mut updated_doc = doc.data.clone();
-        updated_doc.owner_tag_applied = true;
-
-        match store
-            .compare_and_update(&doc.id, doc.version, &updated_doc)
-            .await
-        {
-            Ok(true) => {
-                tracing::info!(
-                    instance_id = %instance_id,
-                    doc_id = %doc.id,
-                    "applied owner tag"
-                );
-            }
-            Ok(false) => {
-                tracing::warn!(
-                    doc_id = %doc.id,
-                    "version conflict updating owner_tag_applied"
-                );
-            }
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    doc_id = %doc.id,
-                    "failed to update owner_tag_applied"
-                );
-            }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                doc_id = %doc.id,
+                "failed to update owner_tag_applied"
+            );
         }
     }
 }
