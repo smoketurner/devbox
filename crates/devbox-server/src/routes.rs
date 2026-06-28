@@ -22,7 +22,6 @@ use devbox_common::{
 use crate::auth::{AgentIdentity, Authenticator, Principal};
 use crate::documents::devbox::DevboxDoc;
 use crate::error::{AppError, JsonBody};
-use crate::reconcile::ReconcilerConfig;
 use crate::service;
 use crate::ui::build_ui_router;
 
@@ -34,7 +33,6 @@ use crate::ui::build_ui_router;
 /// task, so it stays `Arc<DocumentStore>`.
 pub struct AppState {
     pub store: Arc<crate::db::DocumentStore>,
-    pub reconciler_config: ReconcilerConfig,
     /// Every API endpoint requires an authenticated principal (only `/health` and
     /// the RFC 9728 discovery document are open). Claim/release additionally bind
     /// `owner` to that principal — the Unix login derived from the token's `email`
@@ -265,8 +263,6 @@ async fn handle_agent_git_token(
     reason = "test code: panic on assertion failure is acceptable"
 )]
 mod tests {
-    use std::time::Duration;
-
     use axum::body::Body;
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
@@ -281,7 +277,6 @@ mod tests {
     use crate::db::pool::Pool;
     use crate::documents::devbox::DevboxDoc;
     use crate::error::AppError;
-    use crate::reconcile::ReconcilerConfig;
 
     /// Build an `AppState` over a single-connection in-memory SQLite store
     /// (`max_connections(1)`, so concurrent handler calls share one database)
@@ -291,7 +286,6 @@ mod tests {
     async fn setup_state_as(owner: &str) -> SharedState {
         Arc::new(AppState {
             store: Arc::new(test_store().await),
-            reconciler_config: test_config(),
             auth: Authenticator::with_test_owner(owner),
             aws_account_id: None,
             minter: None,
@@ -318,7 +312,6 @@ mod tests {
         });
         Arc::new(AppState {
             store: Arc::new(test_store().await),
-            reconciler_config: test_config(),
             auth,
             aws_account_id: None,
             minter: None,
@@ -331,17 +324,6 @@ mod tests {
             run_sqlite_migrations(p).await.unwrap();
         }
         DocumentStore::new(pool)
-    }
-
-    fn test_config() -> ReconcilerConfig {
-        ReconcilerConfig {
-            pool_id: "test".to_string(),
-            server_id: "test-server".to_string(),
-            target_warm_pool_size: 1,
-            polling_interval: Duration::from_secs(30),
-            lock_ttl: Duration::from_secs(60),
-            ready_timeout: Duration::from_secs(60),
-        }
     }
 
     fn ready_devbox() -> DevboxDoc {
@@ -405,7 +387,6 @@ mod tests {
     async fn protected_resource_metadata_includes_aws_account_id_when_set() {
         let state = Arc::new(AppState {
             store: Arc::new(test_store().await),
-            reconciler_config: test_config(),
             auth: Authenticator::with_test_owner("jdoe"),
             aws_account_id: Some("123456789012".to_string()),
             minter: None,

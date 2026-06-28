@@ -391,18 +391,11 @@ pub(crate) async fn pool_metrics(state: &AppState) -> Result<PoolMetricsResponse
         }
     }
 
-    let target = state.reconciler_config.target_warm_pool_size;
-    let ready_delta = i32::try_from(target)
-        .unwrap_or(i32::MAX)
-        .saturating_sub(i32::try_from(ready).unwrap_or(0));
-
     Ok(PoolMetricsResponse {
         warming,
         ready,
         claimed,
         terminating,
-        target_warm_pool_size: target,
-        ready_delta,
     })
 }
 
@@ -416,8 +409,6 @@ pub(crate) async fn pool_metrics(state: &AppState) -> Result<PoolMetricsResponse
     reason = "test code: panic on assertion failure is acceptable"
 )]
 mod tests {
-    use std::time::Duration;
-
     use devbox_common::{AmiId, InstanceId, InstanceType, SubnetId};
     use jiff::Timestamp;
 
@@ -426,7 +417,6 @@ mod tests {
     use crate::db::DocumentStore;
     use crate::db::migrations::run_sqlite_migrations;
     use crate::db::pool::Pool;
-    use crate::reconcile::ReconcilerConfig;
     use crate::routes::AppState;
 
     fn claimant(login: &str) -> Principal {
@@ -444,21 +434,9 @@ mod tests {
         DocumentStore::new(pool)
     }
 
-    fn test_config() -> ReconcilerConfig {
-        ReconcilerConfig {
-            pool_id: "test".to_string(),
-            server_id: "test-server".to_string(),
-            target_warm_pool_size: 1,
-            polling_interval: Duration::from_secs(30),
-            lock_ttl: Duration::from_secs(60),
-            ready_timeout: Duration::from_secs(60),
-        }
-    }
-
     async fn setup_state() -> AppState {
         AppState {
             store: std::sync::Arc::new(test_store().await),
-            reconciler_config: test_config(),
             auth: Authenticator::with_test_owner("jdoe"),
             aws_account_id: None,
             minter: None,

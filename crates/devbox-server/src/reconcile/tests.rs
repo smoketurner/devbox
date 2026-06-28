@@ -19,7 +19,9 @@ mod reconcile_tests {
     use crate::db::store::DocumentStore;
     use crate::documents::devbox::DevboxDoc;
     use crate::reconcile::config::ReconcilerConfig;
-    use crate::reconcile::tick::{reap_unready_instances, reconciliation_tick};
+    use crate::reconcile::tick::{
+        compute_desired_capacity, reap_unready_instances, reconciliation_tick,
+    };
     use devbox_common::{AmiId, DevboxState, InstanceType, SubnetId};
 
     /// Build an in-memory SQLite document store with migrations applied.
@@ -41,7 +43,6 @@ mod reconcile_tests {
         ReconcilerConfig {
             pool_id: "test".to_string(),
             server_id: "test-server".to_string(),
-            target_warm_pool_size: 1,
             polling_interval: Duration::from_secs(30),
             lock_ttl: Duration::from_secs(60),
             ready_timeout: Duration::from_secs(60),
@@ -813,5 +814,26 @@ mod reconcile_tests {
             !doc.data.owner_tag_applied,
             "owner_tag_applied must remain false when tag_instance fails"
         );
+    }
+
+    #[test]
+    fn desired_capacity_adds_warm_pool_when_below_max() {
+        // claimed + warm fits under max: warm spares stack on top of claims.
+        assert_eq!(compute_desired_capacity(3, 2, 10), 5);
+        // Zero claims yields exactly the warm-pool (ASG min_size).
+        assert_eq!(compute_desired_capacity(0, 2, 10), 2);
+    }
+
+    #[test]
+    fn desired_capacity_clamps_to_max() {
+        // claimed + warm exceeds max (pool saturating): clamp to the ASG ceiling.
+        assert_eq!(compute_desired_capacity(9, 2, 10), 10);
+        assert_eq!(compute_desired_capacity(10, 2, 10), 10);
+    }
+
+    #[test]
+    fn desired_capacity_saturates_without_overflow() {
+        // saturating_add must not panic; the .min() still clamps to max.
+        assert_eq!(compute_desired_capacity(u32::MAX, 2, 10), 10);
     }
 }
