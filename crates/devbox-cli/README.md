@@ -45,6 +45,14 @@ devbox record and are not overridable; AWS credentials come from your environmen
 or, when the control-plane account can be matched, an auto-selected `~/.aws`
 profile (override with `--profile`).
 
+### Recovering a hung session
+
+If a remote command hangs or the SSM tunnel wedges, press **Enter** then type
+`~.` to force-disconnect (the standard SSH escape sequence; `~?` lists the rest).
+A fully dead tunnel is also detected automatically by an SSH keepalive
+(`ServerAliveInterval`/`ServerAliveCountMax`): after ~45 s with no response the
+session ends on its own and drops you back to your shell.
+
 ### IDE Remote-SSH (VS Code, JetBrains Gateway, Cursor)
 
 These connect with the system `ssh` against a `~/.ssh/config` Host entry. Run

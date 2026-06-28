@@ -102,8 +102,29 @@ An absent or empty `/workspace` (e.g. the EBS volume didn't mount, so the direct
 falls back to the root disk) simply skips freshening — the box still becomes Ready.
 
 The minted token is read-only; the claimant's per-claim write credential is a
-separate concern. Warming build/dependency caches into the snapshot is on the
-roadmap.
+separate concern. Warming build/dependency caches into the snapshot is the job of
+`checkout`'s per-repo `.devbox/warm.sh` hook (see below), not warmup; warmup only
+freshens and preserves the warmed `target/`. What is **still in `devbox-infra`** is
+running the snapshot-builder on a schedule, the Launch Template block-device-mapping
+that seeds `/workspace`, and `RUSTUP_HOME`/`CARGO_HOME=/workspace` set system-wide so
+the toolchain and caches survive into the claimant's fresh per-principal home.
+
+## `checkout` — clone and warm repositories
+
+Seeds `/workspace`. Run by the **snapshot-builder** before a new AMI is cut (so the
+warmed result rides the EBS snapshot), and on demand by a developer or agent to add
+a repo to a claimed box. For each repo URL it:
+
+1. Mints a per-repo read-only GitHub App installation token (same in-agent mint as
+   warmup), then `git clone --filter=blob:none` into `/workspace/<name>` (10-min
+   budget). A clone failure is **fatal** — no broken snapshot is published.
+2. Runs the repo's `.devbox/warm.sh` hook if present (30-min budget) to pre-build
+   dependency/build caches; a hook failure is logged, not fatal.
+3. `git gc --quiet` to compact the object store (5-min budget, non-fatal).
+
+This is the warming step that produces a warm snapshot. For the caches to survive
+into the claimant's session, `RUSTUP_HOME`/`CARGO_HOME`/`target/` must live on the
+`/workspace` volume — configured system-wide in `devbox-infra`, not here.
 
 ## Design
 

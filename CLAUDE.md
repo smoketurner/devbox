@@ -326,13 +326,19 @@ are tagged inline):
   `DeleteOnTermination=true`) that seeds the volume, the App-key SSM SecureString +
   `ssm:GetParameter`/`kms:Decrypt` on the host instance profile, and the GitHub
   egress allowlist (`api.github.com` + the git host). _(cf. Ramp Inspect)_
-- **Warm dependency/build caches** — warm language caches (Rust `target/` +
-  `CARGO_HOME`, Go/Node/Python equivalents) into the snapshot via a per-repo
-  `.devbox/warm.sh` hook run by the snapshot-builder, with shared caches on the data
-  volume and `RUSTUP_HOME`/`CARGO_HOME` etc. set system-wide (all on the
-  `/workspace` volume) so the pinned toolchain and caches survive into the
-  claimant's fresh home. Optional remote cache (sccache / Bazel) through the
-  allowlist. _(cf. Ramp Inspect)_
+- **Warm dependency/build caches** — *Agent half implemented:* the per-repo
+  `.devbox/warm.sh` hook (this repo ships one that runs `make build` +
+  `cargo test --all-features --no-run`, pre-building release+debug `target/`) is
+  executed by `devbox-agent checkout` while it seeds repos
+  (`run_warm_hook`, 30-min budget — `crates/devbox-agent/src/checkout.rs`), and
+  warmup's freshen preserves the warmed `target/` by using `git clean -fd` without
+  `-x` (`crates/devbox-agent/src/freshen.rs`). *Still in `devbox-infra`:* having the
+  snapshot-builder actually run `checkout` on a schedule, the Launch Template
+  block-device-mapping that seeds the `/workspace` volume, and — the piece whose
+  absence shows up as a cold rebuild (toolchain re-download) on a claimed box —
+  `RUSTUP_HOME`/`CARGO_HOME` set system-wide on the `/workspace` volume so the
+  pinned toolchain and caches survive into the claimant's fresh per-principal home.
+  Optional remote cache (sccache / Bazel) through the allowlist. _(cf. Ramp Inspect)_
 - **Health-check gating of "warming"** — `devbox-agent warmup` already gates Ready on
   Docker + repo freshen; extend to network and richer health, plus **idle-claim
   reclaim**.

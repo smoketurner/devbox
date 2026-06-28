@@ -60,6 +60,11 @@ enum Commands {
         target: Option<String>,
     },
     /// SSH into a claimed devbox over an SSM tunnel.
+    ///
+    /// A dead or wedged tunnel is detected by an SSH keepalive and the session
+    /// self-terminates after ~45 s, returning you to your shell. To disconnect a
+    /// hung session immediately, press Enter and type `~.` (the SSH escape
+    /// sequence; `~?` lists the rest).
     Ssh {
         /// Devbox name or id to connect to (defaults to your active claim).
         target: Option<String>,
