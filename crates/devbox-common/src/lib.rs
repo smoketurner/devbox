@@ -566,9 +566,6 @@ pub struct PoolMetricsResponse {
     pub ready: u32,
     pub claimed: u32,
     pub terminating: u32,
-    pub target_warm_pool_size: u32,
-    /// Positive = deficit (need more Ready), negative = surplus.
-    pub ready_delta: i32,
 }
 
 // ============================================================================
@@ -793,13 +790,11 @@ mod tests {
             ready: 3,
             claimed: 4,
             terminating: 5,
-            target_warm_pool_size: 3,
-            ready_delta: 0,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: PoolMetricsResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.warming, 2);
-        assert_eq!(parsed.ready_delta, 0);
+        assert_eq!(parsed.terminating, 5);
     }
 
     #[test]

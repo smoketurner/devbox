@@ -21,21 +21,26 @@ use super::config::ReconcilerConfig;
 
 /// Compute the desired ASG capacity.
 ///
-/// Formula: `min(claimed_count + target_warm_pool_size, max_pool_size)`
+/// Formula: `min(claimed_count + warm_pool_size, max_pool_size)`
+///
+/// Both `warm_pool_size` and `max_pool_size` come from the adopted ASG
+/// (`min_size`/`max_size`); Terraform is the single source of truth. AWS
+/// guarantees `min_size <= max_size`, so at zero claims the result equals
+/// `warm_pool_size` and the clamp only engages as claims saturate the pool.
 ///
 /// Uses `saturating_add` to avoid arithmetic overflow and `.min()` to clamp
-/// the result to the configured maximum pool size.
+/// the result to the ASG's maximum.
 ///
 /// # Returns
 ///
 /// The desired capacity value, always in the range `[0, max_pool_size]`.
 pub(crate) fn compute_desired_capacity(
     claimed_count: u32,
-    target_warm_pool_size: u32,
+    warm_pool_size: u32,
     max_pool_size: u32,
 ) -> u32 {
     claimed_count
-        .saturating_add(target_warm_pool_size)
+        .saturating_add(warm_pool_size)
         .min(max_pool_size)
 }
 
@@ -136,7 +141,7 @@ pub(super) async fn reconciliation_tick(
     handle_terminating_instances(store, compute, &asg_name, &all_docs).await;
 
     // Step 7: Recompute desired capacity and update if changed.
-    recompute_desired_capacity(store, compute, config, &asg_name, &asg_desc).await;
+    recompute_desired_capacity(store, compute, &asg_name, &asg_desc).await;
 
     // Step 8: Update scale-in protection.
     update_scale_in_protection(store, compute, &asg_name, &asg_desc.instances).await;
@@ -525,12 +530,11 @@ async fn handle_terminating_instances(
 
 /// Step 7: Recompute desired capacity and update if changed.
 ///
-/// The maximum is read from the adopted ASG (Terraform owns `MaxSize`), not from
-/// config.
+/// Both the warm-pool target (`min_size`) and the ceiling (`max_size`) are read
+/// from the adopted ASG; Terraform is the single source of truth for pool sizing.
 async fn recompute_desired_capacity(
     store: &DocumentStore,
     compute: &(impl Compute + ?Sized),
-    config: &ReconcilerConfig,
     asg_name: &str,
     asg_desc: &crate::compute::AsgDescription,
 ) {
@@ -544,22 +548,7 @@ async fn recompute_desired_capacity(
     };
 
     let claimed_count = count_by_state(&docs, DevboxState::Claimed);
-    let desired = compute_desired_capacity(
-        claimed_count,
-        config.target_warm_pool_size,
-        asg_desc.max_size,
-    );
-
-    // Log warning if the unclamped value exceeds the ASG's max.
-    let unclamped = claimed_count.saturating_add(config.target_warm_pool_size);
-    if unclamped > asg_desc.max_size {
-        tracing::warn!(
-            unclamped_desired = unclamped,
-            max_size = asg_desc.max_size,
-            claimed_count = claimed_count,
-            "computed desired capacity exceeds ASG max_size"
-        );
-    }
+    let desired = compute_desired_capacity(claimed_count, asg_desc.min_size, asg_desc.max_size);
 
     if desired != asg_desc.desired_capacity
         && let Err(e) = compute.set_desired_capacity(asg_name, desired).await

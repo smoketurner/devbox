@@ -108,9 +108,11 @@ Rust workspace, four crates:
 Template and ASG are **provisioned by Terraform** in `devbox-infra`; there is no
 launch lifecycle hook. The reconciler **adopts** the ASG by name (skipping the
 tick if it is absent) and owns only runtime state — `DesiredCapacity =
-min(claimed_count + target_warm_pool_size, ASG max)`, per-instance scale-in
-protection, owner tagging, and termination. Instance metadata (type/AMI/subnet)
-is read from `DescribeInstances`, not config. It runs as a leader-locked
+min(claimed_count + ASG min_size, ASG max)`, per-instance scale-in
+protection, owner tagging, and termination. The warm-pool target is the ASG's
+`min_size` (read live each tick), so Terraform is the single source of truth for
+pool sizing. Instance metadata (type/AMI/subnet) is read from `DescribeInstances`,
+not config. It runs as a leader-locked
 background loop (only one replica acts at a time) and syncs `DevboxDoc` records
 against ASG membership each tick. The host's `devbox-agent warmup` sets the
 instance tag `devbox:ready=true` once the host is ready; the reconciler then

@@ -38,7 +38,8 @@ Launching -> Warming -> Ready -> Claimed -> Terminating
 Pool management is backed by an **Auto Scaling Group + Launch Template**, not
 direct `RunInstances` calls. A leader-locked background loop reconciles each tick:
 - Adopt the Terraform-provisioned ASG by name (skip the tick if absent)
-- Set `DesiredCapacity = claimed_count + target_warm_pool_size`
+- Set `DesiredCapacity = min(claimed_count + ASG min_size, ASG max_size)` (the
+  warm-pool target is the ASG's `min_size`; Terraform owns pool sizing)
 - Sync `DevboxDoc` records against current ASG membership
 - Apply the `devbox:owner` tag to newly claimed instances; manage warming,
   scale-in protection, and termination of released instances

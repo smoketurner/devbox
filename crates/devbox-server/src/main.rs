@@ -58,10 +58,6 @@ async fn main() -> Result<()> {
     let reconciler_config = ReconcilerConfig {
         pool_id: std::env::var("POOL_ID").unwrap_or_else(|_| "default".to_string()),
         server_id: uuid::Uuid::now_v7().to_string(),
-        target_warm_pool_size: std::env::var("POOL_TARGET_WARM_SIZE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2),
         polling_interval: Duration::from_secs(
             std::env::var("POOL_INTERVAL_SECS")
                 .ok()
@@ -103,7 +99,7 @@ async fn main() -> Result<()> {
     let reconcile_handle = spawn_reconciliation_loop(
         Arc::clone(&store),
         ec2_client,
-        reconciler_config.clone(),
+        reconciler_config,
         cancel.clone(),
     );
 
@@ -126,7 +122,6 @@ async fn main() -> Result<()> {
     // Build router. State is shared as a single Arc<AppState>.
     let app = build_router(Arc::new(AppState {
         store: Arc::clone(&store),
-        reconciler_config,
         auth: build_authenticator().await?,
         aws_account_id,
         minter,
