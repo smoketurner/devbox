@@ -105,7 +105,7 @@ Rust workspace, four crates:
 | `devbox-common` | Shared types: `DevboxId`, `DevboxState`, API request/response |
 | `devbox-server` | Axum API (`/api/v1/devboxes/*`) + HTML dashboard, document store (SQLite dev / Aurora DSQL prod), ASG-adopting pool reconciler, AWS compute layer |
 | `devbox-cli`    | `claim` / `release` / `rename` / `list` / `status` / `ssh` |
-| `devbox-agent`  | On-host binary baked into the AMI: `principals` (sshd resolver), `owner-sync` (provision the claimant's account), `warmup` (self-tags `devbox:ready=true` once warmed), `checkout` (clone repos into `/workspace`). musl static; built/released by CI, downloaded into the golden AMI |
+| `devbox-agent`  | On-host binary baked into the AMI: `principals` (sshd resolver), `owner-sync` (provision the claimant's account), `warmup` (self-tags `devbox:ready=true` once warmed), `checkout` (clone repos into `/workspace`), `doctor` (diagnose warm-cache delivery). musl static; built/released by CI, downloaded into the golden AMI |
 
 **Pool management is ASG-based and the reconciler is adopt-only.** The Launch
 Template and ASG are **provisioned by Terraform** in `devbox-infra`; there is no

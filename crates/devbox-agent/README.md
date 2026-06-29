@@ -7,7 +7,7 @@ never calls the devbox control plane — it only reads its own instance metadata
 (IMDS) and calls the AWS Auto Scaling API for its own instance, using the host
 instance profile.
 
-One binary, four subcommands, each wired to a different host trigger:
+One binary, five subcommands, each wired to a different host trigger:
 
 | Subcommand | Triggered by | Job |
 |------------|--------------|-----|
@@ -15,12 +15,13 @@ One binary, four subcommands, each wired to a different host trigger:
 | `owner-sync` | `devbox-owner-sync.service` (systemd) | Provision the claimant's Unix account + git identity, then exit |
 | `warmup` | `devbox-warmup.service` (systemd, at boot) | Freshen `/workspace` repos, then self-tag `devbox:ready=true` |
 | `checkout <urls>` | the snapshot-builder, or a developer/agent on a claimed box | Clone repos into `/workspace`, minting a read-only token per repo |
+| `doctor` | operator on a claimed box, via `devbox ssh -- devbox-agent doctor` | Print a read-only diagnostic of warm-cache delivery |
 
 ## `principals` — per-claim SSH authorization
 
 sshd runs `devbox-agent principals %u` on every authentication. A devbox is
 generic until claimed, so authorization is bound to the `devbox:owner` instance
-tag (the claimant's Vouch principal, applied by the reconciler on claim). The
+tag (the claimant's Vouch principal, applied inline at claim time). The
 command reads that tag from IMDS and prints it **only if it equals the requested
 login user `%u`** — which both authorizes the certificate principal and pins the
 login account to it (so `ssh root@box` with an `alice` certificate is rejected).
@@ -38,7 +39,7 @@ creates that account (`useradd -m -G docker`, passwordless sudo, ownership of
 so there is nothing to do afterwards; the unit uses `Restart=on-failure` so a
 clean exit stays stopped.
 
-It then reads the `devbox:owner-email` tag (set by the reconciler from the
+It then reads the `devbox:owner-email` tag (set inline at claim time from the
 claimant's token email, alongside `devbox:owner`) and writes their git identity —
 `user.email` and `user.name` — into the new account's `~/.gitconfig`, so the first
 commit is attributed correctly with no manual setup. Best-effort: an absent tag or
@@ -125,6 +126,21 @@ a repo to a claimed box. For each repo URL it:
 This is the warming step that produces a warm snapshot. For the caches to survive
 into the claimant's session, `RUSTUP_HOME`/`CARGO_HOME`/`target/` must live on the
 `/workspace` volume — configured system-wide in `devbox-infra`, not here.
+
+## `doctor` — diagnose warm-cache delivery
+
+A one-shot diagnostic for debugging cold builds on a claimed box. Run via
+`devbox ssh <box> -- devbox-agent doctor`. It checks:
+
+- Whether `/workspace` is a separate mount (root-disk fallback = no caches)
+- Where `RUSTUP_HOME`/`CARGO_HOME` resolve (on-volume vs. bypassed)
+- Whether the cargo registry cache is populated
+- For each seeded repo: presence of `target/` and the pinned toolchain
+- The EBS volumes attached, with snapshot ids to compare against
+  `/devbox/workspace-snapshot/latest`
+
+Read-only and best-effort: every probe degrades to a printed note rather than
+aborting.
 
 ## Design
 

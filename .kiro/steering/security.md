@@ -35,7 +35,7 @@ Users and agents reach devboxes over **SSH** — the access path every remote ID
   certificates; devbox hosts trust the CA via `TrustedUserCAKeys`. There are **no
   `authorized_keys` files to manage** and no static keys baked into AMIs.
 - **Dynamic per-claim authorization.** Claiming a devbox tags the instance
-  `devbox:owner=<principal>` (applied by the reconciler). The host reads that tag
+  `devbox:owner=<principal>` (applied inline at claim time). The host reads that tag
   from IMDSv2 (`InstanceMetadataTags=enabled`) via an `sshd`
   `AuthorizedPrincipalsCommand`, so a CA-signed cert is accepted only for the
   current claimant. The instance never calls back to the management plane,

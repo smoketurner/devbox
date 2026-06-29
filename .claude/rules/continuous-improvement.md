@@ -47,14 +47,14 @@ Logical subsystems to track in coverage-status.md:
 - **routes + dashboard** — Axum API and HTML UI (`routes.rs`, `ui.rs`)
 - **ssm-data-channel** — native SSM wire codec + reliable transport (`crates/devbox-cli/src/ssm/`)
 - **cli-auth** — device-code OAuth + DCR, per-server session cache (`crates/devbox-cli/src/auth.rs`)
-- **agent** — principals resolver, owner-sync, warmup, checkout (`crates/devbox-agent/src/`)
+- **agent** — principals resolver, owner-sync, warmup, checkout, doctor (`crates/devbox-agent/src/`)
 
 ## Interfaces
 
 - **HTTP API**: `/api/v1/devboxes/*`, `/api/v1/pool/metrics` (bearer-token auth); `/health` (unauthenticated)
 - **HTML dashboard**: `GET /` (app-side OIDC session cookie)
 - **CLI**: `devbox login/claim/release/list/status/ssh`
-- **On-host agent**: `devbox-agent principals|owner-sync|warmup|checkout`
+- **On-host agent**: `devbox-agent principals|owner-sync|warmup|checkout|doctor`
 
 ## Critical Paths
 

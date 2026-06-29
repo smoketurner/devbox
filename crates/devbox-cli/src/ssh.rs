@@ -16,8 +16,8 @@ use devbox_common::DevboxResponse;
 
 /// How long to wait for the box to become loginable before falling through.
 ///
-/// A freshly-claimed box can take up to ~35s to become loginable:
-/// reconciler tick → IMDS tag propagation → `owner-sync` 5s poll → `useradd`.
+/// A freshly-claimed box can take a few seconds to become loginable:
+/// inline owner tag → IMDS tag propagation → `owner-sync` 2s poll → `useradd`.
 /// 60s gives comfortable headroom for the provisioning window.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -147,7 +147,7 @@ fn probe_backoff(attempt: u32) -> Duration {
 /// When a pinned identity is present, probes until the box accepts the cert
 /// (up to ~60s of elapsed budget; a final in-flight probe can add up to
 /// `ConnectTimeout` beyond that), absorbing the first-login provisioning
-/// window (reconciler tick → IMDS propagation → `owner-sync useradd`) rather
+/// window (inline owner tag → IMDS propagation → `owner-sync useradd`) rather
 /// than surfacing a confusing `Permission denied`. When no pinned identity
 /// exists, the probe is skipped entirely — without `IdentitiesOnly=yes`,
 /// probing would flood MaxAuthTries with every agent key and never succeed.
