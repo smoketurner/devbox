@@ -1052,7 +1052,7 @@ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 
 [[package]]
 name = "devbox-agent"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -1070,7 +1070,7 @@ dependencies = [
 
 [[package]]
 name = "devbox-cli"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -1099,7 +1099,7 @@ dependencies = [
 
 [[package]]
 name = "devbox-common"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "jiff",
@@ -1110,7 +1110,7 @@ dependencies = [
 
 [[package]]
 name = "devbox-server"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "askama",
