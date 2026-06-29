@@ -216,15 +216,11 @@ devbox-infra (pool ASG + LT)                 devbox-server (ECS, adopt-only)
 | `PORT` | Server listen port | `3000` |
 | `DEVBOX_SERVER` | Default server URL for the CLI | `http://localhost:3000` |
 
-### Pool Configuration (planned)
+### Pool Configuration
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `DEVBOX_POOL_SIZE` | Target number of Ready instances | `5` |
-| `DEVBOX_INSTANCE_TYPE` | EC2 instance type | `m5.large` |
-| `DEVBOX_AMI_ID` | AMI to launch instances from | (required) |
-| `DEVBOX_SUBNET_IDS` | Comma-separated subnet IDs | (required) |
-| `DEVBOX_RECONCILE_INTERVAL` | Seconds between reconciliation ticks | `30` |
+Pool sizing is managed by Terraform in `devbox-infra` via the ASG's `min_size` and `max_size`.
+The reconciler adopts the ASG by name and computes `DesiredCapacity = min(claimed_count + ASG min_size, ASG max_size)`.
+Instance type, AMI, and subnets are read from the Launch Template and ASG at runtime.
 
 ## Development
 
