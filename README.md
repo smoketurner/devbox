@@ -172,9 +172,9 @@ chain (`modules/image-builder/components/`): `01-base` (OS hardening) → `02-to
    a new release + a recipe bump.
 2. **Installs the systemd units** that invoke `devbox-agent warmup` and
    `devbox-agent owner-sync`, plus `/etc/devbox/warmup.env` baked from non-secret
-   Terraform vars (GitHub App id, the SSM parameter name holding the App key,
-   fetch timeout). The App private key itself is never baked — `warmup` reads it
-   from SSM at boot.
+   Terraform vars (fetch timeout, control-plane URL). The App private key itself
+   is never on the box — the agent authenticates to the control plane with an AWS
+   web-identity token and the server mints GitHub tokens.
 3. **Configures sshd + the Vouch CA** — drops `TrustedUserCAKeys` and
    `AuthorizedPrincipalsCommand /usr/local/sbin/devbox-agent principals %u`, and
    fetches the Vouch CA public key. This is the host half of the access model in

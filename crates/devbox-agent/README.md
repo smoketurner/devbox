@@ -75,23 +75,23 @@ but a little stale. Before tagging ready, `warmup` `git fetch`es the small delta
 since the snapshot was cut and hard-resets each repo to its upstream HEAD, so a
 claimant gets a near-HEAD checkout without paying a full clone at launch.
 
-**Credential — minted in-agent, nothing baked.** An installation token lives only
-an hour, so it can't be an env var. At warm-up the agent reads the GitHub App
-private key from an **SSM SecureString** (via the host instance profile), signs a
-short JWT, and exchanges it for a fresh `contents:read` installation token used
-only for the fetch (`src/github_token.rs`). The host instance profile therefore
-needs `ssm:GetParameter` + `kms:Decrypt` on that parameter, and egress to the SSM
-and `api.github.com` endpoints. The installation is **discovered per repo** (the
-agent asks GitHub which installation covers each `owner/repo`), so there is no
-installation id to configure. Config is non-secret, read from the process
-environment:
+**Credential — server-backed, nothing baked.** An installation token lives only an
+hour, so it can't be an env var. At warm-up the agent authenticates to the
+control plane with an **AWS web-identity token** (STS `GetWebIdentityToken`, IAM
+Outbound Identity Federation — a short-lived, AWS-signed OIDC JWT asserting this
+instance's identity, with no static secret to steal) and asks the server to mint
+a short-lived, repo-scoped, read-only GitHub App installation token (see
+`src/server_client.rs`). The GitHub App private key lives only on the control
+plane, read from an SSM SecureString by the server; the host needs only
+`sts:GetWebIdentityToken` and egress to `api.github.com`.
 
-- `DEVBOX_GITHUB_APP_ID` — App ID or Client ID (the JWT issuer).
-- `DEVBOX_GITHUB_KEY_PARAM` — SSM SecureString parameter holding the RSA PEM.
-- `DEVBOX_GITHUB_API_BASE` — optional; defaults to `https://api.github.com` (set
-  for GitHub Enterprise).
+Configuration is non-secret and supplied via the environment:
 
-If these are unset the fetch runs unauthenticated (private repos won't freshen).
+- `DEVBOX_SERVER_URL` — the control-plane base URL (also the audience for the
+  web-identity token). When unset the agent is not configured for server-backed
+  minting and fetches unauthenticated.
+
+If this is unset the fetch runs unauthenticated (private repos won't freshen).
 Other knobs:
 
 - `WARMUP_FETCH_TIMEOUT_SECS` — overall fetch budget (default 120 s; keep it well
@@ -116,9 +116,9 @@ Seeds `/workspace`. Run by the **snapshot-builder** before a new AMI is cut (so 
 warmed result rides the EBS snapshot), and on demand by a developer or agent to add
 a repo to a claimed box. For each repo URL it:
 
-1. Mints a per-repo read-only GitHub App installation token (same in-agent mint as
-   warmup), then `git clone --filter=blob:none` into `/workspace/<name>` (10-min
-   budget). A clone failure is **fatal** — no broken snapshot is published.
+1. Mints a per-repo read-only GitHub App installation token (same server-backed
+   flow as warmup), then `git clone --filter=blob:none` into `/workspace/<name>`
+   (10-min budget). A clone failure is **fatal** — no broken snapshot is published.
 2. Runs the repo's `.devbox/warm.sh` hook if present (30-min budget) to pre-build
    dependency/build caches; a hook failure is logged, not fatal.
 3. `git gc --quiet` to compact the object store (5-min budget, non-fatal).
