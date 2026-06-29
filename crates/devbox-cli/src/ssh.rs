@@ -33,6 +33,20 @@ const PROBE_CONNECT_TIMEOUT_SECS: u64 = 15;
 /// only governs the post-logout linger of the ssm-proxy process.
 const CONTROL_PERSIST_SECS: u64 = 10;
 
+/// SSH transport keepalive interval (seconds). The ssh client sends an encrypted
+/// keepalive request to sshd every N seconds; sshd answers it regardless of
+/// terminal or command activity, so an idle session — or a box busy with a long
+/// compile — is never falsely torn down. Only a black-holed transport (no reply)
+/// trips the counter below.
+const SERVER_ALIVE_INTERVAL_SECS: u64 = 15;
+
+/// Consecutive unanswered keepalives before ssh tears the session down
+/// (`SERVER_ALIVE_INTERVAL_SECS` × this ≈ 45 s). This is the user's automatic
+/// "abort" for a wedged SSM tunnel: a dead transport drops them back to their
+/// shell instead of hanging forever, ~4× faster than the native proxy's own
+/// 180 s liveness reconnect (`ssm/channel.rs`).
+const SERVER_ALIVE_COUNT_MAX: u32 = 3;
+
 /// Options controlling how the SSH session is opened.
 pub(crate) struct SshOptions {
     /// AWS profile for the SSM tunnel.
@@ -219,6 +233,15 @@ pub(crate) async fn connect(devbox: &DevboxResponse, opts: &SshOptions) -> Resul
         }
     }
 
+    // The keepalive above auto-recovers a *dead transport*, but not a hung
+    // *remote command* (sshd keeps answering keepalives, so the ~45 s teardown
+    // never fires). The SSH escape sequence is the remedy there; it's only armed
+    // on an interactive tty session, so skip the hint when a remote command was
+    // supplied (where `~.` would not apply anyway).
+    if opts.extra.is_empty() {
+        eprintln!("tip: if the session hangs, press Enter then type ~. to force-disconnect");
+    }
+
     exec_ssh(&core.interactive_args(&opts.extra))
 }
 
@@ -280,6 +303,24 @@ fn build_core(
     }
 
     let mut pre_host = vec!["-o".to_string(), format!("ProxyCommand={proxy}")];
+
+    // Transport keepalive lives in `pre_host` (shared by probe and interactive)
+    // on purpose. In the identity path the probe opens the ControlMaster and the
+    // interactive session attaches as a multiplexed client; OpenSSH ignores
+    // client-side ServerAliveInterval and only the MASTER's keepalive governs the
+    // transport. Since the probe reads `pre_host`, these land on the master and
+    // take effect; in the no-identity path there is no multiplexing and the
+    // interactive ssh is the direct connection, so `pre_host` covers it there too.
+    // Effect: a wedged or dead SSM tunnel is detected after ~45 s and the session
+    // self-terminates, one layer above (and ~4× faster than) the proxy's 180 s
+    // liveness reconnect. TCPKeepAlive is intentionally omitted — a ProxyCommand
+    // is always present, so ssh holds no TCP socket to the host for it to act on.
+    pre_host.extend([
+        "-o".to_string(),
+        format!("ServerAliveInterval={SERVER_ALIVE_INTERVAL_SECS}"),
+        "-o".to_string(),
+        format!("ServerAliveCountMax={SERVER_ALIVE_COUNT_MAX}"),
+    ]);
 
     // When the Vouch default key/cert pair is pinned (vouch_identity already
     // verified both files exist and their paths are valid UTF-8), constrain ssh
@@ -789,5 +830,59 @@ mod tests {
             probe.contains(&expected),
             "ControlPersist value must match CONTROL_PERSIST_SECS ({CONTROL_PERSIST_SECS}s)"
         );
+    }
+
+    // -- Tests for transport keepalive (the "abort a wedged tunnel" lever) --
+
+    #[test]
+    fn keepalive_present_in_both_args() {
+        // Must be on `pre_host` so it lands on the ControlMaster (the probe) as
+        // well as the interactive args: OpenSSH ignores client-side ServerAlive
+        // on a multiplexed client, so the probe coverage is load-bearing.
+        let key = "/home/jdoe/.ssh/id_ed25519_vouch".to_string();
+        let cert = "/home/jdoe/.ssh/id_ed25519_vouch-cert.pub".to_string();
+        let devbox = claimed("i-0abc", Some("jdoe"));
+        let core = build_core(&devbox, &opts(), Some(&(key, cert))).expect("core");
+
+        for args in [core.interactive_args(&[]), core.probe_args()] {
+            assert!(
+                args.iter().any(|a| a.starts_with("ServerAliveInterval=")),
+                "ServerAliveInterval must be present"
+            );
+            assert!(
+                args.iter().any(|a| a.starts_with("ServerAliveCountMax=")),
+                "ServerAliveCountMax must be present"
+            );
+        }
+    }
+
+    #[test]
+    fn keepalive_present_without_identity() {
+        // Keepalive lives in pre_host unconditionally, so the no-identity (no
+        // multiplexing) path gets it on the direct interactive connection too.
+        let devbox = claimed("i-0abc", Some("jdoe"));
+        let args = build_args(&devbox, &opts(), None).expect("args");
+        assert!(args.iter().any(|a| a.starts_with("ServerAliveInterval=")));
+        assert!(args.iter().any(|a| a.starts_with("ServerAliveCountMax=")));
+    }
+
+    #[test]
+    fn keepalive_values_match_consts() {
+        let devbox = claimed("i-0abc", Some("jdoe"));
+        let args = build_args(&devbox, &opts(), None).expect("args");
+        assert!(args.contains(&format!("ServerAliveInterval={SERVER_ALIVE_INTERVAL_SECS}")));
+        assert!(args.contains(&format!("ServerAliveCountMax={SERVER_ALIVE_COUNT_MAX}")));
+    }
+
+    #[test]
+    fn keepalive_precedes_destination() {
+        let devbox = claimed("i-0abc", Some("jdoe"));
+        let args = build_args(&devbox, &opts(), None).expect("args");
+        let dest = args.iter().position(|a| a == "jdoe@i-0abc").expect("dest");
+        let ka = args
+            .iter()
+            .position(|a| a.starts_with("ServerAliveInterval="))
+            .expect("ServerAliveInterval");
+        assert!(ka < dest, "keepalive options must precede destination");
     }
 }
