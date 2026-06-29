@@ -47,6 +47,11 @@ pub struct AppState {
     /// `DEVBOX_GITHUB_KEY_PARAM` unset), in which case `/api/v1/agent/git-token`
     /// reports minting unavailable.
     pub minter: Option<Arc<crate::github::Minter>>,
+    /// EC2 client used to apply the `devbox:owner` tag inline at claim time, so a
+    /// freshly-claimed box becomes loginable without waiting for the next
+    /// reconciler tick. `None` in tests (and any deployment without AWS), where
+    /// the reconciler's `apply_pending_owner_tags` remains the sole tagger.
+    pub compute: Option<Arc<crate::compute::ec2::Ec2>>,
 }
 
 /// Handle to the shared application state, passed to every handler.
@@ -289,6 +294,7 @@ mod tests {
             auth: Authenticator::with_test_owner(owner),
             aws_account_id: None,
             minter: None,
+            compute: None,
         })
     }
 
@@ -315,6 +321,7 @@ mod tests {
             auth,
             aws_account_id: None,
             minter: None,
+            compute: None,
         })
     }
 
@@ -390,6 +397,7 @@ mod tests {
             auth: Authenticator::with_test_owner("jdoe"),
             aws_account_id: Some("123456789012".to_string()),
             minter: None,
+            compute: None,
         });
 
         let Json(meta) = protected_resource_metadata(State(state), HeaderMap::new()).await;

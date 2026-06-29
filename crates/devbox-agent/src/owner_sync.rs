@@ -25,8 +25,12 @@ use devbox_common::is_valid_unix_username;
 
 use crate::imds;
 
-/// How often to poll IMDS for the owner tag.
-const POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// How often to poll IMDS for the owner tag. Kept short so the claimant's account
+/// is provisioned within a couple of seconds of the `devbox:owner` tag becoming
+/// visible (the tag is now applied inline at claim time, not on the next
+/// reconciler tick), trimming the first-SSH wait. The cost on an unclaimed box is
+/// only a cheap IMDS read every few seconds.
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Shared workspace handed to the claimant on provisioning.
 const WORKSPACE: &str = "/workspace";

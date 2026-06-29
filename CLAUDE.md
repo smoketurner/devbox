@@ -41,7 +41,10 @@ Machines are **cattle, not pets**: each is used once and terminated on release.
   short-lived user certificates; devbox hosts trust the CA through
   `TrustedUserCAKeys`. There are **no `authorized_keys` files to manage.**
 - **Per-claim authorization is dynamic.** Claiming a devbox tags the instance
-  `devbox:owner=<principal>` (done by the reconciler's `apply_pending_owner_tags`).
+  `devbox:owner=<principal>` (applied inline by the claim handler so the box is
+  loginable without waiting for a reconciler tick; the reconciler's
+  `apply_pending_owner_tags` re-applies it as an idempotent fallback if the inline
+  call fails).
   The host exposes that tag via IMDSv2 (`InstanceMetadataTags=enabled`) and an
   `sshd` `AuthorizedPrincipalsCommand` — `devbox-agent principals %u` — reads it,
   so a CA-signed cert is accepted only when the login user equals the current

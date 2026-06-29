@@ -94,11 +94,14 @@ async fn main() -> Result<()> {
         .await;
     let ec2_client = Arc::new(Ec2::new(&aws_config));
 
-    // Spawn reconciliation loop with cancellation support
+    // Spawn reconciliation loop with cancellation support. The EC2 client is
+    // shared with the API state so the claim handler can apply the owner tag
+    // inline (see AppState::compute); the reconciler keeps the same client for
+    // its periodic re-assertion.
     let cancel = CancellationToken::new();
     let reconcile_handle = spawn_reconciliation_loop(
         Arc::clone(&store),
-        ec2_client,
+        Arc::clone(&ec2_client),
         reconciler_config,
         cancel.clone(),
     );
@@ -125,6 +128,7 @@ async fn main() -> Result<()> {
         auth: build_authenticator().await?,
         aws_account_id,
         minter,
+        compute: Some(ec2_client),
     }));
 
     // Start server

@@ -217,6 +217,14 @@ pub(crate) async fn claim_devbox(
                 .ok_or_else(|| {
                     AppError::Internal(anyhow::anyhow!("devbox vanished after claim"))
                 })?;
+            // Apply the owner tag immediately so the box is loginable without
+            // waiting for the next reconciler tick (the dominant first-SSH
+            // latency). The reconciler re-asserts the same tag as a fallback, so
+            // a failure here is non-fatal; skipped when no compute client is
+            // configured (tests), where the reconciler does the tagging.
+            if let Some(compute) = state.compute.as_deref() {
+                crate::reconcile::apply_owner_tag(&state.store, compute, &refreshed).await;
+            }
             return Ok(refreshed);
         }
     }
@@ -414,6 +422,7 @@ mod tests {
 
     use super::*;
     use crate::auth::{AgentRole, Authenticator, Principal};
+    use crate::compute::mock::MockCompute;
     use crate::db::DocumentStore;
     use crate::db::migrations::run_sqlite_migrations;
     use crate::db::pool::Pool;
@@ -440,7 +449,66 @@ mod tests {
             auth: Authenticator::with_test_owner("jdoe"),
             aws_account_id: None,
             minter: None,
+            compute: None,
         }
+    }
+
+    fn claimed_devbox(instance_id: &str, owner: &str) -> DevboxDoc {
+        DevboxDoc {
+            instance_id: instance_id.to_string(),
+            name: "calm-quilt".to_string(),
+            state: DevboxState::Claimed,
+            instance_type: InstanceType("m5.large".to_string()),
+            ami_id: AmiId("ami-12345678".to_string()),
+            subnet_id: SubnetId("subnet-12345678".to_string()),
+            region: "us-east-1".to_string(),
+            ebs_volume_id: None,
+            owner: Some(owner.to_string()),
+            owner_email: Some(format!("{owner}@example.com")),
+            claimed_at: Some(Timestamp::now()),
+            created_at: Timestamp::now(),
+            owner_tag_applied: false,
+        }
+    }
+
+    /// A successful inline tag applies both owner tags to the instance and flips
+    /// `owner_tag_applied` so the reconciler's next tick is a no-op.
+    #[tokio::test]
+    async fn inline_tag_applies_owner_tags_and_flips_flag() {
+        let store = test_store().await;
+        let compute = MockCompute::new();
+        let iid = compute.add_instance("InService");
+        let inserted = store.insert(&claimed_devbox(&iid, "jdoe")).await.unwrap();
+        let doc = store.get::<DevboxDoc>(&inserted.id).await.unwrap().unwrap();
+
+        crate::reconcile::apply_owner_tag(&store, &compute, &doc).await;
+
+        let tags = compute.get_instance_tags(&iid).unwrap();
+        assert_eq!(tags.get("devbox:owner").map(String::as_str), Some("jdoe"));
+        assert_eq!(
+            tags.get("devbox:owner-email").map(String::as_str),
+            Some("jdoe@example.com")
+        );
+
+        let after = store.get::<DevboxDoc>(&inserted.id).await.unwrap().unwrap();
+        assert!(after.data.owner_tag_applied);
+    }
+
+    /// A failed inline tag leaves `owner_tag_applied` false so the reconciler
+    /// re-applies it on its next tick (best-effort, not fatal to the claim).
+    #[tokio::test]
+    async fn inline_tag_failure_leaves_flag_false_for_reconciler() {
+        let store = test_store().await;
+        let compute = MockCompute::new();
+        let iid = compute.add_instance("InService");
+        compute.set_error("tag_instance", "transient EC2 error".to_string());
+        let inserted = store.insert(&claimed_devbox(&iid, "jdoe")).await.unwrap();
+        let doc = store.get::<DevboxDoc>(&inserted.id).await.unwrap().unwrap();
+
+        crate::reconcile::apply_owner_tag(&store, &compute, &doc).await;
+
+        let after = store.get::<DevboxDoc>(&inserted.id).await.unwrap().unwrap();
+        assert!(!after.data.owner_tag_applied);
     }
 
     fn ready_devbox() -> DevboxDoc {

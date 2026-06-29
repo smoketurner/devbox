@@ -7,8 +7,10 @@
 //! - `owner-sync` — provision the claimant's Unix account, then exit.
 //! - `warmup` — warm the host and self-tag `devbox:ready=true` so the reconciler
 //!   marks the `DevboxDoc` Ready; boxes that never tag ready are reaped.
+//! - `doctor` — print a read-only diagnostic of warm-cache delivery.
 
 mod checkout;
+mod doctor;
 mod freshen;
 mod git;
 mod imds;
@@ -52,6 +54,9 @@ enum Command {
         #[arg(required = true)]
         repos: Vec<String>,
     },
+    /// Print a read-only diagnostic of warm-cache delivery (workspace mount,
+    /// resolved RUSTUP_HOME/CARGO_HOME, pinned-toolchain and registry presence).
+    Doctor,
 }
 
 // Current-thread runtime: the agent reads IMDS / calls the AWS SDK (both async)
@@ -85,6 +90,16 @@ async fn main() -> ExitCode {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     tracing::error!(error = %format!("{e:#}"), "checkout failed");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Command::Doctor => {
+            // Human-facing report on stdout; no tracing setup (keep it clean).
+            match doctor::run().await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("doctor failed: {e:#}");
                     ExitCode::FAILURE
                 }
             }
