@@ -165,8 +165,15 @@ async fn main() -> Result<()> {
 /// retry — the server cannot verify any token without the issuer's JWKS, so it
 /// fails fast rather than starting unable to authenticate.
 async fn build_authenticator() -> Result<Authenticator> {
-    let issuer =
-        std::env::var("AUTH_OIDC_ISSUER").unwrap_or_else(|_| "https://us.vouch.sh".to_string());
+    // Normalize the issuer once at the source: the same trimmed value feeds the
+    // discovery URL, the document issuer-match guard, and `AuthConfig.issuer`,
+    // which token verification pins `iss` against by exact string match. A
+    // slash-only difference here would otherwise reject every token whose `iss`
+    // is the un-slashed IdP issuer even though the server booted fine.
+    let issuer = std::env::var("AUTH_OIDC_ISSUER")
+        .unwrap_or_else(|_| "https://us.vouch.sh".to_string())
+        .trim_end_matches('/')
+        .to_string();
 
     // Timeouts: a stalled issuer connection must fail fast rather than hang
     // startup forever (a hung request never returns an error, so it would bypass
@@ -222,6 +229,9 @@ async fn build_agent_auth_config(http: &reqwest::Client) -> Result<Option<AgentA
         tracing::info!("agent OIDC auth disabled (DEVBOX_AGENT_OIDC_ISSUER unset)");
         return Ok(None);
     };
+    // Trim as for the Vouch issuer above: the stored value feeds both discovery
+    // and the `iss` pin in verify_agent_token, so a trailing slash must not leak in.
+    let issuer = issuer.trim_end_matches('/').to_string();
 
     let require = |name: &str| -> Result<String> {
         env_non_empty(name).with_context(|| {

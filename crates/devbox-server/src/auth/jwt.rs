@@ -672,6 +672,29 @@ mod tests {
     }
 
     #[test]
+    fn issuer_match_is_slash_sensitive() {
+        // `set_issuer` compares `iss` by exact string match: a configured issuer
+        // with a trailing slash rejects a token whose `iss` is the unslashed IdP
+        // value. This is why the issuer must be trimmed at the source (main.rs)
+        // before it reaches `AuthConfig.issuer` — otherwise a slash-suffixed
+        // AUTH_OIDC_ISSUER boots the server yet rejects every real token.
+        let token =
+            sign(json!({ "email": "jane@example.com", "iss": ISSUER, "exp": 9_999_999_999_u64 }));
+        let key = DecodingKey::from_secret(SECRET);
+
+        let mut slashed = Validation::new(Algorithm::HS256);
+        slashed.set_issuer(&[format!("{ISSUER}/").as_str()]);
+        slashed.validate_aud = false;
+        assert!(
+            decode_owner(&token, &key, &slashed).is_err(),
+            "un-normalized trailing-slash issuer must reject the unslashed token"
+        );
+
+        // The normalized (trimmed) issuer accepts it — the post-fix behavior.
+        assert!(decode_owner(&token, &key, &validation()).is_ok());
+    }
+
+    #[test]
     fn wrong_key_rejected() {
         let token =
             sign(json!({ "email": "jane@example.com", "iss": ISSUER, "exp": 9_999_999_999_u64 }));
