@@ -286,7 +286,12 @@ struct RemoteRef {
 /// remote with no host or no `owner/repo` path (e.g. a local path).
 fn parse_remote(remote: &str) -> Option<RemoteRef> {
     let url = parse_git_url(remote.trim())?;
-    let host = url.host_str()?.to_string();
+    // Hostnames are case-insensitive, but the `url` crate only lowercases hosts for
+    // special schemes (https), not ssh — so an scp-like remote like
+    // `git@GitHub.com:owner/repo` keeps its uppercase host. Lowercase it here so the
+    // comparison against the (already-lowercased) App host in `mint_for_remote`
+    // matches.
+    let host = url.host_str()?.to_lowercase();
     let mut segments = url.path_segments()?.filter(|segment| !segment.is_empty());
     let owner = segments.next()?.to_string();
     let repo = segments.next()?;
@@ -361,6 +366,17 @@ mod tests {
     fn parses_scp_like_form() {
         assert_eq!(
             parsed("git@github.com:smoketurner/devbox.git"),
+            github("smoketurner", "devbox")
+        );
+    }
+
+    #[test]
+    fn scp_like_host_is_lowercased() {
+        // git preserves the host case verbatim and the `url` crate does not
+        // lowercase ssh hosts, so an uppercase scp-like remote must be normalized
+        // here to match the App's lowercased git host (else minting is skipped).
+        assert_eq!(
+            parsed("git@GitHub.com:smoketurner/devbox.git"),
             github("smoketurner", "devbox")
         );
     }
