@@ -34,13 +34,16 @@ pub(crate) const DEFAULT_SERVER: &str = "http://localhost:3000";
 /// Resolve the server to talk to: an explicit `--server`/`$DEVBOX_SERVER`, else
 /// the server remembered from the last `devbox login`, else [`DEFAULT_SERVER`].
 pub(crate) fn resolve_server(explicit: Option<String>) -> Result<String> {
-    if let Some(server) = explicit {
-        return Ok(server);
-    }
-    if let Some(server) = session::current_server()? {
-        return Ok(server);
-    }
-    Ok(DEFAULT_SERVER.to_string())
+    let server = if let Some(server) = explicit {
+        server
+    } else if let Some(server) = session::current_server()? {
+        server
+    } else {
+        DEFAULT_SERVER.to_string()
+    };
+    // Trim a trailing slash so the `format!("{server}/api/v1/...")` call sites don't
+    // produce double-slash paths, which Axum routes differently and 404s.
+    Ok(server.trim_end_matches('/').to_string())
 }
 
 /// Attach the caller's bearer token to a request. Every API endpoint requires
@@ -554,6 +557,16 @@ mod tests {
             server_url: "http://s".to_string(),
             claimed_at: None,
         }
+    }
+
+    #[test]
+    fn resolve_server_trims_trailing_slash() {
+        // An explicit server URL with a trailing slash must not produce a
+        // double-slash API path when formatted into an endpoint.
+        let server = resolve_server(Some("http://localhost:3000/".to_string())).unwrap();
+        assert_eq!(server, "http://localhost:3000");
+        let url = format!("{server}/api/v1/devboxes");
+        assert_eq!(url, "http://localhost:3000/api/v1/devboxes");
     }
 
     #[test]
