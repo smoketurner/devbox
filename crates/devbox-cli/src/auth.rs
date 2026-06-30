@@ -200,6 +200,9 @@ pub(crate) async fn fetch_protected_resource(
 }
 
 async fn fetch_oidc_config(client: &reqwest::Client, issuer: &str) -> Result<OidcDiscovery> {
+    // OIDC Discovery 1.0 §4.1: strip any terminating slash before appending the
+    // well-known path, else the URL gains a double slash and can 404.
+    let issuer = issuer.trim_end_matches('/');
     let url = format!("{issuer}/.well-known/openid-configuration");
     let resp = client
         .get(&url)
