@@ -45,6 +45,10 @@ pub struct OidcEndpoints {
 /// required `issuer` or `jwks_uri`), or the document's `issuer` does not match
 /// `issuer` (an OIDC issuer mix-up guard).
 pub async fn discover(client: &reqwest::Client, issuer: &str) -> Result<OidcEndpoints, AuthError> {
+    // OIDC Discovery 1.0 §4.1 requires stripping any terminating slash from the
+    // issuer before appending the well-known path; otherwise the URL has a double
+    // slash and the issuer-match guard below trips on a slash-only difference.
+    let issuer = issuer.trim_end_matches('/');
     let url = format!("{issuer}/.well-known/openid-configuration");
 
     let resp = client
@@ -65,7 +69,7 @@ pub async fn discover(client: &reqwest::Client, issuer: &str) -> Result<OidcEndp
         .await
         .map_err(|e| AuthError::Invalid(format!("parse OIDC discovery {url}: {e}")))?;
 
-    if endpoints.issuer != issuer {
+    if endpoints.issuer.trim_end_matches('/') != issuer {
         return Err(AuthError::Invalid(format!(
             "OIDC discovery issuer mismatch: configured {issuer}, document {}",
             endpoints.issuer
@@ -155,6 +159,29 @@ mod tests {
             endpoints.end_session_endpoint.as_deref(),
             Some(format!("{base}/oauth/logout").as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn discover_normalizes_trailing_slash_in_issuer() {
+        // An issuer configured with a trailing slash must still discover: the
+        // well-known URL is built without a double slash, and the issuer-match
+        // guard ignores the slash-only difference against the document's issuer.
+        let (listener, base) = bind().await;
+        let doc = discovery_doc(&base);
+        let router = axum::Router::new().route(
+            "/.well-known/openid-configuration",
+            get(move || {
+                let doc = doc.clone();
+                async move { Json(doc) }
+            }),
+        );
+        spawn(listener, router);
+
+        let endpoints = discover(&reqwest::Client::new(), &format!("{base}/"))
+            .await
+            .unwrap();
+        assert_eq!(endpoints.issuer, base);
+        assert_eq!(endpoints.jwks_uri, format!("{base}/oauth/jwks"));
     }
 
     #[tokio::test]

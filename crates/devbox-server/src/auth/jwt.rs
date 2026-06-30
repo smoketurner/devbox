@@ -132,9 +132,17 @@ impl Authenticator {
     /// Build an authenticator for the given configuration.
     #[must_use]
     pub fn new(config: AuthConfig) -> Self {
+        // Redirect::none: the JWKS URI is issuer-controlled, so an open redirect at
+        // the IdP must not be able to steer signing-key fetches elsewhere. The
+        // builder only fails if the TLS backend can't initialize (effectively
+        // never); fall back to a default client rather than panic.
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             config,
-            http: reqwest::Client::new(),
+            http,
             jwks: RwLock::new(HashMap::new()),
             alb_keys: RwLock::new(HashMap::new()),
             agent_jwks: RwLock::new(HashMap::new()),
@@ -661,6 +669,29 @@ mod tests {
         }));
         let key = DecodingKey::from_secret(SECRET);
         assert!(decode_owner(&token, &key, &validation()).is_err());
+    }
+
+    #[test]
+    fn issuer_match_is_slash_sensitive() {
+        // `set_issuer` compares `iss` by exact string match: a configured issuer
+        // with a trailing slash rejects a token whose `iss` is the unslashed IdP
+        // value. This is why the issuer must be trimmed at the source (main.rs)
+        // before it reaches `AuthConfig.issuer` — otherwise a slash-suffixed
+        // AUTH_OIDC_ISSUER boots the server yet rejects every real token.
+        let token =
+            sign(json!({ "email": "jane@example.com", "iss": ISSUER, "exp": 9_999_999_999_u64 }));
+        let key = DecodingKey::from_secret(SECRET);
+
+        let mut slashed = Validation::new(Algorithm::HS256);
+        slashed.set_issuer(&[format!("{ISSUER}/").as_str()]);
+        slashed.validate_aud = false;
+        assert!(
+            decode_owner(&token, &key, &slashed).is_err(),
+            "un-normalized trailing-slash issuer must reject the unslashed token"
+        );
+
+        // The normalized (trimmed) issuer accepts it — the post-fix behavior.
+        assert!(decode_owner(&token, &key, &validation()).is_ok());
     }
 
     #[test]
