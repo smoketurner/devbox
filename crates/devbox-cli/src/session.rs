@@ -355,7 +355,17 @@ fn logout_from(dir: &Path, server: &str) -> Result<()> {
     let key = server_key(server)?;
     let mut config = load_config(dir)?;
     config.servers.remove(&key);
-    if config.current_server.as_deref() == Some(server) {
+    // Clear current_server when it points at the same host:port, comparing by
+    // server_key rather than exact string. A current_server persisted with a
+    // trailing slash (or any other URL-equivalent difference) would otherwise
+    // survive logout — the session entry is keyed by server_key and is removed,
+    // but an exact-string match would leave a stale default pointing at a server
+    // the user just logged out of.
+    let current_key = config
+        .current_server
+        .as_deref()
+        .and_then(|s| server_key(s).ok());
+    if current_key.as_deref() == Some(key.as_str()) {
         config.current_server = None;
     }
     save_config(dir, &config)
@@ -597,6 +607,33 @@ mod tests {
             load_client_from(&dir, "https://us.vouch.sh")
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn logout_clears_current_server_saved_with_trailing_slash() {
+        // current_server persisted with a trailing slash (e.g. by a pre-fix CLI)
+        // must still be cleared when logging out of the normalized server, so the
+        // CLI does not keep defaulting to a server the user logged out of.
+        let dir = temp_dir("logout-trailing-slash");
+        let token = sign(json!({ "email": "carol@example.com", "exp": 9_999_999_999_i64 }));
+        let session = Session::from_token(token).unwrap();
+        save_session_to(&dir, "http://localhost:3000/", &session).unwrap();
+        assert_eq!(
+            load_config(&dir).unwrap().current_server.as_deref(),
+            Some("http://localhost:3000/")
+        );
+
+        logout_from(&dir, "http://localhost:3000").unwrap();
+
+        assert!(
+            current_from(&dir, "http://localhost:3000")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            load_config(&dir).unwrap().current_server.is_none(),
+            "current_server must be cleared despite the slash-only difference"
         );
     }
 
