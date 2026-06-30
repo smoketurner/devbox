@@ -168,7 +168,17 @@ async fn build_authenticator() -> Result<Authenticator> {
     let issuer =
         std::env::var("AUTH_OIDC_ISSUER").unwrap_or_else(|_| "https://us.vouch.sh".to_string());
 
-    let http = reqwest::Client::new();
+    // Timeouts: a stalled issuer connection must fail fast rather than hang
+    // startup forever (a hung request never returns an error, so it would bypass
+    // discover_with_retry's retry loop entirely). Redirect::none: discovery and
+    // JWKS fetches hit issuer-controlled URLs, so an open redirect at the IdP must
+    // not be able to steer them elsewhere.
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .connect_timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("build OIDC discovery HTTP client")?;
     let endpoints = discover_with_retry(&http, &issuer).await?;
 
     let oidc = build_oidc_config(&endpoints)?;
