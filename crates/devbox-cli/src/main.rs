@@ -101,7 +101,12 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let http = reqwest::Client::new();
+    // Redirect::none: OIDC discovery hits issuer-controlled URLs, so an open
+    // redirect at the IdP must not be able to steer the login flow elsewhere.
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let server = resolve_server(cli.server)?;
 
     match cli.command {

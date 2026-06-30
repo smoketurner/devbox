@@ -132,9 +132,17 @@ impl Authenticator {
     /// Build an authenticator for the given configuration.
     #[must_use]
     pub fn new(config: AuthConfig) -> Self {
+        // Redirect::none: the JWKS URI is issuer-controlled, so an open redirect at
+        // the IdP must not be able to steer signing-key fetches elsewhere. The
+        // builder only fails if the TLS backend can't initialize (effectively
+        // never); fall back to a default client rather than panic.
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             config,
-            http: reqwest::Client::new(),
+            http,
             jwks: RwLock::new(HashMap::new()),
             alb_keys: RwLock::new(HashMap::new()),
             agent_jwks: RwLock::new(HashMap::new()),
