@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.7"
 edition = "2024"
-rust-version = "1.96.0"
+rust-version = "1.96.1"
 license = "Apache-2.0 OR MIT"
 publish = false
 
@@ -119,10 +119,10 @@ anyhow = { version = "=1.0.103", default-features = false }
 askama = { version = "=0.16.0", default-features = false }
 aws-config = { version = "=1.8.18", default-features = false }
 aws-credential-types = { version = "=1.2.14", default-features = false }
-aws-lc-rs = { version = "=1.17.0", default-features = false }
-aws-sdk-autoscaling = { version = "=1.120.0", default-features = false }
+aws-lc-rs = { version = "=1.17.1", default-features = false }
+aws-sdk-autoscaling = { version = "=1.121.0", default-features = false }
 aws-sdk-dsql = { version = "=1.60.0", default-features = false }
-aws-sdk-ec2 = { version = "=1.233.0", default-features = false }
+aws-sdk-ec2 = { version = "=1.236.0", default-features = false }
 aws-sdk-ssm = { version = "=1.113.0", default-features = false }
 aws-sdk-sts = { version = "=1.107.0", default-features = false }
 axum = { version = "=0.8.9", default-features = false }
@@ -131,9 +131,9 @@ bytes = { version = "=1.12.0", default-features = false }
 clap = { version = "=4.6.1", default-features = false }
 dialoguer = { version = "=0.12.0", default-features = false }
 futures-util = { version = "=0.3.32", default-features = false }
-jiff = { version = "=0.2.29", default-features = false }
+jiff = { version = "=0.2.31", default-features = false }
 jsonwebtoken = { version = "=10.4.0", default-features = false }
-open = { version = "=5.3.5", default-features = false }
+open = { version = "=5.3.6", default-features = false }
 proptest = { version = "=1.11.0", default-features = false }
 reqwest = { version = "=0.13.4", default-features = false }
 rust-embed = { version = "=8.11.0", default-features = false }

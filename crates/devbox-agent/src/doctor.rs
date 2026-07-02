@@ -201,7 +201,7 @@ fn pinned_toolchain(repo: &Path) -> Option<String> {
 }
 
 /// Whether a toolchain whose name begins with `channel-` exists under
-/// `$RUSTUP_HOME/toolchains` (installed dirs are `1.96.0-aarch64-...`).
+/// `$RUSTUP_HOME/toolchains` (installed dirs are `1.96.1-aarch64-...`).
 fn toolchain_installed(rustup_home: &str, channel: &str) -> bool {
     if rustup_home.is_empty() {
         return false;
