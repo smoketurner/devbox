@@ -1,0 +1,70 @@
+default_install_hook_types: [pre-commit, pre-push]
+
+exclude: |
+  (?x)^(
+    Cargo\.lock
+  )$
+
+repos:
+  # File hygiene — pinned repo hook (pre-commit-hooks is not an installed CLI).
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: [--fix=lf] # matches rustfmt newline_style = "Unix"
+      - id: check-added-large-files
+      - id: check-merge-conflict
+      - id: check-yaml
+      - id: check-toml
+
+  # Rust + workflow + shell — local hooks reuse the CLIs already on PATH, so prek
+  # does not provision separate Go/Python/Rust toolchains per repo.
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: actionlint
+        name: actionlint
+        entry: actionlint
+        language: system
+        types: [yaml]
+        files: ^\.github/workflows/
+
+      - id: zizmor
+        name: zizmor
+        entry: zizmor
+        language: system
+        types: [yaml]
+        files: ^\.github/workflows/
+
+      - id: shellcheck
+        name: shellcheck
+        entry: shellcheck
+        language: system
+        types: [shell]
+
+      # Heavy checks run at the pre-push stage only. types:[rust] + pass_filenames:false
+      # means they run once over the whole workspace, but only when the push carries
+      # a Rust change.
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --all-targets --all-features -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: cargo-test
+        name: cargo test
+        entry: cargo test --all-features
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]

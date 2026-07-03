@@ -182,7 +182,10 @@ in-memory SQLite.
 - **No raw SQL** — build queries with `sea-query` (works across SQLite + DSQL).
 - **No secrets in code**; AWS via IAM roles / instance profiles, never static keys.
 - **Conventional commits** (`feat:`, `fix:`, `docs:`, `refactor:`, `chore:`).
-- Run `make fmt && make lint && make test` before committing.
+- Run `make fmt && make lint && make test` before committing. `make hooks`
+  (`prek install`) wires the same gate into `.pre-commit-config.yaml` — `cargo fmt`
+  + hygiene/`actionlint`/`zizmor`/`shellcheck` on commit, `clippy`/`test` on push;
+  `prek run --all-files` checks the whole tree.
 
 ## Where things live
 
