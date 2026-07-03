@@ -12,7 +12,7 @@ DOCKER ?= docker
 IMAGE_NAME ?= devbox
 IMAGE_TAG ?= latest
 
-.PHONY: all build test run run-agent run-server clean help docker-build docker-run css-dev css-build fmt lint check bake-cli bake-server bake-agent bake-all
+.PHONY: all build test run run-agent run-server clean help docker-build docker-run css-dev css-build fmt lint check hooks bake-cli bake-server bake-agent bake-all
 
 all: build
 
@@ -48,6 +48,9 @@ lint: ## Run clippy lints
 
 check: ## Run cargo check
 	$(CARGO) check
+
+hooks: ## Install prek git hooks (pre-commit + pre-push)
+	prek install
 
 ##@ Testing
 

@@ -229,7 +229,17 @@ make fmt      # Format code
 make lint     # Run clippy
 make test     # Run tests
 make check    # Cargo check
+make hooks    # Install prek git hooks
 ```
+
+### Git hooks
+
+`.pre-commit-config.yaml` defines [`prek`](https://github.com/j178/prek) hooks.
+`make hooks` (or `prek install`) wires them up: `cargo fmt` plus file-hygiene,
+`actionlint`, `zizmor`, and `shellcheck` run on every commit, and
+`cargo clippy`/`cargo test` run at the pre-push stage. Run `prek run --all-files`
+to check the whole tree. Requires `prek`, `actionlint`, `zizmor`, and `shellcheck`
+on `PATH`.
 
 See [`.kiro/steering/build-and-test.md`](.kiro/steering/build-and-test.md) for full development guide.
 
