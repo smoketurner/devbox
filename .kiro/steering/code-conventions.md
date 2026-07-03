@@ -86,6 +86,7 @@ fn launch_instance(&self, instance_type: &str, ami_id: &str, subnet_id: &str) ->
 ```bash
 make fmt    # cargo fmt --all
 make lint   # cargo clippy --all-targets --all-features -- -D warnings
+make hooks  # install prek git hooks (fmt on commit, lint+test on push)
 ```
 
 Configuration: edition 2024, max width 100, Unix newlines.
