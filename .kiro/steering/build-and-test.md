@@ -16,6 +16,7 @@
 | Lint | `make lint` |
 | Check | `make check` |
 | Unit tests | `make test` |
+| Install git hooks | `make hooks` |
 | Run server | `make run-server` |
 | Build CSS | `make css-build` |
 | Watch CSS | `make css-dev` |

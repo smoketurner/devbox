@@ -21,7 +21,11 @@ This project does not use milestone segments.
 
 ## Before Creating a PR
 
-Run the project gate (matches `make` targets and CLAUDE.md):
+`make hooks` (or `prek install`) wires the project gate into git hooks:
+- `cargo fmt` + file hygiene + `actionlint`/`zizmor`/`shellcheck` run on commit
+- `cargo clippy` + `cargo test` run on push
+
+If hooks are installed, these checks are automatic. Run manually for faster feedback:
 
 ```bash
 make fmt    # cargo fmt --all
