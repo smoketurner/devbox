@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use tokio::process::Command;
 
-use crate::git::{build_minter, run_git};
-use crate::server_client::ServerTokenClient;
+use crate::git::{build_server_client, run_git};
+use crate::server_client::ServerClient;
 
 /// Where the snapshot-seeded repositories live.
 const WORKSPACE: &str = "/workspace";
@@ -59,13 +59,13 @@ pub(crate) async fn freshen_workspace() {
         return;
     }
 
-    let mut minter = build_minter().await;
+    let mut client = build_server_client().await;
     // Resolve a token per repo *before* starting the fetch timer, so installation
     // discovery/mint latency is not charged against the budget — only the git fetch
     // is. Tokens last an hour, well beyond the fetch loop.
     let mut tokens = Vec::with_capacity(repos.len());
     for repo in &repos {
-        tokens.push(repo_token(minter.as_mut(), repo).await);
+        tokens.push(repo_token(client.as_mut(), repo).await);
     }
 
     // One shared budget. Each git op is given the time *left* in it (see `run_git`),
@@ -196,11 +196,11 @@ fn remove_lock_files(dir: &Path, recurse: bool) {
 }
 
 /// A read-only token for `repo`'s `origin` owner, or `None` to fetch unauthenticated
-/// (no minter, no/non-GitHub remote, or the App isn't installed on the owner).
-async fn repo_token(minter: Option<&mut ServerTokenClient>, repo: &Path) -> Option<String> {
-    let minter = minter?;
+/// (no client, no/non-GitHub remote, or the App isn't installed on the owner).
+async fn repo_token(client: Option<&mut ServerClient>, repo: &Path) -> Option<String> {
+    let client = client?;
     let url = repo_origin_url(repo).await?;
-    match minter.token_for(&url).await {
+    match client.token_for(&url).await {
         Ok(Some(token)) => Some(token),
         Ok(None) => {
             tracing::debug!(

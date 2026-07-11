@@ -1,21 +1,21 @@
-//! Obtain GitHub tokens from the devbox-server control plane.
+//! Authenticated client for the devbox-server agent API (`/api/v1/agent/*`).
 //!
-//! The GitHub App private key no longer lives on the box. Instead the agent
-//! authenticates to devbox-server with an **AWS web-identity token** (IAM
-//! Outbound Identity Federation, `sts:GetWebIdentityToken`) — a short-lived,
-//! AWS-signed OIDC JWT asserting this instance's identity, with no static secret
-//! to steal — and asks the server to mint a short-lived, **repo-scoped**,
-//! read-only GitHub token per git remote. The server holds the key and mints;
-//! the box only ever holds a 1 h scoped token.
+//! The agent authenticates to devbox-server with an **AWS web-identity token**
+//! (IAM Outbound Identity Federation, `sts:GetWebIdentityToken`) — a
+//! short-lived, AWS-signed OIDC JWT asserting this instance's identity, with no
+//! static secret to steal. Over that channel it asks the server to mint
+//! short-lived, **repo-scoped**, read-only GitHub tokens per git remote (the
+//! GitHub App private key lives only on the control plane), and reports
+//! warm-up metrics.
 //!
 //! Configuration is non-secret and supplied via the environment:
 //!
 //! - `DEVBOX_SERVER_URL` — the control-plane base URL. Also the **audience** the
 //!   web-identity token is minted for; it must equal the server's
 //!   `DEVBOX_AGENT_AUDIENCE` (trailing slashes are trimmed on both sides). When
-//!   unset the agent is not configured for
-//!   server-backed minting ([`ServerTokenClient::new`] returns `Ok(None)`) and
-//!   callers fetch unauthenticated.
+//!   unset the agent is not configured for the server-backed agent API
+//!   ([`ServerClient::new`] returns `Ok(None)`) and callers degrade (fetch
+//!   unauthenticated, skip reporting).
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -45,28 +45,27 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bound on the STS token call so a stall can't block warm-up.
 const STS_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Fetches short-lived, repo-scoped GitHub tokens from devbox-server, presenting
-/// an AWS web-identity token for auth. Built once per run; caches the web-identity
+/// Authenticated client for the devbox-server agent API, presenting an AWS
+/// web-identity token for auth. Built once per run; caches the web-identity
 /// JWT (refreshed near expiry) and one GitHub token per git remote.
 ///
 /// GitHub tokens are cached **per remote**, not per owner: each is scoped to a
 /// single repository, so it cannot be reused across remotes.
-pub(crate) struct ServerTokenClient {
+pub(crate) struct ServerClient {
     http: reqwest::Client,
     sts: aws_sdk_sts::Client,
-    git_token_url: String,
-    /// The audience the web-identity token is minted for (the control-plane
-    /// resource); equals the server's expected `DEVBOX_AGENT_AUDIENCE`.
-    audience: String,
+    /// Trimmed control-plane base URL. Also the audience the web-identity token
+    /// is minted for; equals the server's expected `DEVBOX_AGENT_AUDIENCE`.
+    base_url: String,
     /// Cached web-identity JWT and its unix expiry (seconds).
     web_identity: Option<(String, u64)>,
     /// Cached repo-scoped GitHub tokens, keyed by git remote URL.
-    cache: HashMap<String, String>,
+    git_tokens: HashMap<String, String>,
 }
 
-impl ServerTokenClient {
-    /// Build a client, or `Ok(None)` when the box is not configured for
-    /// server-backed minting (`DEVBOX_SERVER_URL` unset).
+impl ServerClient {
+    /// Build a client, or `Ok(None)` when the box is not configured for the
+    /// server-backed agent API (`DEVBOX_SERVER_URL` unset).
     ///
     /// # Errors
     ///
@@ -92,15 +91,13 @@ impl ServerTokenClient {
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .context("build control-plane HTTP client")?;
-        let base = server_url.trim_end_matches('/').to_string();
-        let git_token_url = format!("{base}/api/v1/agent/git-token");
+        let base_url = server_url.trim_end_matches('/').to_string();
         Ok(Some(Self {
             http,
             sts,
-            git_token_url,
-            audience: base,
+            base_url,
             web_identity: None,
-            cache: HashMap::new(),
+            git_tokens: HashMap::new(),
         }))
     }
 
@@ -114,33 +111,58 @@ impl ServerTokenClient {
     /// request fails (including when the App is not installed on the repo, which
     /// the server surfaces as an error).
     pub(crate) async fn token_for(&mut self, remote: &str) -> Result<Option<String>> {
-        if let Some(token) = self.cache.get(remote) {
+        if let Some(token) = self.git_tokens.get(remote) {
             return Ok(Some(token.clone()));
         }
-        let jwt = self.web_identity_token().await?;
-        let resp = self
-            .http
-            .post(&self.git_token_url)
-            .bearer_auth(&jwt)
-            .json(&GitTokenRequest {
-                remote: remote.to_string(),
-            })
-            .send()
-            .await
-            .with_context(|| format!("POST {}", self.git_token_url))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("git-token request failed ({status}): {body}");
-        }
-        let parsed: GitTokenResponse = resp.json().await.context("parse git-token response")?;
+        let req = GitTokenRequest {
+            remote: remote.to_string(),
+        };
+        let parsed: GitTokenResponse = self.post_json("/api/v1/agent/git-token", &req).await?;
         match parsed.token {
             Some(token) => {
-                self.cache.insert(remote.to_string(), token.clone());
+                self.git_tokens.insert(remote.to_string(), token.clone());
                 Ok(Some(token))
             }
             None => Ok(None),
         }
+    }
+
+    /// Mint/refresh the cached web-identity JWT and POST `body` as JSON to
+    /// `{base_url}{path}` with bearer auth. The response status is **not**
+    /// checked — callers that need to distinguish statuses (e.g. a 404 from an
+    /// older server) inspect it themselves; the rest go through [`Self::post_json`].
+    async fn post_authenticated<Req: serde::Serialize>(
+        &mut self,
+        path: &str,
+        body: &Req,
+    ) -> Result<reqwest::Response> {
+        let jwt = self.web_identity_token().await?;
+        let url = format!("{}{path}", self.base_url);
+        self.http
+            .post(&url)
+            .bearer_auth(&jwt)
+            .json(body)
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))
+    }
+
+    /// POST `body` to `path` via [`Self::post_authenticated`] and parse a success
+    /// JSON body; any non-2xx status is an error carrying status + body text.
+    async fn post_json<Req: serde::Serialize, Resp: serde::de::DeserializeOwned>(
+        &mut self,
+        path: &str,
+        body: &Req,
+    ) -> Result<Resp> {
+        let resp = self.post_authenticated(path, body).await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("POST {path} failed ({status}): {body}");
+        }
+        resp.json()
+            .await
+            .with_context(|| format!("parse {path} response"))
     }
 
     /// A valid web-identity JWT, minting a fresh one via STS when none is cached or
@@ -163,7 +185,7 @@ impl ServerTokenClient {
             STS_TIMEOUT,
             self.sts
                 .get_web_identity_token()
-                .audience(&self.audience)
+                .audience(&self.base_url)
                 .signing_algorithm(SIGNING_ALGORITHM)
                 .duration_seconds(WEB_IDENTITY_TTL_SECS)
                 .send(),

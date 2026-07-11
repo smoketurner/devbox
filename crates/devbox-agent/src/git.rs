@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tokio::process::Command;
 
-use crate::server_client::ServerTokenClient;
+use crate::server_client::ServerClient;
 
 /// Env var the credential helper reads the token from. The agent sets it on the
 /// git child process — the token is never baked into the binary, logged, or placed
@@ -62,11 +62,11 @@ pub(crate) async fn run_git_clone(
     await_git(cmd, &format!("git clone {url}")).await
 }
 
-/// Build the control-plane token client from the environment, or `None` when the
-/// box is not configured for server-backed minting (`DEVBOX_SERVER_URL` unset).
-/// Degrades gracefully so callers can proceed unauthenticated.
-pub(crate) async fn build_minter() -> Option<ServerTokenClient> {
-    match ServerTokenClient::new().await {
+/// Build the control-plane agent-API client from the environment, or `None` when
+/// the box is not configured for it (`DEVBOX_SERVER_URL` unset). Degrades
+/// gracefully so callers can proceed unauthenticated.
+pub(crate) async fn build_server_client() -> Option<ServerClient> {
+    match ServerClient::new().await {
         Ok(Some(client)) => Some(client),
         Ok(None) => {
             tracing::warn!(
@@ -78,7 +78,7 @@ pub(crate) async fn build_minter() -> Option<ServerTokenClient> {
         Err(e) => {
             tracing::warn!(
                 error = %format!("{e:#}"),
-                "failed to build control-plane token client; proceeding without credentials"
+                "failed to build control-plane client; proceeding without credentials"
             );
             None
         }

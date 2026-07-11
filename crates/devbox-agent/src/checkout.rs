@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use crate::git::{build_minter, run_git, run_git_clone};
-use crate::server_client::ServerTokenClient;
+use crate::git::{build_server_client, run_git, run_git_clone};
+use crate::server_client::ServerClient;
 
 /// Time budget for a single `git clone` operation.
 const CLONE_TIMEOUT: Duration = Duration::from_mins(10);
@@ -69,12 +69,12 @@ pub(crate) async fn run(workspace: &Path, repos: &[String]) -> Result<()> {
         }
     }
 
-    let mut minter = build_minter().await;
+    let mut client = build_server_client().await;
 
     for (url, name) in repos.iter().zip(&dest_names) {
         let dest = workspace.join(name);
 
-        let token = resolve_token(minter.as_mut(), url).await;
+        let token = resolve_token(client.as_mut(), url).await;
 
         tracing::info!(url, dest = %dest.display(), "cloning repository");
         run_git_clone(
@@ -138,11 +138,11 @@ fn dest_name(url: &str) -> Option<String> {
     Some(name.to_string())
 }
 
-/// Resolve a read-only token for `url` via the minter, logging at the appropriate
-/// level when unavailable so the caller can proceed unauthenticated.
-async fn resolve_token(minter: Option<&mut ServerTokenClient>, url: &str) -> Option<String> {
-    let minter = minter?;
-    match minter.token_for(url).await {
+/// Resolve a read-only token for `url` via the control-plane client, logging at the
+/// appropriate level when unavailable so the caller can proceed unauthenticated.
+async fn resolve_token(client: Option<&mut ServerClient>, url: &str) -> Option<String> {
+    let client = client?;
+    match client.token_for(url).await {
         Ok(Some(token)) => Some(token),
         Ok(None) => {
             tracing::debug!(
