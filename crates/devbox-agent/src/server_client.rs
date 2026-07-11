@@ -23,7 +23,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use aws_config::BehaviorVersion;
 use aws_sdk_sts::config::Region;
-use devbox_common::{GitTokenRequest, GitTokenResponse, env_non_empty};
+use devbox_common::{GitTokenRequest, GitTokenResponse, WarmupReportRequest, env_non_empty};
 
 const SERVER_URL_ENV: &str = "DEVBOX_SERVER_URL";
 
@@ -125,6 +125,25 @@ impl ServerClient {
             }
             None => Ok(None),
         }
+    }
+
+    /// POST the warm-up report. `Ok(true)` = recorded; `Ok(false)` = the server
+    /// predates the endpoint (404 — tolerated per the AMI-ordering contract, the
+    /// agent may briefly run ahead of the server); `Err` = transport/auth/other
+    /// failure. Callers treat every outcome as best-effort.
+    pub(crate) async fn report_warmup(&mut self, report: &WarmupReportRequest) -> Result<bool> {
+        let resp = self
+            .post_authenticated("/api/v1/agent/warmup-report", report)
+            .await?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("warmup-report failed ({status}): {body}");
+        }
+        Ok(true)
     }
 
     /// Mint/refresh the cached web-identity JWT and POST `body` as JSON to
