@@ -17,6 +17,7 @@ use axum::{Extension, Router};
 use devbox_common::{
     ClaimRequest, DevboxListResponse, DevboxResponse, GitTokenRequest, GitTokenResponse,
     HealthResponse, PoolMetricsResponse, ProtectedResourceMetadata, RenameRequest,
+    WarmupReportRequest, WarmupReportResponse,
 };
 
 use crate::auth::{AgentIdentity, Authenticator, Principal};
@@ -132,6 +133,10 @@ pub fn build_router(state: SharedState) -> Router {
     // own edge layer rather than sharing `require_auth`.
     let agent = Router::new()
         .route("/api/v1/agent/git-token", post(handle_agent_git_token))
+        .route(
+            "/api/v1/agent/warmup-report",
+            post(handle_agent_warmup_report),
+        )
         .route_layer(from_fn_with_state(state.clone(), require_agent_iam));
 
     Router::new()
@@ -262,6 +267,17 @@ async fn handle_agent_git_token(
     Ok(Json(resp))
 }
 
+/// HTTP adapter: record a warm-up report from a verified devbox host onto its
+/// `DevboxDoc` (see [`service::record_warmup_report`]).
+async fn handle_agent_warmup_report(
+    State(state): State<SharedState>,
+    Extension(agent): Extension<AgentIdentity>,
+    JsonBody(req): JsonBody<WarmupReportRequest>,
+) -> Result<Json<WarmupReportResponse>, AppError> {
+    service::record_warmup_report(&state, &agent, &req).await?;
+    Ok(Json(WarmupReportResponse {}))
+}
+
 #[cfg(test)]
 #[expect(
     clippy::unwrap_used,
@@ -348,6 +364,7 @@ mod tests {
             claimed_at: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
+            warmup_report: None,
         }
     }
 
@@ -461,31 +478,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_git_token_requires_agent_credential() {
-        // The agent endpoint sits behind require_agent_iam (a separate edge layer
-        // from the human require_auth). With no Bearer credential it returns 401,
-        // and it is wired (not 404) — pinning the route-separated agent path.
-        let state = setup_state_no_principal().await;
-        let status = router_status(state, "POST", "/api/v1/agent/git-token").await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    async fn agent_routes_require_agent_credential() {
+        // The agent endpoints sit behind require_agent_iam (a separate edge layer
+        // from the human require_auth). With no Bearer credential each returns
+        // 401, and each is wired (not 404) — pinning the route-separated agent path.
+        for uri in ["/api/v1/agent/git-token", "/api/v1/agent/warmup-report"] {
+            let state = setup_state_no_principal().await;
+            let status = router_status(state, "POST", uri).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "expected 401 for {uri}");
+        }
     }
 
     #[tokio::test]
-    async fn agent_git_token_rejects_human_test_principal() {
+    async fn agent_routes_reject_human_test_principal() {
         // A mocked human principal (with_test_owner) authenticates the human path
-        // only; the agent endpoint uses verify_agent_token, which is unconfigured
+        // only; the agent endpoints use verify_agent_token, which is unconfigured
         // here, so a request still fails closed with 401 — a human token cannot
         // reach the agent endpoints.
-        let state = setup_state().await;
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/agent/git-token")
-            .header(AUTHORIZATION, "Bearer some-human-looking-token")
-            .header(axum::http::header::CONTENT_TYPE, "application/json")
-            .body(Body::from(r#"{"remote":"https://github.com/o/r.git"}"#))
-            .unwrap();
-        let status = build_router(state).oneshot(req).await.unwrap().status();
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        for (uri, body) in [
+            (
+                "/api/v1/agent/git-token",
+                r#"{"remote":"https://github.com/o/r.git"}"#,
+            ),
+            (
+                "/api/v1/agent/warmup-report",
+                r#"{"docker_start_ms":1,"freshen_total_ms":2,"total_ms":3,"workspace_present":true,"repos":[]}"#,
+            ),
+        ] {
+            let state = setup_state().await;
+            let req = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(AUTHORIZATION, "Bearer some-human-looking-token")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let status = build_router(state).oneshot(req).await.unwrap().status();
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "expected 401 for {uri}");
+        }
     }
 
     #[tokio::test]

@@ -516,6 +516,54 @@ pub struct GitTokenResponse {
 }
 
 // ============================================================================
+// Agent warmup-report API
+// ============================================================================
+
+/// Outcome of freshening one repo under `/workspace` during warm-up.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoFreshenReport {
+    /// Directory name under `/workspace` (final path component).
+    pub repo: String,
+    /// Whether the repo reached upstream HEAD within the budget.
+    pub success: bool,
+    /// Wall time spent on this repo (fetch + reset + clean), in milliseconds.
+    pub duration_ms: u64,
+    /// Truncated error summary when `success` is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Request body for `POST /api/v1/agent/warmup-report`.
+///
+/// Sent best-effort after the box tags itself `devbox:ready=true` — a lost or
+/// rejected report never blocks readiness. Durations are u64 milliseconds and
+/// are measured from the warm-up process, so they exclude kernel/cloud-init
+/// boot time (launch→Ready wall time is derivable server-side from the EC2
+/// launch timestamp).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WarmupReportRequest {
+    /// `systemctl start docker` wall time, in milliseconds.
+    pub docker_start_ms: u64,
+    /// Total wall time of the freshen phase (token minting + all repos), in
+    /// milliseconds.
+    pub freshen_total_ms: u64,
+    /// Warm-up wall time from agent start to just before this report, in
+    /// milliseconds.
+    pub total_ms: u64,
+    /// Whether `/workspace` held at least one repo. `false` with empty `repos`
+    /// is itself a signal: the snapshot-seeded volume didn't deliver.
+    pub workspace_present: bool,
+    /// Per-repo freshen outcomes.
+    #[serde(default)]
+    pub repos: Vec<RepoFreshenReport>,
+}
+
+/// Response body for `POST /api/v1/agent/warmup-report`. Currently empty; a
+/// struct so fields can be added compatibly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WarmupReportResponse {}
+
+// ============================================================================
 // API Response Types
 // ============================================================================
 

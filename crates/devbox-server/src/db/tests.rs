@@ -38,6 +38,7 @@ mod store_tests {
             claimed_at: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
+            warmup_report: None,
         }
     }
 

@@ -4,7 +4,12 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::db::document_type::{DocumentType, IndexEntry};
-use devbox_common::{AmiId, DevboxState, InstanceType, SubnetId};
+use devbox_common::{AmiId, DevboxState, InstanceType, RepoFreshenReport, SubnetId};
+
+/// Bound on stored per-repo entries; a report exceeding it is truncated.
+const MAX_REPORT_REPOS: usize = 64;
+/// Bound on a stored per-repo error string, in characters.
+const MAX_REPORT_ERROR_CHARS: usize = 256;
 
 /// A devbox instance document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +56,70 @@ pub struct DevboxDoc {
     /// stays false and the reconciler re-applies it on its next tick.
     #[serde(default)]
     pub owner_tag_applied: bool,
+    /// Warm-up metrics reported by the agent after tagging ready. Absent for
+    /// boxes running an older agent, or when the best-effort report never
+    /// arrived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warmup_report: Option<WarmupReport>,
+}
+
+/// Warm-up metrics as stored on the [`DevboxDoc`] — the wire request plus the
+/// server receive time. A doc-owned copy (rather than the wire type raw) so
+/// storage can evolve independently of the agent API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WarmupReport {
+    /// `systemctl start docker` wall time, in milliseconds.
+    pub docker_start_ms: u64,
+    /// Total wall time of the freshen phase, in milliseconds.
+    pub freshen_total_ms: u64,
+    /// Warm-up wall time from agent start to the report, in milliseconds.
+    pub total_ms: u64,
+    /// Whether `/workspace` held at least one repo.
+    pub workspace_present: bool,
+    /// Per-repo freshen outcomes, bounded to [`MAX_REPORT_REPOS`] entries.
+    #[serde(default)]
+    pub repos: Vec<RepoFreshenReport>,
+    /// When the server received the report (server clock — agent clocks are
+    /// not trusted for cross-box comparison).
+    pub reported_at: Timestamp,
+}
+
+impl WarmupReport {
+    /// Build the stored report from a wire request, stamping `now` as the
+    /// receive time and bounding stored size: at most [`MAX_REPORT_REPOS`]
+    /// repo entries, each error truncated to [`MAX_REPORT_ERROR_CHARS`]
+    /// characters. The caller is an authenticated pool host, but the document
+    /// row shouldn't grow unbounded on a misbehaving one.
+    pub(crate) fn from_request(req: &devbox_common::WarmupReportRequest, now: Timestamp) -> Self {
+        let repos = req
+            .repos
+            .iter()
+            .take(MAX_REPORT_REPOS)
+            .map(|repo| RepoFreshenReport {
+                repo: truncate_chars(&repo.repo, MAX_REPORT_ERROR_CHARS),
+                success: repo.success,
+                duration_ms: repo.duration_ms,
+                error: repo
+                    .error
+                    .as_deref()
+                    .map(|e| truncate_chars(e, MAX_REPORT_ERROR_CHARS)),
+            })
+            .collect();
+        Self {
+            docker_start_ms: req.docker_start_ms,
+            freshen_total_ms: req.freshen_total_ms,
+            total_ms: req.total_ms,
+            workspace_present: req.workspace_present,
+            repos,
+            reported_at: now,
+        }
+    }
+}
+
+/// The first `max` characters of `s` (char-boundary-safe; indexing by bytes
+/// would panic mid-codepoint and is denied by the lint set anyway).
+fn truncate_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
 }
 
 impl DevboxDoc {
@@ -126,6 +195,7 @@ mod tests {
             claimed_at: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
+            warmup_report: None,
         }
     }
 
@@ -173,5 +243,69 @@ mod tests {
     #[test]
     fn test_devbox_doc_type() {
         assert_eq!(DevboxDoc::DOC_TYPE, "devbox");
+    }
+
+    #[test]
+    fn warmup_report_roundtrips_through_serde() {
+        let mut doc = sample_devbox();
+        doc.warmup_report = Some(WarmupReport {
+            docker_start_ms: 850,
+            freshen_total_ms: 12_000,
+            total_ms: 13_500,
+            workspace_present: true,
+            repos: vec![RepoFreshenReport {
+                repo: "devbox".to_string(),
+                success: true,
+                duration_ms: 11_000,
+                error: None,
+            }],
+            reported_at: Timestamp::now(),
+        });
+
+        let json = serde_json::to_string(&doc).unwrap();
+        let parsed: DevboxDoc = serde_json::from_str(&json).unwrap();
+        let report = parsed.warmup_report.unwrap();
+        assert_eq!(report.total_ms, 13_500);
+        assert_eq!(report.repos.first().unwrap().repo, "devbox");
+    }
+
+    #[test]
+    fn doc_without_warmup_report_field_deserializes_to_none() {
+        // Documents written before the field existed must keep deserializing
+        // (forward compat — no migration, no version bump).
+        let mut json = serde_json::to_value(sample_devbox()).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        assert!(
+            !obj.contains_key("warmup_report"),
+            "None must be skipped in serialization"
+        );
+        let parsed: DevboxDoc = serde_json::from_value(json).unwrap();
+        assert!(parsed.warmup_report.is_none());
+    }
+
+    #[test]
+    fn from_request_bounds_repos_and_error_length() {
+        let req = devbox_common::WarmupReportRequest {
+            docker_start_ms: 1,
+            freshen_total_ms: 2,
+            total_ms: 3,
+            workspace_present: true,
+            repos: (0..(MAX_REPORT_REPOS + 10))
+                .map(|i| RepoFreshenReport {
+                    repo: format!("repo-{i}"),
+                    success: false,
+                    duration_ms: 1,
+                    error: Some("é".repeat(MAX_REPORT_ERROR_CHARS + 50)),
+                })
+                .collect(),
+        };
+
+        let stored = WarmupReport::from_request(&req, Timestamp::now());
+
+        assert_eq!(stored.repos.len(), MAX_REPORT_REPOS);
+        let error = stored.repos.first().unwrap().error.as_deref().unwrap();
+        // Multi-byte chars: the bound is characters, not bytes, and truncation
+        // must never split a codepoint.
+        assert_eq!(error.chars().count(), MAX_REPORT_ERROR_CHARS);
     }
 }

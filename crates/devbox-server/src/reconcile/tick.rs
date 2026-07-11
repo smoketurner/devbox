@@ -264,6 +264,7 @@ async fn sync_docs_with_asg(
             claimed_at: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
+            warmup_report: None,
         };
 
         let doc_id = uuid::Uuid::now_v7().to_string();

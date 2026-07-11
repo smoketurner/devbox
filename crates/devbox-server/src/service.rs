@@ -11,13 +11,14 @@
 //! [`AppError`] variants so the callers decide how to render them.
 
 use devbox_common::{
-    DEVBOX_NAME_MAX_LEN, DevboxState, GitTokenResponse, PoolMetricsResponse, is_valid_devbox_name,
+    DEVBOX_NAME_MAX_LEN, DevboxState, GitTokenResponse, PoolMetricsResponse, WarmupReportRequest,
+    is_valid_devbox_name,
 };
 
-use crate::auth::{AgentIdentity, Principal};
+use crate::auth::{AgentIdentity, AgentRole, Principal};
 use crate::db::UpdateOutcome;
 use crate::db::document_type::Document;
-use crate::documents::devbox::DevboxDoc;
+use crate::documents::devbox::{DevboxDoc, WarmupReport};
 use crate::error::AppError;
 use crate::routes::AppState;
 
@@ -118,6 +119,92 @@ pub(crate) async fn mint_git_token(
             token: None,
         }),
         Err(e) => Err(AppError::Internal(e)),
+    }
+}
+
+// ============================================================================
+// Agent warmup report
+// ============================================================================
+
+/// Record a warm-up report from a verified pool host onto its [`DevboxDoc`].
+///
+/// A later report replaces an earlier one (last-writer-wins — a box warms once,
+/// so a second report is a re-run, not a merge).
+///
+/// # Errors
+///
+/// [`AppError::Forbidden`] for a non-pool (builder) identity — builders have no
+/// `DevboxDoc`; [`AppError::NotFound`] when no doc exists for the instance
+/// (e.g. the reconciler hasn't adopted it yet, or it was already reaped);
+/// [`AppError::Conflict`] when the write retries are exhausted.
+pub(crate) async fn record_warmup_report(
+    state: &AppState,
+    agent: &AgentIdentity,
+    report: &WarmupReportRequest,
+) -> Result<(), AppError> {
+    if agent.role != AgentRole::Pool {
+        return Err(AppError::Forbidden(
+            "only pool hosts have a devbox record".into(),
+        ));
+    }
+
+    let stored = WarmupReport::from_request(report, jiff::Timestamp::now());
+    update_devbox_by_instance(state, agent.instance_id.as_str(), |doc| {
+        doc.warmup_report = Some(stored.clone());
+    })
+    .await?;
+
+    tracing::info!(
+        instance_id = %agent.instance_id,
+        total_ms = report.total_ms,
+        freshen_total_ms = report.freshen_total_ms,
+        workspace_present = report.workspace_present,
+        repos = report.repos.len(),
+        "recorded warmup report"
+    );
+    Ok(())
+}
+
+/// Apply `mutate` to the [`DevboxDoc`] whose `instance_id` matches, with a
+/// read-modify-CAS retry loop.
+///
+/// The version guard matters here: agent writes race the reconciler (which
+/// flips the same doc `Warming → Ready` right when the warmup report arrives),
+/// and an unguarded whole-document write from a stale read would silently
+/// revert the reconciler's state change. Shared shape for agent-reported
+/// fields (warmup report now; heartbeats later).
+async fn update_devbox_by_instance(
+    state: &AppState,
+    instance_id: &str,
+    mutate: impl Fn(&mut DevboxDoc),
+) -> Result<(), AppError> {
+    const MAX_RETRIES: u32 = 3;
+    let mut attempts = 0u32;
+    loop {
+        let doc = state
+            .store
+            .find_one::<DevboxDoc>("instance_id", instance_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::NotFound(format!("no devbox record for instance '{instance_id}'"))
+            })?;
+
+        let mut updated = doc.data.clone();
+        mutate(&mut updated);
+
+        if state
+            .store
+            .compare_and_update(&doc.id, doc.version, &updated)
+            .await?
+        {
+            return Ok(());
+        }
+        if attempts >= MAX_RETRIES {
+            return Err(AppError::Conflict(
+                "devbox was modified concurrently".into(),
+            ));
+        }
+        attempts = attempts.saturating_add(1);
     }
 }
 
@@ -468,6 +555,7 @@ mod tests {
             claimed_at: Some(Timestamp::now()),
             created_at: Timestamp::now(),
             owner_tag_applied: false,
+            warmup_report: None,
         }
     }
 
@@ -526,6 +614,7 @@ mod tests {
             claimed_at: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
+            warmup_report: None,
         }
     }
 
@@ -570,6 +659,142 @@ mod tests {
             .err()
             .unwrap();
         assert!(matches!(err, AppError::ServiceUnavailable(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // warmup-report tests
+    // -----------------------------------------------------------------------
+
+    fn sample_report() -> WarmupReportRequest {
+        WarmupReportRequest {
+            docker_start_ms: 850,
+            freshen_total_ms: 12_000,
+            total_ms: 13_500,
+            workspace_present: true,
+            repos: vec![devbox_common::RepoFreshenReport {
+                repo: "devbox".to_string(),
+                success: true,
+                duration_ms: 11_000,
+                error: None,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn warmup_report_persists_on_devbox_doc() {
+        // pool_agent()'s instance id matches ready_devbox()'s, so the report
+        // resolves to that doc and lands on its warmup_report field.
+        let state = setup_state().await;
+        let id = insert(&state, ready_devbox()).await;
+
+        record_warmup_report(&state, &pool_agent(), &sample_report())
+            .await
+            .ok()
+            .unwrap();
+
+        let doc = state.store.get::<DevboxDoc>(&id).await.unwrap().unwrap();
+        let report = doc.data.warmup_report.unwrap();
+        assert_eq!(report.docker_start_ms, 850);
+        assert_eq!(report.freshen_total_ms, 12_000);
+        assert_eq!(report.total_ms, 13_500);
+        assert!(report.workspace_present);
+        assert_eq!(report.repos.len(), 1);
+        assert_eq!(report.repos.first().unwrap().repo, "devbox");
+        // reported_at is stamped from the server clock at receive time.
+        assert!(report.reported_at <= Timestamp::now());
+    }
+
+    #[tokio::test]
+    async fn warmup_report_unknown_instance_is_not_found() {
+        // No DevboxDoc for the calling instance (not yet adopted, or already
+        // reaped) → 404, so the agent's best-effort send logs and moves on.
+        let state = setup_state().await;
+
+        let err = record_warmup_report(&state, &pool_agent(), &sample_report())
+            .await
+            .err()
+            .unwrap();
+
+        assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn warmup_report_builder_role_is_forbidden() {
+        // Snapshot-builder hosts authenticate on the same path but have no
+        // DevboxDoc; they must be rejected up front, not fall through to a 404.
+        let state = setup_state().await;
+        insert(&state, ready_devbox()).await;
+        let builder = AgentIdentity {
+            instance_id: InstanceId("i-1234567890abcdef0".to_string()),
+            role: AgentRole::Builder,
+            owner: None,
+        };
+
+        let err = record_warmup_report(&state, &builder, &sample_report())
+            .await
+            .err()
+            .unwrap();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn warmup_report_overwrites_previous_report() {
+        // A box warms once per life, so a second report is a re-run replacing
+        // the first (last-writer-wins), not a merge.
+        let state = setup_state().await;
+        let id = insert(&state, ready_devbox()).await;
+
+        record_warmup_report(&state, &pool_agent(), &sample_report())
+            .await
+            .ok()
+            .unwrap();
+        let mut second = sample_report();
+        second.total_ms = 99_000;
+        record_warmup_report(&state, &pool_agent(), &second)
+            .await
+            .ok()
+            .unwrap();
+
+        let doc = state.store.get::<DevboxDoc>(&id).await.unwrap().unwrap();
+        assert_eq!(doc.data.warmup_report.unwrap().total_ms, 99_000);
+    }
+
+    #[tokio::test]
+    async fn warmup_report_bounds_oversized_input() {
+        // The stored report is size-bounded at the trust boundary: repo entries
+        // capped, error strings truncated — a misbehaving host cannot grow the
+        // document row without bound.
+        let state = setup_state().await;
+        let id = insert(&state, ready_devbox()).await;
+
+        let mut report = sample_report();
+        report.repos = (0..100)
+            .map(|i| devbox_common::RepoFreshenReport {
+                repo: format!("repo-{i}"),
+                success: false,
+                duration_ms: 1,
+                error: Some("e".repeat(10_000)),
+            })
+            .collect();
+        record_warmup_report(&state, &pool_agent(), &report)
+            .await
+            .ok()
+            .unwrap();
+
+        let doc = state.store.get::<DevboxDoc>(&id).await.unwrap().unwrap();
+        let stored = doc.data.warmup_report.unwrap();
+        assert_eq!(stored.repos.len(), 64, "repo entries must be capped");
+        let first_error = stored
+            .repos
+            .first()
+            .unwrap()
+            .error
+            .as_deref()
+            .unwrap()
+            .chars()
+            .count();
+        assert_eq!(first_error, 256, "error strings must be truncated");
     }
 
     // -----------------------------------------------------------------------
