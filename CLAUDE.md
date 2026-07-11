@@ -170,7 +170,7 @@ in-memory SQLite.
 
 ## Conventions (enforced — see `.kiro/steering/code-conventions.md`)
 
-- **Toolchain**: Rust `1.96.1`, edition 2024 (`rust-toolchain.toml`). Release
+- **Toolchain**: Rust `1.97.0`, edition 2024 (`rust-toolchain.toml`). Release
   profile is `lto`/`codegen-units = 1`/`opt-level = "z"`/`strip`/**`panic =
   "abort"`** — abort-on-panic is *why* the no-panic policy below is a hard lint,
   not a preference (a panic is a process abort in release).
