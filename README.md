@@ -1,7 +1,7 @@
 # Devbox
 
 [![License](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue)](LICENSE-APACHE)
-[![Rust](https://img.shields.io/badge/rust-1.96%2B-orange)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.97%2B-orange)](https://www.rust-lang.org)
 
 **Tooling to help any company adopt remote development machines — for engineers and the coding agents working alongside them.**
 
@@ -82,7 +82,7 @@ SQLite for local development, Aurora DSQL for production. Same code, same querie
 ### Build
 
 ```bash
-# Prerequisites: Rust 1.96+, clang, pkg-config
+# Prerequisites: Rust 1.97+, clang, pkg-config
 make build
 ```
 
