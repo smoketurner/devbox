@@ -183,7 +183,10 @@ fn warmth_label(doc: &DevboxDoc) -> &'static str {
                 "cold"
             }
         }
-        DevboxState::Launching | DevboxState::Warming | DevboxState::Terminating => "—",
+        DevboxState::Launching
+        | DevboxState::Warming
+        | DevboxState::Archiving
+        | DevboxState::Terminating => "—",
     }
 }
 

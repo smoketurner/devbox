@@ -516,6 +516,7 @@ pub(crate) async fn pool_metrics(state: &AppState) -> Result<PoolMetricsResponse
     let mut warming = 0u32;
     let mut ready = 0u32;
     let mut claimed = 0u32;
+    let mut archiving = 0u32;
     let mut terminating = 0u32;
     let mut warm = 0u32;
 
@@ -525,10 +526,11 @@ pub(crate) async fn pool_metrics(state: &AppState) -> Result<PoolMetricsResponse
             DevboxState::Warming => warming = warming.saturating_add(1),
             DevboxState::Ready => ready = ready.saturating_add(1),
             DevboxState::Claimed => claimed = claimed.saturating_add(1),
+            DevboxState::Archiving => archiving = archiving.saturating_add(1),
             DevboxState::Terminating => terminating = terminating.saturating_add(1),
         }
         // Warmth is only meaningful for claimable/claimed boxes: Warming can't
-        // have a report yet and Terminating is leaving the pool.
+        // have a report yet and Archiving/Terminating are leaving the pool.
         if matches!(doc.data.state, DevboxState::Ready | DevboxState::Claimed)
             && doc.data.warmup_report.as_ref().is_some_and(|r| r.warm)
         {
@@ -540,6 +542,7 @@ pub(crate) async fn pool_metrics(state: &AppState) -> Result<PoolMetricsResponse
         warming,
         ready,
         claimed,
+        archiving,
         terminating,
         warm,
     })

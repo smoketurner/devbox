@@ -354,7 +354,7 @@ pub(crate) async fn cmd_claim(
         );
     }
     let url = format!("{server}/api/v1/devboxes/claim");
-    let req = ClaimRequest { name };
+    let req = ClaimRequest { name, resume: None };
     let resp = with_auth(http.post(&url).json(&req), &session.token)
         .send()
         .await
@@ -548,6 +548,7 @@ mod tests {
             region: "us-east-1".to_string(),
             created_at: "2026-06-23T00:00:00Z".to_string(),
             claimed_at: None,
+            session: None,
         }
     }
 

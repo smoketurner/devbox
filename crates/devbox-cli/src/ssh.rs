@@ -468,6 +468,7 @@ mod tests {
             region: "us-west-2".to_string(),
             created_at: "2024-01-01T00:00:00Z".to_string(),
             claimed_at: Some("2024-01-02T00:00:00Z".to_string()),
+            session: None,
         }
     }
 

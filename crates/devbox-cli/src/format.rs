@@ -104,6 +104,7 @@ mod tests {
                 region: "us-east-1".to_string(),
                 created_at: "2024-01-01T00:00:00Z".to_string(),
                 claimed_at: None,
+                session: None,
             }],
         };
         let output = format_list_table(&list);
@@ -129,6 +130,7 @@ mod tests {
             region: "us-east-1".to_string(),
             created_at: "2024-01-01T00:00:00Z".to_string(),
             claimed_at: Some("2024-01-02T00:00:00Z".to_string()),
+            session: None,
         };
         let output = format_status(&d);
         // The name and instance ID are shown; the internal UUID is not.
@@ -157,6 +159,7 @@ mod tests {
             region: "us-east-1".to_string(),
             created_at: "2024-01-01T00:00:00Z".to_string(),
             claimed_at: Some("2024-01-02T00:00:00Z".to_string()),
+            session: None,
         };
         let output = format_claim_success(&d);
         assert!(output.contains("Claimed devbox calm-quilt"));
@@ -181,6 +184,7 @@ mod tests {
             region: "us-east-1".to_string(),
             created_at: "2024-01-01T00:00:00Z".to_string(),
             claimed_at: None,
+            session: None,
         };
         let output = format_release_success(&d);
         assert!(output.contains("Released devbox calm-quilt"));
@@ -201,6 +205,7 @@ mod tests {
             region: "us-east-1".to_string(),
             created_at: "2024-01-01T00:00:00Z".to_string(),
             claimed_at: Some("2024-01-02T00:00:00Z".to_string()),
+            session: None,
         };
         let output = format_rename_success(&d);
         assert!(output.contains("Renamed devbox to my-feature"));
