@@ -10,13 +10,13 @@
 //! - `doctor` — print a read-only diagnostic of warm-cache delivery.
 
 mod checkout;
+mod control_plane;
 mod doctor;
 mod freshen;
 mod git;
 mod imds;
 mod owner_sync;
 mod principals;
-mod server_client;
 mod warmup;
 
 use std::path::PathBuf;

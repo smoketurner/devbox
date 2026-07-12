@@ -81,7 +81,7 @@ control plane with an **AWS web-identity token** (STS `GetWebIdentityToken`, IAM
 Outbound Identity Federation — a short-lived, AWS-signed OIDC JWT asserting this
 instance's identity, with no static secret to steal) and asks the server to mint
 a short-lived, repo-scoped, read-only GitHub App installation token (see
-`src/server_client.rs`). The GitHub App private key lives only on the control
+`src/control_plane.rs`). The GitHub App private key lives only on the control
 plane, read from an SSM SecureString by the server; the host needs only
 `sts:GetWebIdentityToken` and egress to `api.github.com`.
 

@@ -10,14 +10,17 @@
 //! status codes, or JSON types cross this boundary. Error cases are expressed via
 //! [`AppError`] variants so the callers decide how to render them.
 
+use std::future::Future;
+
 use devbox_common::{
-    DEVBOX_NAME_MAX_LEN, DevboxState, GitTokenResponse, PoolMetricsResponse, is_valid_devbox_name,
+    DEVBOX_NAME_MAX_LEN, DevboxState, GitTokenResponse, PoolMetricsResponse, WarmupReportRequest,
+    is_valid_devbox_name,
 };
 
-use crate::auth::{AgentIdentity, Principal};
+use crate::auth::{AgentIdentity, AgentRole, Principal};
 use crate::db::UpdateOutcome;
 use crate::db::document_type::Document;
-use crate::documents::devbox::DevboxDoc;
+use crate::documents::devbox::{DevboxDoc, WarmupReport};
 use crate::error::AppError;
 use crate::routes::AppState;
 
@@ -119,6 +122,141 @@ pub(crate) async fn mint_git_token(
         }),
         Err(e) => Err(AppError::Internal(e)),
     }
+}
+
+// ============================================================================
+// Optimistic-concurrency retry
+// ============================================================================
+
+/// Version-conflict retries granted to an optimistic-concurrency loop before it
+/// gives up with a 409. The common conflicting writer is the reconciler (owner
+/// tagging, `Warming → Ready`), which touches a document at most once per tick,
+/// so one retry usually suffices.
+const MAX_OCC_RETRIES: u32 = 3;
+
+/// Outcome of one optimistic-concurrency attempt in [`with_occ_retry`].
+enum OccAttempt<T> {
+    /// The operation finished (successfully wrote, or legitimately no-oped).
+    Done(T),
+    /// The document version moved underneath the attempt; re-run on fresh state.
+    Retry,
+}
+
+/// Run `attempt` until it completes or [`MAX_OCC_RETRIES`] version conflicts
+/// are exhausted (then 409 Conflict).
+///
+/// Each attempt must **re-read its document** so a retry operates on fresh
+/// state — re-running a CAS with a stale version is deterministically futile,
+/// and the re-read is also where business rules get re-validated against the
+/// document's *new* state (a retry may legitimately become a 403/404/409).
+/// This is a different retry domain from transient DSQL errors, which the
+/// store already retries generically via
+/// [`with_dsql_retry!`](crate::with_dsql_retry).
+///
+/// Takes `FnMut() -> Fut` rather than `AsyncFnMut` so the returned future's
+/// `Send`-ness stays inferable inside axum handlers (async-closure futures
+/// currently fail higher-ranked `Send` proofs); capture by `Copy` reference
+/// and return an `async move` block.
+async fn with_occ_retry<T, Fut>(mut attempt: impl FnMut() -> Fut) -> Result<T, AppError>
+where
+    Fut: Future<Output = Result<OccAttempt<T>, AppError>>,
+{
+    let mut attempts = 0u32;
+    loop {
+        match attempt().await? {
+            OccAttempt::Done(value) => return Ok(value),
+            OccAttempt::Retry if attempts < MAX_OCC_RETRIES => {
+                attempts = attempts.saturating_add(1);
+            }
+            OccAttempt::Retry => {
+                return Err(AppError::Conflict(
+                    "devbox was modified concurrently".into(),
+                ));
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Agent warmup report
+// ============================================================================
+
+/// Record a warm-up report from a verified pool host onto its [`DevboxDoc`].
+///
+/// A later report replaces an earlier one (last-writer-wins — a box warms once,
+/// so a second report is a re-run, not a merge).
+///
+/// # Errors
+///
+/// [`AppError::Forbidden`] for a non-pool (builder) identity — builders have no
+/// `DevboxDoc`; [`AppError::NotFound`] when no doc exists for the instance
+/// (e.g. the reconciler hasn't adopted it yet, or it was already reaped);
+/// [`AppError::Conflict`] when the write retries are exhausted.
+pub(crate) async fn record_warmup_report(
+    state: &AppState,
+    agent: &AgentIdentity,
+    report: &WarmupReportRequest,
+) -> Result<(), AppError> {
+    if agent.role != AgentRole::Pool {
+        return Err(AppError::Forbidden(
+            "only pool hosts have a devbox record".into(),
+        ));
+    }
+
+    let stored = WarmupReport::from_request(report, jiff::Timestamp::now());
+    update_devbox_by_instance(state, agent.instance_id.as_str(), |doc| {
+        doc.warmup_report = Some(stored.clone());
+    })
+    .await?;
+
+    tracing::info!(
+        instance_id = %agent.instance_id,
+        total_ms = report.total_ms,
+        freshen_total_ms = report.freshen_total_ms,
+        workspace_present = report.workspace_present,
+        repos = report.repos.len(),
+        "recorded warmup report"
+    );
+    Ok(())
+}
+
+/// Apply `mutate` to the [`DevboxDoc`] whose `instance_id` matches, under
+/// [`with_occ_retry`].
+///
+/// The version guard matters here: agent writes race the reconciler (which
+/// flips the same doc `Warming → Ready` right when the warmup report arrives),
+/// and an unguarded whole-document write from a stale read would silently
+/// revert the reconciler's state change. Shared shape for agent-reported
+/// fields (warmup report now; heartbeats later).
+async fn update_devbox_by_instance(
+    state: &AppState,
+    instance_id: &str,
+    mutate: impl Fn(&mut DevboxDoc),
+) -> Result<(), AppError> {
+    let mutate = &mutate;
+    with_occ_retry(move || async move {
+        let doc = state
+            .store
+            .find_one::<DevboxDoc>("instance_id", instance_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::NotFound(format!("no devbox record for instance '{instance_id}'"))
+            })?;
+
+        let mut updated = doc.data.clone();
+        mutate(&mut updated);
+
+        if state
+            .store
+            .compare_and_update(&doc.id, doc.version, &updated)
+            .await?
+        {
+            Ok(OccAttempt::Done(()))
+        } else {
+            Ok(OccAttempt::Retry)
+        }
+    })
+    .await
 }
 
 // ============================================================================
@@ -308,7 +446,7 @@ pub(crate) async fn release_devbox(
 /// - No-op short-circuit when `new_name` equals the current name (200, unchanged).
 /// - Uniqueness via [`compare_and_update_unique`](crate::db::DocumentStore::compare_and_update_unique).
 ///
-/// `VersionMismatch` is retried up to `MAX_RETRIES` times: the reconciler's
+/// `VersionMismatch` is retried via [`with_occ_retry`]: the reconciler's
 /// `apply_pending_owner_tags` bumps the document version within ~30 s of a claim,
 /// so a rename attempted in that window would otherwise get a spurious 409. A
 /// re-fetch and retry is sufficient — no sleep — because the reconciler is the
@@ -321,9 +459,8 @@ pub(crate) async fn rename_devbox(
 ) -> Result<Document<DevboxDoc>, AppError> {
     let name = validate_rename_name(new_name)?;
 
-    const MAX_RETRIES: u32 = 3;
-    let mut attempts = 0u32;
-    loop {
+    let name = &name;
+    with_occ_retry(move || async move {
         let doc = state
             .store
             .get::<DevboxDoc>(id)
@@ -343,8 +480,8 @@ pub(crate) async fn rename_devbox(
         }
 
         // No-op: same name → return box unchanged without touching the store.
-        if doc.data.name == name {
-            return Ok(doc);
+        if doc.data.name == *name {
+            return Ok(OccAttempt::Done(doc));
         }
 
         let mut updated = doc.data.clone();
@@ -352,32 +489,24 @@ pub(crate) async fn rename_devbox(
 
         match state
             .store
-            .compare_and_update_unique(&doc.id, doc.version, &updated, "name", &name)
+            .compare_and_update_unique(&doc.id, doc.version, &updated, "name", name)
             .await?
         {
             UpdateOutcome::Updated => {
-                return state.store.get::<DevboxDoc>(id).await?.ok_or_else(|| {
+                let refreshed = state.store.get::<DevboxDoc>(id).await?.ok_or_else(|| {
                     AppError::Internal(anyhow::anyhow!("devbox vanished after rename"))
-                });
+                })?;
+                Ok(OccAttempt::Done(refreshed))
             }
-            UpdateOutcome::VersionMismatch if attempts < MAX_RETRIES => {
-                // The reconciler just bumped the version (owner-tag sync);
-                // re-fetch and retry with the fresh version.
-                attempts = attempts.saturating_add(1);
-                continue;
-            }
-            UpdateOutcome::VersionMismatch => {
-                return Err(AppError::Conflict(
-                    "devbox was modified concurrently".into(),
-                ));
-            }
-            UpdateOutcome::DuplicateValue => {
-                return Err(AppError::Conflict(format!(
-                    "name '{name}' is already in use"
-                )));
-            }
+            // The reconciler just bumped the version (owner-tag sync);
+            // re-fetch and retry with the fresh version.
+            UpdateOutcome::VersionMismatch => Ok(OccAttempt::Retry),
+            UpdateOutcome::DuplicateValue => Err(AppError::Conflict(format!(
+                "name '{name}' is already in use"
+            ))),
         }
-    }
+    })
+    .await
 }
 
 /// Compute pool metrics from the current document store state.
@@ -468,6 +597,7 @@ mod tests {
             claimed_at: Some(Timestamp::now()),
             created_at: Timestamp::now(),
             owner_tag_applied: false,
+            warmup_report: None,
         }
     }
 
@@ -526,6 +656,7 @@ mod tests {
             claimed_at: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
+            warmup_report: None,
         }
     }
 
@@ -570,6 +701,204 @@ mod tests {
             .err()
             .unwrap();
         assert!(matches!(err, AppError::ServiceUnavailable(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // with_occ_retry tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn occ_retry_reruns_until_done() {
+        // An attempt that conflicts a few times then succeeds must be re-run
+        // (on what would be fresh state) and yield the final value.
+        let calls = std::cell::Cell::new(0u32);
+        let calls = &calls;
+        let result = with_occ_retry(move || async move {
+            calls.set(calls.get().saturating_add(1));
+            if calls.get() <= MAX_OCC_RETRIES {
+                Ok(OccAttempt::Retry)
+            } else {
+                Ok(OccAttempt::Done(calls.get()))
+            }
+        })
+        .await
+        .ok()
+        .unwrap();
+
+        assert_eq!(result, MAX_OCC_RETRIES + 1);
+    }
+
+    #[tokio::test]
+    async fn occ_retry_exhaustion_is_conflict() {
+        // A persistently conflicting attempt is bounded: after the retries are
+        // spent the caller gets a 409, never an unbounded loop.
+        let calls = std::cell::Cell::new(0u32);
+        let calls = &calls;
+        let err = with_occ_retry(move || async move {
+            calls.set(calls.get().saturating_add(1));
+            Ok::<OccAttempt<()>, AppError>(OccAttempt::Retry)
+        })
+        .await
+        .err()
+        .unwrap();
+
+        assert!(matches!(err, AppError::Conflict(_)));
+        // Initial attempt + MAX_OCC_RETRIES re-runs.
+        assert_eq!(calls.get(), MAX_OCC_RETRIES + 1);
+    }
+
+    #[tokio::test]
+    async fn occ_retry_propagates_domain_errors_immediately() {
+        // A domain error from the attempt (403/404/409 from re-validation) is
+        // returned as-is, not retried — only version conflicts re-run.
+        let calls = std::cell::Cell::new(0u32);
+        let calls = &calls;
+        let err = with_occ_retry(move || async move {
+            calls.set(calls.get().saturating_add(1));
+            Err::<OccAttempt<()>, AppError>(AppError::Forbidden("ownership mismatch".into()))
+        })
+        .await
+        .err()
+        .unwrap();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+        assert_eq!(calls.get(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // warmup-report tests
+    // -----------------------------------------------------------------------
+
+    fn sample_report() -> WarmupReportRequest {
+        WarmupReportRequest {
+            docker_start_ms: 850,
+            freshen_total_ms: 12_000,
+            total_ms: 13_500,
+            workspace_present: true,
+            repos: vec![devbox_common::RepoFreshenReport {
+                repo: "devbox".to_string(),
+                success: true,
+                duration_ms: 11_000,
+                error: None,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn warmup_report_persists_on_devbox_doc() {
+        // pool_agent()'s instance id matches ready_devbox()'s, so the report
+        // resolves to that doc and lands on its warmup_report field.
+        let state = setup_state().await;
+        let id = insert(&state, ready_devbox()).await;
+
+        record_warmup_report(&state, &pool_agent(), &sample_report())
+            .await
+            .ok()
+            .unwrap();
+
+        let doc = state.store.get::<DevboxDoc>(&id).await.unwrap().unwrap();
+        let report = doc.data.warmup_report.unwrap();
+        assert_eq!(report.docker_start_ms, 850);
+        assert_eq!(report.freshen_total_ms, 12_000);
+        assert_eq!(report.total_ms, 13_500);
+        assert!(report.workspace_present);
+        assert_eq!(report.repos.len(), 1);
+        assert_eq!(report.repos.first().unwrap().repo, "devbox");
+        // reported_at is stamped from the server clock at receive time.
+        assert!(report.reported_at <= Timestamp::now());
+    }
+
+    #[tokio::test]
+    async fn warmup_report_unknown_instance_is_not_found() {
+        // No DevboxDoc for the calling instance (not yet adopted, or already
+        // reaped) → 404, so the agent's best-effort send logs and moves on.
+        let state = setup_state().await;
+
+        let err = record_warmup_report(&state, &pool_agent(), &sample_report())
+            .await
+            .err()
+            .unwrap();
+
+        assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn warmup_report_builder_role_is_forbidden() {
+        // Snapshot-builder hosts authenticate on the same path but have no
+        // DevboxDoc; they must be rejected up front, not fall through to a 404.
+        let state = setup_state().await;
+        insert(&state, ready_devbox()).await;
+        let builder = AgentIdentity {
+            instance_id: InstanceId("i-1234567890abcdef0".to_string()),
+            role: AgentRole::Builder,
+            owner: None,
+        };
+
+        let err = record_warmup_report(&state, &builder, &sample_report())
+            .await
+            .err()
+            .unwrap();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn warmup_report_overwrites_previous_report() {
+        // A box warms once per life, so a second report is a re-run replacing
+        // the first (last-writer-wins), not a merge.
+        let state = setup_state().await;
+        let id = insert(&state, ready_devbox()).await;
+
+        record_warmup_report(&state, &pool_agent(), &sample_report())
+            .await
+            .ok()
+            .unwrap();
+        let mut second = sample_report();
+        second.total_ms = 99_000;
+        record_warmup_report(&state, &pool_agent(), &second)
+            .await
+            .ok()
+            .unwrap();
+
+        let doc = state.store.get::<DevboxDoc>(&id).await.unwrap().unwrap();
+        assert_eq!(doc.data.warmup_report.unwrap().total_ms, 99_000);
+    }
+
+    #[tokio::test]
+    async fn warmup_report_bounds_oversized_input() {
+        // The stored report is size-bounded at the trust boundary: repo entries
+        // capped, error strings truncated — a misbehaving host cannot grow the
+        // document row without bound.
+        let state = setup_state().await;
+        let id = insert(&state, ready_devbox()).await;
+
+        let mut report = sample_report();
+        report.repos = (0..100)
+            .map(|i| devbox_common::RepoFreshenReport {
+                repo: format!("repo-{i}"),
+                success: false,
+                duration_ms: 1,
+                error: Some("e".repeat(10_000)),
+            })
+            .collect();
+        record_warmup_report(&state, &pool_agent(), &report)
+            .await
+            .ok()
+            .unwrap();
+
+        let doc = state.store.get::<DevboxDoc>(&id).await.unwrap().unwrap();
+        let stored = doc.data.warmup_report.unwrap();
+        assert_eq!(stored.repos.len(), 64, "repo entries must be capped");
+        let first_error = stored
+            .repos
+            .first()
+            .unwrap()
+            .error
+            .as_deref()
+            .unwrap()
+            .chars()
+            .count();
+        assert_eq!(first_error, 256, "error strings must be truncated");
     }
 
     // -----------------------------------------------------------------------

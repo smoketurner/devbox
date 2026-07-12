@@ -318,6 +318,7 @@ mod reconcile_tests {
             claimed_at: None,
             created_at: past,
             owner_tag_applied: false,
+            warmup_report: None,
         };
         let claimed_doc = DevboxDoc {
             instance_id: claimed_id.clone(),
@@ -333,6 +334,7 @@ mod reconcile_tests {
             claimed_at: None,
             created_at: past,
             owner_tag_applied: false,
+            warmup_report: None,
         };
 
         store.insert(&ready_doc).await.unwrap();
@@ -386,6 +388,7 @@ mod reconcile_tests {
             claimed_at: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
+            warmup_report: None,
         };
         // A timed-out, unready Warming box the reaper would normally reap.
         let past = Timestamp::from_second(0).unwrap();
@@ -403,6 +406,7 @@ mod reconcile_tests {
             claimed_at: None,
             created_at: past,
             owner_tag_applied: false,
+            warmup_report: None,
         };
         store.insert(&claimed_doc).await.unwrap();
         store.insert(&warming_doc).await.unwrap();
@@ -458,6 +462,7 @@ mod reconcile_tests {
             claimed_at: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
+            warmup_report: None,
         };
         store.insert(&claimed_doc).await.unwrap();
 
@@ -511,6 +516,7 @@ mod reconcile_tests {
             claimed_at: None,
             created_at: past,
             owner_tag_applied: false,
+            warmup_report: None,
         };
         store.insert(&warming_doc).await.unwrap();
 
@@ -567,6 +573,7 @@ mod reconcile_tests {
             claimed_at: None,
             created_at: Timestamp::now(),
             owner_tag_applied: true,
+            warmup_report: None,
         };
         store.insert(&claimed_doc).await.unwrap();
 
@@ -628,6 +635,7 @@ mod reconcile_tests {
             claimed_at: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
+            warmup_report: None,
         };
         store.insert(&claimed_doc).await.unwrap();
 
@@ -686,6 +694,7 @@ mod reconcile_tests {
             claimed_at: None,
             created_at: Timestamp::now(),
             owner_tag_applied: true,
+            warmup_report: None,
         };
         store.insert(&claimed_doc).await.unwrap();
 
@@ -747,6 +756,7 @@ mod reconcile_tests {
             claimed_at: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
+            warmup_report: None,
         };
         store.insert(&ready_doc).await.unwrap();
 
@@ -793,6 +803,7 @@ mod reconcile_tests {
             claimed_at: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
+            warmup_report: None,
         };
         store.insert(&claimed_doc).await.unwrap();
 

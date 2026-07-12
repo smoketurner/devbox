@@ -8,7 +8,7 @@
 //!
 //! The fetch is **read-only** — the agent requests a short-lived, repo-scoped
 //! token per repo from the control plane, which mints it from each repo's `origin`
-//! (see [`crate::server_client`]) — and
+//! (see [`crate::control_plane`]) — and
 //! **time-budgeted**: if the delta is too large to land within the budget, the box
 //! still becomes Ready serving the snapshot-age checkout (degrade, don't reap) — a
 //! slightly-stale box beats no box, and the claimant can fetch HEAD themselves. An
@@ -20,13 +20,18 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use devbox_common::RepoFreshenReport;
 use tokio::process::Command;
 
-use crate::git::{build_minter, run_git};
-use crate::server_client::ServerTokenClient;
+use crate::control_plane::ControlPlaneClient;
+use crate::git::run_git;
 
 /// Where the snapshot-seeded repositories live.
 const WORKSPACE: &str = "/workspace";
+
+/// Bound on a reported per-repo error string, in characters (the server bounds
+/// again at its trust boundary; this just keeps the request body small).
+const MAX_ERROR_CHARS: usize = 256;
 
 /// Environment variable overriding the overall fetch time budget, in seconds.
 const BUDGET_ENV: &str = "WARMUP_FETCH_TIMEOUT_SECS";
@@ -44,28 +49,51 @@ const MIN_STEP: Duration = Duration::from_secs(1);
 /// while the working-tree reset is skipped.
 const LOCAL_GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Aggregate outcome of the freshen phase, for the warm-up report.
+pub(crate) struct FreshenOutcome {
+    /// Per-repo results, one entry per repo found under `/workspace`.
+    pub repos: Vec<RepoFreshenReport>,
+    /// Wall time of the whole phase (token minting + fetch loop).
+    pub total: Duration,
+    /// Whether `/workspace` held at least one repo. `false` means the
+    /// snapshot-seeded volume didn't deliver (or the box has no workspace).
+    pub workspace_present: bool,
+}
+
 /// Freshen every repository under `/workspace`.
 ///
 /// Each repo is fetched and hard-reset to its upstream HEAD within the shared time
 /// budget; a repo that errors or times out is left at its snapshot-age state and
-/// logged. An absent or empty `/workspace` simply skips freshening.
-pub(crate) async fn freshen_workspace() {
+/// logged. An absent or empty `/workspace` simply skips freshening. The returned
+/// [`FreshenOutcome`] feeds the warm-up report; freshening itself never fails
+/// warm-up (degrade, don't reap).
+///
+/// `client` is the caller's control-plane client (`None` when the box isn't
+/// configured for it), borrowed rather than built here so the same cached
+/// web-identity JWT serves both the token minting and the warm-up report.
+pub(crate) async fn freshen_workspace(
+    mut client: Option<&mut ControlPlaneClient>,
+) -> FreshenOutcome {
+    let phase_start = Instant::now();
     let repos = repos_under(Path::new(WORKSPACE));
     if repos.is_empty() {
         tracing::info!(
             workspace = WORKSPACE,
             "no repositories to freshen; skipping"
         );
-        return;
+        return FreshenOutcome {
+            repos: Vec::new(),
+            total: phase_start.elapsed(),
+            workspace_present: false,
+        };
     }
 
-    let mut minter = build_minter().await;
     // Resolve a token per repo *before* starting the fetch timer, so installation
     // discovery/mint latency is not charged against the budget — only the git fetch
     // is. Tokens last an hour, well beyond the fetch loop.
     let mut tokens = Vec::with_capacity(repos.len());
     for repo in &repos {
-        tokens.push(repo_token(minter.as_mut(), repo).await);
+        tokens.push(repo_token(client.as_deref_mut(), repo).await);
     }
 
     // One shared budget. Each git op is given the time *left* in it (see `run_git`),
@@ -74,8 +102,12 @@ pub(crate) async fn freshen_workspace() {
     // until the reaper kills the box.
     let start = Instant::now();
     let budget = fetch_budget();
+    let mut reports = Vec::with_capacity(repos.len());
     for (repo, token) in repos.iter().zip(&tokens) {
-        match freshen_repo(repo, token.as_deref(), start, budget).await {
+        let repo_start = Instant::now();
+        let result = freshen_repo(repo, token.as_deref(), start, budget).await;
+        let duration_ms = millis_u64(repo_start.elapsed());
+        match &result {
             Ok(()) => tracing::info!(repo = %repo.display(), "freshened to upstream HEAD"),
             Err(e) => tracing::warn!(
                 repo = %repo.display(),
@@ -83,7 +115,40 @@ pub(crate) async fn freshen_workspace() {
                 "stopped freshening repo; serving snapshot-age checkout"
             ),
         }
+        reports.push(RepoFreshenReport {
+            repo: dir_name(repo),
+            success: result.is_ok(),
+            duration_ms,
+            error: result
+                .err()
+                .map(|e| truncate_chars(&format!("{e:#}"), MAX_ERROR_CHARS)),
+        });
     }
+    FreshenOutcome {
+        repos: reports,
+        total: phase_start.elapsed(),
+        workspace_present: true,
+    }
+}
+
+/// A duration as u64 milliseconds, saturating at `u64::MAX` (`as_millis` is
+/// u128; the no-`as`-cast lint wants an explicit, non-truncating conversion).
+pub(crate) fn millis_u64(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The repo's directory name under `/workspace` (final path component), falling
+/// back to the full path display for pathological paths.
+fn dir_name(repo: &Path) -> String {
+    repo.file_name().map_or_else(
+        || repo.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    )
+}
+
+/// The first `max` characters of `s` (char-boundary-safe truncation).
+fn truncate_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
 }
 
 /// Git repositories directly under `root`: `root` itself if it is a repo, otherwise
@@ -196,11 +261,11 @@ fn remove_lock_files(dir: &Path, recurse: bool) {
 }
 
 /// A read-only token for `repo`'s `origin` owner, or `None` to fetch unauthenticated
-/// (no minter, no/non-GitHub remote, or the App isn't installed on the owner).
-async fn repo_token(minter: Option<&mut ServerTokenClient>, repo: &Path) -> Option<String> {
-    let minter = minter?;
+/// (no client, no/non-GitHub remote, or the App isn't installed on the owner).
+async fn repo_token(client: Option<&mut ControlPlaneClient>, repo: &Path) -> Option<String> {
+    let client = client?;
     let url = repo_origin_url(repo).await?;
-    match minter.token_for(&url).await {
+    match client.token_for(&url).await {
         Ok(Some(token)) => Some(token),
         Ok(None) => {
             tracing::debug!(
@@ -260,8 +325,8 @@ fn parse_budget(value: Option<&str>) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_BUDGET, Duration, Instant, Path, PathBuf, clear_stale_locks, parse_budget,
-        repos_under, step_timeout,
+        DEFAULT_BUDGET, Duration, Instant, Path, PathBuf, clear_stale_locks, dir_name, millis_u64,
+        parse_budget, repos_under, step_timeout, truncate_chars,
     };
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -370,6 +435,30 @@ mod tests {
         assert_eq!(parse_budget(None), DEFAULT_BUDGET);
         assert_eq!(parse_budget(Some("0")), DEFAULT_BUDGET);
         assert_eq!(parse_budget(Some("nonsense")), DEFAULT_BUDGET);
+    }
+
+    #[test]
+    fn millis_u64_converts_and_saturates() {
+        assert_eq!(millis_u64(Duration::from_millis(1500)), 1500);
+        assert_eq!(millis_u64(Duration::ZERO), 0);
+        // A duration whose millis exceed u64 saturates instead of truncating.
+        assert_eq!(millis_u64(Duration::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn dir_name_takes_the_final_path_component() {
+        assert_eq!(dir_name(Path::new("/workspace/devbox")), "devbox");
+        assert_eq!(dir_name(Path::new("relative/repo")), "repo");
+        // Pathological path with no final component falls back to the display form.
+        assert_eq!(dir_name(Path::new("/")), "/");
+    }
+
+    #[test]
+    fn truncate_chars_is_codepoint_safe() {
+        assert_eq!(truncate_chars("short", 10), "short");
+        assert_eq!(truncate_chars("abcdef", 3), "abc");
+        // Multi-byte chars: the bound is characters, and no codepoint is split.
+        assert_eq!(truncate_chars("ééééé", 3), "ééé");
     }
 
     #[test]
