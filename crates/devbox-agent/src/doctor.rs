@@ -190,7 +190,7 @@ fn report_repos(rustup_home: &str) {
 
 /// The `channel` pinned in a repo's `rust-toolchain.toml`, if present. A minimal
 /// line parse — avoids a TOML dependency for one well-known field.
-fn pinned_toolchain(repo: &Path) -> Option<String> {
+pub(crate) fn pinned_toolchain(repo: &Path) -> Option<String> {
     let text = std::fs::read_to_string(repo.join("rust-toolchain.toml")).ok()?;
     text.lines().find_map(|line| {
         let line = line.trim();
@@ -202,7 +202,7 @@ fn pinned_toolchain(repo: &Path) -> Option<String> {
 
 /// Whether a toolchain whose name begins with `channel-` exists under
 /// `$RUSTUP_HOME/toolchains` (installed dirs are `1.97.0-aarch64-...`).
-fn toolchain_installed(rustup_home: &str, channel: &str) -> bool {
+pub(crate) fn toolchain_installed(rustup_home: &str, channel: &str) -> bool {
     if rustup_home.is_empty() {
         return false;
     }

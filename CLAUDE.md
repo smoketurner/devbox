@@ -213,7 +213,7 @@ in-memory SQLite.
 | `POST /api/v1/devboxes/claim` | Claim a Ready devbox (body: optional `name` override; `owner` from token) |
 | `POST /api/v1/devboxes/{id}/release` | Release a Claimed devbox (no body; `owner` from token) |
 | `POST /api/v1/devboxes/{id}/rename` | Rename a Claimed devbox (body: `name`; `owner` from token) |
-| `GET /api/v1/pool/metrics` | Pool counts vs target |
+| `GET /api/v1/pool/metrics` | Pool counts by state, plus `warm` (Ready/Claimed boxes whose warm-up report says the caches were warm) |
 | `GET /` | HTML dashboard |
 
 ## Status: implemented vs planned
@@ -229,7 +229,13 @@ freshens the snapshot-seeded repos under `/workspace`
 below for the infra half), then self-sets `devbox:ready=true` via `ec2:CreateTags`; the reconciler flips
 `DevboxDoc` `Warming → Ready` on that tag; boxes that never tag ready within
 `ready_timeout` (`POOL_READY_TIMEOUT_SECS`, default 300 s, validated 60–3600 s) are
-terminated and the ASG relaunches them. **SSH/Vouch-CA path:** `devbox-agent` (principals resolver
+terminated and the ASG relaunches them. **Warmth is measured, not assumed:**
+`devbox-agent warmup` probes the caches at the end of warm-up (repos under
+`/workspace`, built `target/`, pinned toolchains installed — reusing `doctor`'s
+checks) and reports a `warm` flag with its timings to
+`POST /api/v1/agent/warmup-report`; the reconciler stamps `ready_at` on the
+`Warming → Ready` flip; `/api/v1/pool/metrics` counts warm Ready/Claimed boxes
+and the dashboard shows warm/cold per box. **SSH/Vouch-CA path:** `devbox-agent` (principals resolver
 + per-principal account provisioning + warmup) baked into the AMI; Terraform `pool`
 module provides the host instance profile (SSM core + `ec2:CreateTags` for
 `devbox:ready`), `InstanceMetadataTags=enabled`, and sshd `AuthorizedPrincipalsCommand`

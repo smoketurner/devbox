@@ -17,7 +17,7 @@ use crate::auth::{Principal, SessionUser, random_token};
 use crate::db::document_type::Document;
 use crate::documents::devbox::DevboxDoc;
 use crate::routes::{AppState, SharedState};
-use devbox_common::format_timestamp;
+use devbox_common::{DevboxState, format_timestamp};
 
 /// Cookie holding the Vouch OIDC ID token after a successful dashboard login.
 const SESSION_COOKIE: &str = "devbox_session";
@@ -166,6 +166,25 @@ pub struct DashboardDevbox {
     pub instance_id: String,
     pub owner: String,
     pub created_at: String,
+    /// Warmth label: `warm`, `cold`, or `—` (see [`warmth_label`]).
+    pub warm: &'static str,
+}
+
+/// The warmth label for a box: a claimable/claimed box is either `warm` (its
+/// warm-up report says the caches were warm) or `cold` (report says cold, or no
+/// report arrived — an older agent reads as cold, not unknown). States where
+/// warmth is meaningless (Launching/Warming/Terminating) render `—`.
+fn warmth_label(doc: &DevboxDoc) -> &'static str {
+    match doc.state {
+        DevboxState::Ready | DevboxState::Claimed => {
+            if doc.warmup_report.as_ref().is_some_and(|r| r.warm) {
+                "warm"
+            } else {
+                "cold"
+            }
+        }
+        DevboxState::Launching | DevboxState::Warming | DevboxState::Terminating => "—",
+    }
 }
 
 // ============================================================================
@@ -406,6 +425,7 @@ async fn dashboard(State(state): State<SharedState>, headers: HeaderMap) -> Resp
                     instance_id: doc.data.instance_id.clone(),
                     owner: doc.data.owner.clone().unwrap_or_default(),
                     created_at: format_timestamp(doc.created_at),
+                    warm: warmth_label(&doc.data),
                 })
                 .collect();
             DashboardTemplate {
@@ -622,5 +642,60 @@ mod tests {
         assert!(set.contains("SameSite=Lax"));
         assert!(set.contains("Path=/"));
         assert!(set_cookie(SESSION_COOKIE, "", 0).contains("Max-Age=0"));
+    }
+
+    #[test]
+    fn warmth_label_by_state_and_report() {
+        use crate::documents::devbox::WarmupReport;
+        use devbox_common::{AmiId, InstanceType, SubnetId, WarmupReportRequest};
+        use jiff::Timestamp;
+
+        let doc = |state: DevboxState, warm: Option<bool>| DevboxDoc {
+            instance_id: "i-1234567890abcdef0".to_string(),
+            name: "calm-quilt".to_string(),
+            state,
+            instance_type: InstanceType("m5.large".to_string()),
+            ami_id: AmiId("ami-12345678".to_string()),
+            subnet_id: SubnetId("subnet-12345678".to_string()),
+            region: "us-east-1".to_string(),
+            ebs_volume_id: None,
+            owner: None,
+            owner_email: None,
+            claimed_at: None,
+            ready_at: None,
+            created_at: Timestamp::now(),
+            owner_tag_applied: false,
+            warmup_report: warm.map(|warm| {
+                WarmupReport::from_request(
+                    &WarmupReportRequest {
+                        docker_start_ms: 1,
+                        freshen_total_ms: 2,
+                        total_ms: 3,
+                        workspace_present: warm,
+                        repos: Vec::new(),
+                        warm,
+                    },
+                    Timestamp::now(),
+                )
+            }),
+        };
+
+        let cases = [
+            (DevboxState::Ready, Some(true), "warm"),
+            (DevboxState::Claimed, Some(true), "warm"),
+            (DevboxState::Ready, Some(false), "cold"),
+            (DevboxState::Ready, None, "cold"),
+            (DevboxState::Claimed, None, "cold"),
+            (DevboxState::Launching, Some(true), "—"),
+            (DevboxState::Warming, Some(true), "—"),
+            (DevboxState::Terminating, Some(true), "—"),
+        ];
+        for (state, warm, expected) in cases {
+            assert_eq!(
+                warmth_label(&doc(state, warm)),
+                expected,
+                "state={state:?} warm={warm:?}"
+            );
+        }
     }
 }

@@ -262,6 +262,7 @@ async fn sync_docs_with_asg(
             owner: None,
             owner_email: None,
             claimed_at: None,
+            ready_at: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
             warmup_report: None,
@@ -308,6 +309,10 @@ async fn handle_warming_instances(
 
         let mut updated_doc = doc.data.clone();
         updated_doc.state = DevboxState::Ready;
+        // The claim-to-ready dwell (and the deferred claim-to-first-build
+        // metric) needs the moment the box became claimable; state alone
+        // doesn't record it.
+        updated_doc.ready_at = Some(Timestamp::now());
 
         match store
             .compare_and_update(&doc.id, doc.version, &updated_doc)

@@ -517,6 +517,7 @@ pub(crate) async fn pool_metrics(state: &AppState) -> Result<PoolMetricsResponse
     let mut ready = 0u32;
     let mut claimed = 0u32;
     let mut terminating = 0u32;
+    let mut warm = 0u32;
 
     for doc in &docs {
         match doc.data.state {
@@ -526,6 +527,13 @@ pub(crate) async fn pool_metrics(state: &AppState) -> Result<PoolMetricsResponse
             DevboxState::Claimed => claimed = claimed.saturating_add(1),
             DevboxState::Terminating => terminating = terminating.saturating_add(1),
         }
+        // Warmth is only meaningful for claimable/claimed boxes: Warming can't
+        // have a report yet and Terminating is leaving the pool.
+        if matches!(doc.data.state, DevboxState::Ready | DevboxState::Claimed)
+            && doc.data.warmup_report.as_ref().is_some_and(|r| r.warm)
+        {
+            warm = warm.saturating_add(1);
+        }
     }
 
     Ok(PoolMetricsResponse {
@@ -533,6 +541,7 @@ pub(crate) async fn pool_metrics(state: &AppState) -> Result<PoolMetricsResponse
         ready,
         claimed,
         terminating,
+        warm,
     })
 }
 
@@ -595,6 +604,7 @@ mod tests {
             owner: Some(owner.to_string()),
             owner_email: Some(format!("{owner}@example.com")),
             claimed_at: Some(Timestamp::now()),
+            ready_at: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
             warmup_report: None,
@@ -654,6 +664,7 @@ mod tests {
             owner: None,
             owner_email: None,
             claimed_at: None,
+            ready_at: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
             warmup_report: None,
@@ -781,6 +792,7 @@ mod tests {
                 duration_ms: 11_000,
                 error: None,
             }],
+            warm: true,
         }
     }
 
@@ -804,8 +816,65 @@ mod tests {
         assert!(report.workspace_present);
         assert_eq!(report.repos.len(), 1);
         assert_eq!(report.repos.first().unwrap().repo, "devbox");
+        assert!(report.warm);
         // reported_at is stamped from the server clock at receive time.
         assert!(report.reported_at <= Timestamp::now());
+    }
+
+    // -----------------------------------------------------------------------
+    // pool-metrics tests
+    // -----------------------------------------------------------------------
+
+    /// `warm` counts only Ready/Claimed boxes whose report says warm: a cold
+    /// report and a warm-but-still-Warming box are both excluded.
+    #[tokio::test]
+    async fn pool_metrics_counts_states_and_warm_boxes() {
+        let state = setup_state().await;
+        let now = Timestamp::now();
+        let warm_report = || WarmupReport::from_request(&sample_report(), now);
+
+        let mut warm_ready = ready_devbox();
+        warm_ready.warmup_report = Some(warm_report());
+        insert(&state, warm_ready).await;
+
+        let mut cold_request = sample_report();
+        cold_request.warm = false;
+        let mut cold_ready = ready_devbox_other();
+        cold_ready.warmup_report = Some(WarmupReport::from_request(&cold_request, now));
+        insert(&state, cold_ready).await;
+
+        let mut still_warming = ready_devbox();
+        still_warming.instance_id = "i-warming000000000".to_string();
+        still_warming.name = "witty-yak".to_string();
+        still_warming.state = DevboxState::Warming;
+        still_warming.warmup_report = Some(warm_report());
+        insert(&state, still_warming).await;
+
+        let mut warm_claimed = claimed_devbox_for("jdoe");
+        warm_claimed.instance_id = "i-claimed000000000".to_string();
+        warm_claimed.name = "brave-fox".to_string();
+        warm_claimed.warmup_report = Some(warm_report());
+        insert(&state, warm_claimed).await;
+
+        let metrics = pool_metrics(&state).await.ok().unwrap();
+
+        assert_eq!(metrics.ready, 2);
+        assert_eq!(metrics.warming, 1);
+        assert_eq!(metrics.claimed, 1);
+        assert_eq!(metrics.terminating, 0);
+        assert_eq!(metrics.warm, 2);
+    }
+
+    /// Boxes without a report (older agent, lost report) never count as warm.
+    #[tokio::test]
+    async fn pool_metrics_unreported_boxes_are_not_warm() {
+        let state = setup_state().await;
+        insert(&state, ready_devbox()).await;
+
+        let metrics = pool_metrics(&state).await.ok().unwrap();
+
+        assert_eq!(metrics.ready, 1);
+        assert_eq!(metrics.warm, 0);
     }
 
     #[tokio::test]
