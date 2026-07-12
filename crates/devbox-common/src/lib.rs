@@ -556,6 +556,11 @@ pub struct WarmupReportRequest {
     /// Per-repo freshen outcomes.
     #[serde(default)]
     pub repos: Vec<RepoFreshenReport>,
+    /// Whether the box's caches were warm at the end of warm-up: at least one
+    /// repo under `/workspace`, each with a built `target/`, and every pinned
+    /// toolchain installed. Absent (false) from agents that predate the probe.
+    #[serde(default)]
+    pub warm: bool,
 }
 
 /// Response body for `POST /api/v1/agent/warmup-report`. Currently empty; a
@@ -843,6 +848,16 @@ mod tests {
         let parsed: PoolMetricsResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.warming, 2);
         assert_eq!(parsed.terminating, 5);
+    }
+
+    #[test]
+    fn warmup_report_request_without_warm_defaults_to_false() {
+        // A report from an agent that predates the probe must still parse.
+        let json =
+            r#"{"docker_start_ms":1,"freshen_total_ms":2,"total_ms":3,"workspace_present":true}"#;
+        let parsed: WarmupReportRequest = serde_json::from_str(json).unwrap();
+        assert!(!parsed.warm);
+        assert!(parsed.repos.is_empty());
     }
 
     #[test]

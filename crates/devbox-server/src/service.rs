@@ -781,6 +781,7 @@ mod tests {
                 duration_ms: 11_000,
                 error: None,
             }],
+            warm: true,
         }
     }
 

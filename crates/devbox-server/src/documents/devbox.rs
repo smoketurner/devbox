@@ -298,6 +298,7 @@ mod tests {
                     error: Some("é".repeat(MAX_REPORT_ERROR_CHARS + 50)),
                 })
                 .collect(),
+            warm: false,
         };
 
         let stored = WarmupReport::from_request(&req, Timestamp::now());

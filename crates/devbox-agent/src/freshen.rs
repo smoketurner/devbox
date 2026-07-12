@@ -153,7 +153,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
 
 /// Git repositories directly under `root`: `root` itself if it is a repo, otherwise
 /// each immediate child directory containing a `.git` entry. Sorted for determinism.
-fn repos_under(root: &Path) -> Vec<PathBuf> {
+pub(crate) fn repos_under(root: &Path) -> Vec<PathBuf> {
     if root.join(".git").exists() {
         return vec![root.to_path_buf()];
     }
