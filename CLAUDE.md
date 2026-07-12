@@ -316,7 +316,7 @@ are tagged inline):
   the agent authenticates to devbox-server with an AWS web-identity token (STS
   `GetWebIdentityToken`, IAM Outbound Identity Federation — no static secret on the box),
   and the server mints a short-lived, repo-scoped GitHub App installation token and returns
-  it to the agent (see `crates/devbox-agent/src/server_client.rs`). The GitHub App private
+  it to the agent (see `crates/devbox-agent/src/control_plane.rs`). The GitHub App private
   key lives only on the control plane, read from an SSM SecureString by the server; the host
   needs only `sts:GetWebIdentityToken` and egress to `api.github.com`. The fetch is
   time-budgeted (`WARMUP_FETCH_TIMEOUT_SECS`, default 120 s) and **degrades, does not reap** —

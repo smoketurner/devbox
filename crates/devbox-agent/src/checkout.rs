@@ -5,7 +5,7 @@
 //! with `git gc`. Run by the snapshot-builder pipeline to seed the EBS workspace
 //! volume before a new AMI is cut, and by a developer or agent on a claimed box to
 //! add a repo under `/workspace`. Tokens are fetched from the control plane (see
-//! [`crate::server_client`]); `DEVBOX_SERVER_URL` is read from the environment.
+//! [`crate::control_plane`]); `DEVBOX_SERVER_URL` is read from the environment.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use crate::git::{build_server_client, run_git, run_git_clone};
-use crate::server_client::ServerClient;
+use crate::control_plane::ControlPlaneClient;
+use crate::git::{control_plane_client, run_git, run_git_clone};
 
 /// Time budget for a single `git clone` operation.
 const CLONE_TIMEOUT: Duration = Duration::from_mins(10);
@@ -69,7 +69,7 @@ pub(crate) async fn run(workspace: &Path, repos: &[String]) -> Result<()> {
         }
     }
 
-    let mut client = build_server_client().await;
+    let mut client = control_plane_client().await;
 
     for (url, name) in repos.iter().zip(&dest_names) {
         let dest = workspace.join(name);
@@ -140,7 +140,7 @@ fn dest_name(url: &str) -> Option<String> {
 
 /// Resolve a read-only token for `url` via the control-plane client, logging at the
 /// appropriate level when unavailable so the caller can proceed unauthenticated.
-async fn resolve_token(client: Option<&mut ServerClient>, url: &str) -> Option<String> {
+async fn resolve_token(client: Option<&mut ControlPlaneClient>, url: &str) -> Option<String> {
     let client = client?;
     match client.token_for(url).await {
         Ok(Some(token)) => Some(token),

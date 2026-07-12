@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tokio::process::Command;
 
-use crate::server_client::ServerClient;
+use crate::control_plane::ControlPlaneClient;
 
 /// Env var the credential helper reads the token from. The agent sets it on the
 /// git child process — the token is never baked into the binary, logged, or placed
@@ -65,8 +65,8 @@ pub(crate) async fn run_git_clone(
 /// Build the control-plane agent-API client from the environment, or `None` when
 /// the box is not configured for it (`DEVBOX_SERVER_URL` unset). Degrades
 /// gracefully so callers can proceed unauthenticated.
-pub(crate) async fn build_server_client() -> Option<ServerClient> {
-    match ServerClient::new().await {
+pub(crate) async fn control_plane_client() -> Option<ControlPlaneClient> {
+    match ControlPlaneClient::new().await {
         Ok(Some(client)) => Some(client),
         Ok(None) => {
             tracing::warn!(

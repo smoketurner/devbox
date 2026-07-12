@@ -8,7 +8,7 @@
 //!
 //! The fetch is **read-only** — the agent requests a short-lived, repo-scoped
 //! token per repo from the control plane, which mints it from each repo's `origin`
-//! (see [`crate::server_client`]) — and
+//! (see [`crate::control_plane`]) — and
 //! **time-budgeted**: if the delta is too large to land within the budget, the box
 //! still becomes Ready serving the snapshot-age checkout (degrade, don't reap) — a
 //! slightly-stale box beats no box, and the claimant can fetch HEAD themselves. An
@@ -23,8 +23,8 @@ use anyhow::{Context, Result};
 use devbox_common::RepoFreshenReport;
 use tokio::process::Command;
 
+use crate::control_plane::ControlPlaneClient;
 use crate::git::run_git;
-use crate::server_client::ServerClient;
 
 /// Where the snapshot-seeded repositories live.
 const WORKSPACE: &str = "/workspace";
@@ -71,7 +71,9 @@ pub(crate) struct FreshenOutcome {
 /// `client` is the caller's control-plane client (`None` when the box isn't
 /// configured for it), borrowed rather than built here so the same cached
 /// web-identity JWT serves both the token minting and the warm-up report.
-pub(crate) async fn freshen_workspace(mut client: Option<&mut ServerClient>) -> FreshenOutcome {
+pub(crate) async fn freshen_workspace(
+    mut client: Option<&mut ControlPlaneClient>,
+) -> FreshenOutcome {
     let phase_start = Instant::now();
     let repos = repos_under(Path::new(WORKSPACE));
     if repos.is_empty() {
@@ -260,7 +262,7 @@ fn remove_lock_files(dir: &Path, recurse: bool) {
 
 /// A read-only token for `repo`'s `origin` owner, or `None` to fetch unauthenticated
 /// (no client, no/non-GitHub remote, or the App isn't installed on the owner).
-async fn repo_token(client: Option<&mut ServerClient>, repo: &Path) -> Option<String> {
+async fn repo_token(client: Option<&mut ControlPlaneClient>, repo: &Path) -> Option<String> {
     let client = client?;
     let url = repo_origin_url(repo).await?;
     match client.token_for(&url).await {

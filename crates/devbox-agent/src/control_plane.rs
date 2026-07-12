@@ -14,7 +14,7 @@
 //!   web-identity token is minted for; it must equal the server's
 //!   `DEVBOX_AGENT_AUDIENCE` (trailing slashes are trimmed on both sides). When
 //!   unset the agent is not configured for the server-backed agent API
-//!   ([`ServerClient::new`] returns `Ok(None)`) and callers degrade (fetch
+//!   ([`ControlPlaneClient::new`] returns `Ok(None)`) and callers degrade (fetch
 //!   unauthenticated, skip reporting).
 
 use std::collections::HashMap;
@@ -51,7 +51,7 @@ const STS_TIMEOUT: Duration = Duration::from_secs(20);
 ///
 /// GitHub tokens are cached **per remote**, not per owner: each is scoped to a
 /// single repository, so it cannot be reused across remotes.
-pub(crate) struct ServerClient {
+pub(crate) struct ControlPlaneClient {
     http: reqwest::Client,
     sts: aws_sdk_sts::Client,
     /// Trimmed control-plane base URL. Also the audience the web-identity token
@@ -63,7 +63,7 @@ pub(crate) struct ServerClient {
     git_tokens: HashMap<String, String>,
 }
 
-impl ServerClient {
+impl ControlPlaneClient {
     /// Build a client, or `Ok(None)` when the box is not configured for the
     /// server-backed agent API (`DEVBOX_SERVER_URL` unset).
     ///

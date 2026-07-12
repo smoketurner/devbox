@@ -19,9 +19,9 @@ use aws_sdk_ec2::config::Region;
 use aws_sdk_ec2::types::Tag;
 use devbox_common::WarmupReportRequest;
 
+use crate::control_plane::ControlPlaneClient;
 use crate::freshen::{self, FreshenOutcome, millis_u64};
 use crate::imds;
-use crate::server_client::ServerClient;
 
 /// Run warm-up and self-tag the instance `devbox:ready=true`.
 ///
@@ -54,7 +54,7 @@ pub(crate) async fn run() -> Result<()> {
 
     // One client for both the freshen token minting and the warm-up report, so
     // the cached web-identity JWT is minted once.
-    let mut client = crate::git::build_server_client().await;
+    let mut client = crate::git::control_plane_client().await;
     let freshen = freshen::freshen_workspace(client.as_mut()).await;
 
     let ec2_client = ec2_client(region).await;
@@ -73,7 +73,7 @@ pub(crate) async fn run() -> Result<()> {
 /// that predates the endpoint is logged at info and tolerated (the agent binary
 /// reaches infra via a new AMI, so it may briefly run ahead of the server).
 async fn report_warmup(
-    client: Option<&mut ServerClient>,
+    client: Option<&mut ControlPlaneClient>,
     docker_start_ms: u64,
     freshen: &FreshenOutcome,
     warmup_start: Instant,
