@@ -28,6 +28,7 @@
                         <th class="table-header">Name</th>
                         <th class="table-header">Instance ID</th>
                         <th class="table-header">State</th>
+                        <th class="table-header">Warm</th>
                         <th class="table-header">Instance Type</th>
                         <th class="table-header">Owner</th>
                         <th class="table-header">Created</th>
@@ -39,6 +40,7 @@
                         <td class="table-cell font-medium text-white">{{ devbox.name }}</td>
                         <td class="table-cell font-mono text-xs">{{ devbox.instance_id }}</td>
                         <td class="table-cell"><span class="status-{{ devbox.state }}">{{ devbox.state }}</span></td>
+                        <td class="table-cell">{{ devbox.warm }}</td>
                         <td class="table-cell">{{ devbox.instance_type }}</td>
                         <td class="table-cell">{{ devbox.owner }}</td>
                         <td class="table-cell text-gray-400">{{ devbox.created_at }}</td>
@@ -46,7 +48,7 @@
                     {% endfor %}
                     {% if devboxes.is_empty() %}
                     <tr>
-                        <td colspan="6" class="table-cell text-center text-gray-500 py-8">No devboxes found.</td>
+                        <td colspan="7" class="table-cell text-center text-gray-500 py-8">No devboxes found.</td>
                     </tr>
                     {% endif %}
                 </tbody>
