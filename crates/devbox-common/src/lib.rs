@@ -619,6 +619,10 @@ pub struct PoolMetricsResponse {
     pub ready: u32,
     pub claimed: u32,
     pub terminating: u32,
+    /// Ready or Claimed boxes whose warm-up report says the caches were warm.
+    /// Absent (0) when talking to a server that predates the field.
+    #[serde(default)]
+    pub warm: u32,
 }
 
 // ============================================================================
@@ -843,11 +847,21 @@ mod tests {
             ready: 3,
             claimed: 4,
             terminating: 5,
+            warm: 1,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: PoolMetricsResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.warming, 2);
         assert_eq!(parsed.terminating, 5);
+        assert_eq!(parsed.warm, 1);
+    }
+
+    #[test]
+    fn pool_metrics_response_without_warm_defaults_to_zero() {
+        // A server that predates the field must still parse (CLI forward-compat).
+        let json = r#"{"warming":1,"ready":2,"claimed":3,"terminating":4}"#;
+        let parsed: PoolMetricsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.warm, 0);
     }
 
     #[test]

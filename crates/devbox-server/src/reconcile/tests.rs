@@ -87,6 +87,10 @@ mod reconcile_tests {
             DevboxState::Warming,
             "instance without devbox:ready tag must stay Warming (instance_id={instance_id})"
         );
+        assert!(
+            all.first().unwrap().data.ready_at.is_none(),
+            "ready_at must stay unset while the box is Warming"
+        );
     }
 
     /// Test: a Pending instance (no hook variant) also gets a Warming doc.
@@ -191,6 +195,10 @@ mod reconcile_tests {
             all.first().unwrap().data.state,
             DevboxState::Ready,
             "instance with devbox:ready=true must transition to Ready"
+        );
+        assert!(
+            all.first().unwrap().data.ready_at.is_some(),
+            "the Warming → Ready flip must stamp ready_at"
         );
     }
 
@@ -316,6 +324,7 @@ mod reconcile_tests {
             owner: None,
             owner_email: None,
             claimed_at: None,
+            ready_at: None,
             created_at: past,
             owner_tag_applied: false,
             warmup_report: None,
@@ -332,6 +341,7 @@ mod reconcile_tests {
             owner: Some("alice".to_string()),
             owner_email: None,
             claimed_at: None,
+            ready_at: None,
             created_at: past,
             owner_tag_applied: false,
             warmup_report: None,
@@ -386,6 +396,7 @@ mod reconcile_tests {
             owner: Some("alice".to_string()),
             owner_email: None,
             claimed_at: None,
+            ready_at: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
             warmup_report: None,
@@ -404,6 +415,7 @@ mod reconcile_tests {
             owner: None,
             owner_email: None,
             claimed_at: None,
+            ready_at: None,
             created_at: past,
             owner_tag_applied: false,
             warmup_report: None,
@@ -460,6 +472,7 @@ mod reconcile_tests {
             owner: Some("alice".to_string()),
             owner_email: Some("alice@example.com".to_string()),
             claimed_at: None,
+            ready_at: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
             warmup_report: None,
@@ -514,6 +527,7 @@ mod reconcile_tests {
             owner: None,
             owner_email: None,
             claimed_at: None,
+            ready_at: None,
             created_at: past,
             owner_tag_applied: false,
             warmup_report: None,
@@ -571,6 +585,7 @@ mod reconcile_tests {
             owner: Some("alice".to_string()),
             owner_email: Some("alice@example.com".to_string()),
             claimed_at: None,
+            ready_at: None,
             created_at: Timestamp::now(),
             owner_tag_applied: true,
             warmup_report: None,
@@ -633,6 +648,7 @@ mod reconcile_tests {
             owner: Some("bob".to_string()),
             owner_email: None,
             claimed_at: None,
+            ready_at: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
             warmup_report: None,
@@ -692,6 +708,7 @@ mod reconcile_tests {
             owner: Some("carol".to_string()),
             owner_email: None,
             claimed_at: None,
+            ready_at: None,
             created_at: Timestamp::now(),
             owner_tag_applied: true,
             warmup_report: None,
@@ -754,6 +771,7 @@ mod reconcile_tests {
             owner: Some("sneaky".to_string()),
             owner_email: None,
             claimed_at: None,
+            ready_at: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
             warmup_report: None,
@@ -801,6 +819,7 @@ mod reconcile_tests {
             owner: Some("dave".to_string()),
             owner_email: None,
             claimed_at: None,
+            ready_at: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
             warmup_report: None,

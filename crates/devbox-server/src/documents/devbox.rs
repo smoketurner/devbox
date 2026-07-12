@@ -48,6 +48,11 @@ pub struct DevboxDoc {
     pub owner_email: Option<String>,
     /// When the devbox was claimed.
     pub claimed_at: Option<Timestamp>,
+    /// When the reconciler flipped this box Warming → Ready (the `devbox:ready`
+    /// tag observed). Absent for documents written before this field existed and
+    /// for boxes that never reached Ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_at: Option<Timestamp>,
     /// When the devbox record was created.
     pub created_at: Timestamp,
     /// Whether the EC2 "devbox:owner" tag has been applied after claiming. The
@@ -79,6 +84,11 @@ pub struct WarmupReport {
     /// Per-repo freshen outcomes, bounded to [`MAX_REPORT_REPOS`] entries.
     #[serde(default)]
     pub repos: Vec<RepoFreshenReport>,
+    /// Whether the agent found the box's caches warm at the end of warm-up
+    /// (repos present, `target/` built, pinned toolchains installed). `false`
+    /// for reports from agents that predate the probe.
+    #[serde(default)]
+    pub warm: bool,
     /// When the server received the report (server clock — agent clocks are
     /// not trusted for cross-box comparison).
     pub reported_at: Timestamp,
@@ -111,6 +121,7 @@ impl WarmupReport {
             total_ms: req.total_ms,
             workspace_present: req.workspace_present,
             repos,
+            warm: req.warm,
             reported_at: now,
         }
     }
@@ -193,6 +204,7 @@ mod tests {
             owner: None,
             owner_email: None,
             claimed_at: None,
+            ready_at: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
             warmup_report: None,
@@ -259,6 +271,7 @@ mod tests {
                 duration_ms: 11_000,
                 error: None,
             }],
+            warm: true,
             reported_at: Timestamp::now(),
         });
 
@@ -267,6 +280,7 @@ mod tests {
         let report = parsed.warmup_report.unwrap();
         assert_eq!(report.total_ms, 13_500);
         assert_eq!(report.repos.first().unwrap().repo, "devbox");
+        assert!(report.warm);
     }
 
     #[test]
@@ -281,6 +295,19 @@ mod tests {
         );
         let parsed: DevboxDoc = serde_json::from_value(json).unwrap();
         assert!(parsed.warmup_report.is_none());
+    }
+
+    #[test]
+    fn doc_without_ready_at_field_deserializes_to_none() {
+        // Same forward-compat guarantee for ready_at as for warmup_report.
+        let mut json = serde_json::to_value(sample_devbox()).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        assert!(
+            !obj.contains_key("ready_at"),
+            "None must be skipped in serialization"
+        );
+        let parsed: DevboxDoc = serde_json::from_value(json).unwrap();
+        assert!(parsed.ready_at.is_none());
     }
 
     #[test]
