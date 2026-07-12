@@ -10,6 +10,8 @@
 //! status codes, or JSON types cross this boundary. Error cases are expressed via
 //! [`AppError`] variants so the callers decide how to render them.
 
+use std::future::Future;
+
 use devbox_common::{
     DEVBOX_NAME_MAX_LEN, DevboxState, GitTokenResponse, PoolMetricsResponse, WarmupReportRequest,
     is_valid_devbox_name,
@@ -123,6 +125,59 @@ pub(crate) async fn mint_git_token(
 }
 
 // ============================================================================
+// Optimistic-concurrency retry
+// ============================================================================
+
+/// Version-conflict retries granted to an optimistic-concurrency loop before it
+/// gives up with a 409. The common conflicting writer is the reconciler (owner
+/// tagging, `Warming → Ready`), which touches a document at most once per tick,
+/// so one retry usually suffices.
+const MAX_OCC_RETRIES: u32 = 3;
+
+/// Outcome of one optimistic-concurrency attempt in [`with_occ_retry`].
+enum OccAttempt<T> {
+    /// The operation finished (successfully wrote, or legitimately no-oped).
+    Done(T),
+    /// The document version moved underneath the attempt; re-run on fresh state.
+    Retry,
+}
+
+/// Run `attempt` until it completes or [`MAX_OCC_RETRIES`] version conflicts
+/// are exhausted (then 409 Conflict).
+///
+/// Each attempt must **re-read its document** so a retry operates on fresh
+/// state — re-running a CAS with a stale version is deterministically futile,
+/// and the re-read is also where business rules get re-validated against the
+/// document's *new* state (a retry may legitimately become a 403/404/409).
+/// This is a different retry domain from transient DSQL errors, which the
+/// store already retries generically via
+/// [`with_dsql_retry!`](crate::with_dsql_retry).
+///
+/// Takes `FnMut() -> Fut` rather than `AsyncFnMut` so the returned future's
+/// `Send`-ness stays inferable inside axum handlers (async-closure futures
+/// currently fail higher-ranked `Send` proofs); capture by `Copy` reference
+/// and return an `async move` block.
+async fn with_occ_retry<T, Fut>(mut attempt: impl FnMut() -> Fut) -> Result<T, AppError>
+where
+    Fut: Future<Output = Result<OccAttempt<T>, AppError>>,
+{
+    let mut attempts = 0u32;
+    loop {
+        match attempt().await? {
+            OccAttempt::Done(value) => return Ok(value),
+            OccAttempt::Retry if attempts < MAX_OCC_RETRIES => {
+                attempts = attempts.saturating_add(1);
+            }
+            OccAttempt::Retry => {
+                return Err(AppError::Conflict(
+                    "devbox was modified concurrently".into(),
+                ));
+            }
+        }
+    }
+}
+
+// ============================================================================
 // Agent warmup report
 // ============================================================================
 
@@ -165,8 +220,8 @@ pub(crate) async fn record_warmup_report(
     Ok(())
 }
 
-/// Apply `mutate` to the [`DevboxDoc`] whose `instance_id` matches, with a
-/// read-modify-CAS retry loop.
+/// Apply `mutate` to the [`DevboxDoc`] whose `instance_id` matches, under
+/// [`with_occ_retry`].
 ///
 /// The version guard matters here: agent writes race the reconciler (which
 /// flips the same doc `Warming → Ready` right when the warmup report arrives),
@@ -178,9 +233,8 @@ async fn update_devbox_by_instance(
     instance_id: &str,
     mutate: impl Fn(&mut DevboxDoc),
 ) -> Result<(), AppError> {
-    const MAX_RETRIES: u32 = 3;
-    let mut attempts = 0u32;
-    loop {
+    let mutate = &mutate;
+    with_occ_retry(move || async move {
         let doc = state
             .store
             .find_one::<DevboxDoc>("instance_id", instance_id)
@@ -197,15 +251,12 @@ async fn update_devbox_by_instance(
             .compare_and_update(&doc.id, doc.version, &updated)
             .await?
         {
-            return Ok(());
+            Ok(OccAttempt::Done(()))
+        } else {
+            Ok(OccAttempt::Retry)
         }
-        if attempts >= MAX_RETRIES {
-            return Err(AppError::Conflict(
-                "devbox was modified concurrently".into(),
-            ));
-        }
-        attempts = attempts.saturating_add(1);
-    }
+    })
+    .await
 }
 
 // ============================================================================
@@ -395,7 +446,7 @@ pub(crate) async fn release_devbox(
 /// - No-op short-circuit when `new_name` equals the current name (200, unchanged).
 /// - Uniqueness via [`compare_and_update_unique`](crate::db::DocumentStore::compare_and_update_unique).
 ///
-/// `VersionMismatch` is retried up to `MAX_RETRIES` times: the reconciler's
+/// `VersionMismatch` is retried via [`with_occ_retry`]: the reconciler's
 /// `apply_pending_owner_tags` bumps the document version within ~30 s of a claim,
 /// so a rename attempted in that window would otherwise get a spurious 409. A
 /// re-fetch and retry is sufficient — no sleep — because the reconciler is the
@@ -408,9 +459,8 @@ pub(crate) async fn rename_devbox(
 ) -> Result<Document<DevboxDoc>, AppError> {
     let name = validate_rename_name(new_name)?;
 
-    const MAX_RETRIES: u32 = 3;
-    let mut attempts = 0u32;
-    loop {
+    let name = &name;
+    with_occ_retry(move || async move {
         let doc = state
             .store
             .get::<DevboxDoc>(id)
@@ -430,8 +480,8 @@ pub(crate) async fn rename_devbox(
         }
 
         // No-op: same name → return box unchanged without touching the store.
-        if doc.data.name == name {
-            return Ok(doc);
+        if doc.data.name == *name {
+            return Ok(OccAttempt::Done(doc));
         }
 
         let mut updated = doc.data.clone();
@@ -439,32 +489,24 @@ pub(crate) async fn rename_devbox(
 
         match state
             .store
-            .compare_and_update_unique(&doc.id, doc.version, &updated, "name", &name)
+            .compare_and_update_unique(&doc.id, doc.version, &updated, "name", name)
             .await?
         {
             UpdateOutcome::Updated => {
-                return state.store.get::<DevboxDoc>(id).await?.ok_or_else(|| {
+                let refreshed = state.store.get::<DevboxDoc>(id).await?.ok_or_else(|| {
                     AppError::Internal(anyhow::anyhow!("devbox vanished after rename"))
-                });
+                })?;
+                Ok(OccAttempt::Done(refreshed))
             }
-            UpdateOutcome::VersionMismatch if attempts < MAX_RETRIES => {
-                // The reconciler just bumped the version (owner-tag sync);
-                // re-fetch and retry with the fresh version.
-                attempts = attempts.saturating_add(1);
-                continue;
-            }
-            UpdateOutcome::VersionMismatch => {
-                return Err(AppError::Conflict(
-                    "devbox was modified concurrently".into(),
-                ));
-            }
-            UpdateOutcome::DuplicateValue => {
-                return Err(AppError::Conflict(format!(
-                    "name '{name}' is already in use"
-                )));
-            }
+            // The reconciler just bumped the version (owner-tag sync);
+            // re-fetch and retry with the fresh version.
+            UpdateOutcome::VersionMismatch => Ok(OccAttempt::Retry),
+            UpdateOutcome::DuplicateValue => Err(AppError::Conflict(format!(
+                "name '{name}' is already in use"
+            ))),
         }
-    }
+    })
+    .await
 }
 
 /// Compute pool metrics from the current document store state.
@@ -659,6 +701,68 @@ mod tests {
             .err()
             .unwrap();
         assert!(matches!(err, AppError::ServiceUnavailable(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // with_occ_retry tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn occ_retry_reruns_until_done() {
+        // An attempt that conflicts a few times then succeeds must be re-run
+        // (on what would be fresh state) and yield the final value.
+        let calls = std::cell::Cell::new(0u32);
+        let calls = &calls;
+        let result = with_occ_retry(move || async move {
+            calls.set(calls.get().saturating_add(1));
+            if calls.get() <= MAX_OCC_RETRIES {
+                Ok(OccAttempt::Retry)
+            } else {
+                Ok(OccAttempt::Done(calls.get()))
+            }
+        })
+        .await
+        .ok()
+        .unwrap();
+
+        assert_eq!(result, MAX_OCC_RETRIES + 1);
+    }
+
+    #[tokio::test]
+    async fn occ_retry_exhaustion_is_conflict() {
+        // A persistently conflicting attempt is bounded: after the retries are
+        // spent the caller gets a 409, never an unbounded loop.
+        let calls = std::cell::Cell::new(0u32);
+        let calls = &calls;
+        let err = with_occ_retry(move || async move {
+            calls.set(calls.get().saturating_add(1));
+            Ok::<OccAttempt<()>, AppError>(OccAttempt::Retry)
+        })
+        .await
+        .err()
+        .unwrap();
+
+        assert!(matches!(err, AppError::Conflict(_)));
+        // Initial attempt + MAX_OCC_RETRIES re-runs.
+        assert_eq!(calls.get(), MAX_OCC_RETRIES + 1);
+    }
+
+    #[tokio::test]
+    async fn occ_retry_propagates_domain_errors_immediately() {
+        // A domain error from the attempt (403/404/409 from re-validation) is
+        // returned as-is, not retried — only version conflicts re-run.
+        let calls = std::cell::Cell::new(0u32);
+        let calls = &calls;
+        let err = with_occ_retry(move || async move {
+            calls.set(calls.get().saturating_add(1));
+            Err::<OccAttempt<()>, AppError>(AppError::Forbidden("ownership mismatch".into()))
+        })
+        .await
+        .err()
+        .unwrap();
+
+        assert!(matches!(err, AppError::Forbidden(_)));
+        assert_eq!(calls.get(), 1);
     }
 
     // -----------------------------------------------------------------------
