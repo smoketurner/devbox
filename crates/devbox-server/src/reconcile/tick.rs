@@ -209,8 +209,20 @@ async fn handle_archiving_instances(
             }
         }
 
-        if let Some(session_id) = expired_session.as_deref() {
-            fail_session(store, session_id, "archive deadline exceeded").await;
+        // Past the deadline the session must be resolved (failed) BEFORE the
+        // box flips to Terminating: terminating first on a store error would
+        // strand the SessionDoc as pending forever once the instance is gone.
+        // A failure here just retries next tick — the deadline has already
+        // passed, so nothing extends the box's life beyond the store outage.
+        if let Some(session_id) = expired_session.as_deref()
+            && !fail_session(store, session_id, "archive deadline exceeded").await
+        {
+            tracing::warn!(
+                doc_id = %doc.id,
+                session_id,
+                "could not fail expired session; retrying next tick"
+            );
+            continue;
         }
 
         let mut updated = doc.data.clone();
@@ -263,22 +275,24 @@ async fn session_resolved(store: &DocumentStore, session_id: &str) -> bool {
     }
 }
 
-/// Mark a session Failed with `reason`, tolerating a concurrent completion (a
-/// version conflict means the agent's done report just landed — leave it).
-async fn fail_session(store: &DocumentStore, session_id: &str, reason: &str) {
+/// Mark a session Failed with `reason`. Returns whether the session is now in
+/// a terminal state (failed here, already resolved, missing, or a version
+/// conflict — the agent's done report just landed); `false` only on a store
+/// error, so the caller can hold the box until the session record is settled.
+async fn fail_session(store: &DocumentStore, session_id: &str, reason: &str) -> bool {
     let doc = match store.get::<SessionDoc>(session_id).await {
         Ok(Some(doc)) => doc,
         Ok(None) => {
             tracing::warn!(session_id, "session record missing while failing it");
-            return;
+            return true;
         }
         Err(e) => {
             tracing::error!(error = %e, session_id, "failed to load session record");
-            return;
+            return false;
         }
     };
     if doc.data.state != SessionState::Pending {
-        return;
+        return true;
     }
     let mut updated = doc.data.clone();
     updated.state = SessionState::Failed;
@@ -288,9 +302,10 @@ async fn fail_session(store: &DocumentStore, session_id: &str, reason: &str) {
         .compare_and_update(&doc.id, doc.version, &updated)
         .await
     {
-        Ok(_) => {}
+        Ok(_) => true,
         Err(e) => {
             tracing::error!(error = %e, session_id, "failed to mark session failed");
+            false
         }
     }
 }

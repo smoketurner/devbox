@@ -287,9 +287,18 @@ pub(crate) async fn claim_devbox(
     let name_override = validate_name_override(name)?;
 
     // Resolve the session to restore before racing for a box, so a bad
-    // selector fails without consuming a claim.
+    // selector fails without consuming a claim. Requires session archiving to
+    // be configured: without the bucket the box's restore-url call would 503
+    // and the claim would quietly come up without the session.
     let restore_session_id = match resume {
-        Some(selector) => Some(resolve_resumable_session(state, &claimant.owner, selector).await?),
+        Some(selector) => {
+            if state.sessions.is_none() {
+                return Err(AppError::Conflict(
+                    "session archiving is not configured on this server".into(),
+                ));
+            }
+            Some(resolve_resumable_session(state, &claimant.owner, selector).await?)
+        }
         None => None,
     };
 
@@ -1860,6 +1869,26 @@ mod tests {
             .err()
             .unwrap();
         assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn claim_resume_without_config_is_conflict() {
+        let state = setup_state().await; // sessions: None
+        insert(&state, ready_devbox()).await;
+
+        let err = claim_devbox(&state, &claimant("jdoe"), None, Some("anything"))
+            .await
+            .err()
+            .unwrap();
+
+        assert!(matches!(err, AppError::Conflict(_)));
+        // No box was consumed by the failed resume.
+        let doc = state
+            .store
+            .find_one::<DevboxDoc>("state", "ready")
+            .await
+            .unwrap();
+        assert!(doc.is_some(), "the ready box must remain claimable");
     }
 
     #[tokio::test]
