@@ -53,8 +53,8 @@ Logical subsystems to track in coverage-status.md:
 
 - **HTTP API**: `/api/v1/devboxes/*`, `/api/v1/pool/metrics` (bearer-token auth); `/health` (unauthenticated)
 - **HTML dashboard**: `GET /` (app-side OIDC session cookie)
-- **CLI**: `devbox login/claim/release/list/status/ssh`
-- **On-host agent**: `devbox-agent principals|owner-sync|warmup|checkout|doctor`
+- **CLI**: `devbox login/claim/release/list/status/ssh/sessions`
+- **On-host agent**: `devbox-agent principals|owner-sync|warmup|checkout|doctor|session-watch`
 
 ## Critical Paths
 

@@ -59,8 +59,9 @@ Objects for per-session state, and GitHub App tokens for VCS.
   **predictive / pre-claim warming** and **multiple pools keyed by profile/repo**
   (devbox pools are generic today).
 - **Session durability via snapshot-on-completion.** After a run they snapshot so a
-  later follow-up can restore even if the sandbox was reclaimed — the concrete
-  mechanism behind devbox's planned **durable agent sessions**.
+  later follow-up can restore even if the sandbox was reclaimed — the same
+  mechanism now implemented in devbox's durable sessions (`release --keep` /
+  `claim --resume`).
 - **Per-clone GitHub App tokens; user opens the PR (no self-approval).** Tokens are
   scoped per clone and PRs are attributed to the human, avoiding self-approval.
 - **Observability wired in.** Sandboxes ship connected to Datadog/Sentry/etc.;
