@@ -4,9 +4,11 @@
 //! SSH access and warm-up:
 //!
 //! - `principals <login-user>` — sshd `AuthorizedPrincipalsCommand` resolver.
-//! - `owner-sync` — provision the claimant's Unix account, then exit.
+//! - `owner-sync` — provision the claimant's Unix account (restoring a session
+//!   when `claim --resume` asked for one), then exit.
 //! - `warmup` — warm the host and self-tag `devbox:ready=true` so the reconciler
 //!   marks the `DevboxDoc` Ready; boxes that never tag ready are reaped.
+//! - `session-watch` — archive the session to S3 when `release --keep` asks.
 //! - `doctor` — print a read-only diagnostic of warm-cache delivery.
 
 mod checkout;
@@ -17,6 +19,9 @@ mod git;
 mod imds;
 mod owner_sync;
 mod principals;
+mod session;
+mod session_restore;
+mod session_watch;
 mod warmup;
 
 use std::path::PathBuf;
@@ -57,6 +62,9 @@ enum Command {
     /// Print a read-only diagnostic of warm-cache delivery (workspace mount,
     /// resolved RUSTUP_HOME/CARGO_HOME, pinned-toolchain and registry presence).
     Doctor,
+    /// Watch for a `devbox:archive-session` tag (release --keep); on seeing it,
+    /// pack the session, upload it via a presigned URL, report, and exit.
+    SessionWatch,
 }
 
 // Current-thread runtime: the agent reads IMDS / calls the AWS SDK (both async)
@@ -103,6 +111,11 @@ async fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             }
+        }
+        Command::SessionWatch => {
+            init_tracing();
+            session_watch::run().await;
+            ExitCode::SUCCESS
         }
     }
 }

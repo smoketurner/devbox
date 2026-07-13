@@ -117,8 +117,38 @@ async fn tick(client: &Client) -> Result<Pass> {
                 .await
                 .context("read devbox:owner-email")?;
             configure_git_identity(&owner, email.as_deref());
+            // Best-effort session restore (claim --resume): any failure logs
+            // and continues — the account is already usable and a restore
+            // failure must never brick the claim.
+            restore_session_if_requested(client, &owner).await;
             Ok(Pass::Done)
         }
+    }
+}
+
+/// Restore the session named by the `devbox:session-restore` tag, if any, onto
+/// `/workspace` and the claimant's home. Strictly best-effort.
+async fn restore_session_if_requested(client: &Client, owner: &str) {
+    let session_id = match imds::instance_tag(client, "devbox:session-restore").await {
+        Ok(Some(id)) if !id.trim().is_empty() => id.trim().to_string(),
+        Ok(_) => return,
+        Err(e) => {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "could not read devbox:session-restore tag; skipping restore"
+            );
+            return;
+        }
+    };
+    tracing::info!(session_id, "restoring session onto this box");
+    if let Err(e) = crate::session_restore::run(&session_id, owner).await {
+        tracing::warn!(
+            session_id,
+            error = %format!("{e:#}"),
+            "session restore failed; continuing with a fresh box"
+        );
+    } else {
+        tracing::info!(session_id, "session restored");
     }
 }
 
@@ -209,7 +239,7 @@ fn configure_git_identity(user: &str, email: Option<&str>) {
 }
 
 /// The home directory of an existing Unix account, read from `getent passwd`.
-fn user_home(user: &str) -> Option<String> {
+pub(crate) fn user_home(user: &str) -> Option<String> {
     let output = Command::new("getent")
         .arg("passwd")
         .arg(user)
