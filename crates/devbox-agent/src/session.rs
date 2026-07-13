@@ -392,13 +392,20 @@ async fn restore_home(extracted: &Path, home: &Path, owner: &str) -> Result<()> 
     Ok(())
 }
 
-/// Run `git -C <repo> <args>` under GNU `timeout` (local ops only).
+// Unlike `crate::git` (whose *network* fetches use the GNU `timeout` binary to
+// group-kill git's remote helpers), everything here is a local operation
+// (bundle/checkout/reset/tar/cp/chown), so the cap is enforced in-process with
+// `tokio::time::timeout` + `kill_on_drop` — a direct child kill suffices and
+// the code stays portable (macOS has no GNU `timeout`, and CI runs these tests
+// there).
+
+/// Run `git -C <repo> <args>` under [`LOCAL_GIT_TIMEOUT`].
 async fn run_git(repo: &Path, args: &[&str]) -> Result<()> {
-    let mut cmd = timeout_cmd("git");
+    let mut cmd = base_cmd("git");
     cmd.arg("-C").arg(repo).args(args);
-    let status = cmd
-        .status()
+    let status = tokio::time::timeout(LOCAL_GIT_TIMEOUT, cmd.status())
         .await
+        .map_err(|_| anyhow::anyhow!("git {} timed out", args.join(" ")))?
         .with_context(|| format!("run git {}", args.join(" ")))?;
     if !status.success() {
         bail!("git {} exited with {:?}", args.join(" "), status.code());
@@ -406,13 +413,14 @@ async fn run_git(repo: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Run `git -C <repo> <args>` and return trimmed stdout.
+/// Run `git -C <repo> <args>` under [`LOCAL_GIT_TIMEOUT`] and return trimmed
+/// stdout.
 async fn git_stdout(repo: &Path, args: &[&str]) -> Result<String> {
-    let mut cmd = timeout_cmd("git");
+    let mut cmd = base_cmd("git");
     cmd.arg("-C").arg(repo).args(args);
-    let output = cmd
-        .output()
+    let output = tokio::time::timeout(LOCAL_GIT_TIMEOUT, cmd.output())
         .await
+        .map_err(|_| anyhow::anyhow!("git {} timed out", args.join(" ")))?
         .with_context(|| format!("run git {}", args.join(" ")))?;
     if !output.status.success() {
         bail!(
@@ -424,13 +432,13 @@ async fn git_stdout(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Run a non-git tool (tar/cp/chown) under GNU `timeout`.
+/// Run a non-git tool (tar/cp/chown) under [`LOCAL_GIT_TIMEOUT`].
 async fn run_tool(program: &str, args: &[String]) -> Result<()> {
-    let mut cmd = timeout_cmd(program);
+    let mut cmd = base_cmd(program);
     cmd.args(args);
-    let status = cmd
-        .status()
+    let status = tokio::time::timeout(LOCAL_GIT_TIMEOUT, cmd.status())
         .await
+        .map_err(|_| anyhow::anyhow!("{program} timed out"))?
         .with_context(|| format!("run {program}"))?;
     if !status.success() {
         bail!("{program} exited with {:?}", status.code());
@@ -438,16 +446,10 @@ async fn run_tool(program: &str, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `timeout -k 5 <cap> <program>` base command (same group-kill rationale as
-/// [`crate::git::run_git`]).
-fn timeout_cmd(program: &str) -> Command {
-    let mut cmd = Command::new("timeout");
-    cmd.arg("-k")
-        .arg("5")
-        .arg(LOCAL_GIT_TIMEOUT.as_secs().to_string())
-        .arg(program)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .kill_on_drop(true);
+/// Base command: no prompts, child killed if the timeout drops the future.
+fn base_cmd(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.env("GIT_TERMINAL_PROMPT", "0").kill_on_drop(true);
     cmd
 }
 
