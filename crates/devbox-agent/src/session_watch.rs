@@ -120,7 +120,7 @@ async fn archive(
     session_id: &str,
 ) -> Result<u64> {
     let staging = staging_dir()?;
-    let home = claimant_home(imds_client).await;
+    let home = claimant_home(imds_client).await?;
 
     let archive_path =
         session::pack_session(Path::new(WORKSPACE), home.as_deref(), &staging).await?;
@@ -129,30 +129,56 @@ async fn archive(
         .len();
 
     let url = control_plane.session_archive_url(session_id).await?;
-    upload(&archive_path, &url).await?;
+    upload(&archive_path, &url, size_bytes).await?;
 
     std::fs::remove_dir_all(&staging).ok();
     Ok(size_bytes)
 }
 
-/// The claimant's home directory, resolved from the `devbox:owner` tag. `None`
-/// (owner unknown/unresolvable) skips the home tree — repos still archive.
-async fn claimant_home(imds_client: &aws_config::imds::client::Client) -> Option<PathBuf> {
-    let owner = imds::instance_tag(imds_client, "devbox:owner")
-        .await
-        .ok()
-        .flatten()
+/// IMDS read attempts for the owner tag (with [`POLL_INTERVAL`] between them).
+const OWNER_READ_ATTEMPTS: u32 = 3;
+
+/// The claimant's home directory, resolved from the `devbox:owner` tag.
+/// `Ok(None)` only when the tag is genuinely absent/empty or the account has
+/// no home — repos still archive. A persistent IMDS **error** is propagated
+/// (after retries) so the archive fails loudly instead of silently shipping
+/// without the home tree.
+async fn claimant_home(imds_client: &aws_config::imds::client::Client) -> Result<Option<PathBuf>> {
+    let mut attempt = 0u32;
+    let owner = loop {
+        match imds::instance_tag(imds_client, "devbox:owner").await {
+            Ok(owner) => break owner,
+            Err(e) => {
+                attempt = attempt.saturating_add(1);
+                if attempt >= OWNER_READ_ATTEMPTS {
+                    return Err(e.context("read devbox:owner for the home archive"));
+                }
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "could not read devbox:owner; retrying"
+                );
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+        }
+    };
+    let Some(owner) = owner
         .map(|o| o.trim().to_string())
-        .filter(|o| !o.is_empty())?;
-    let home = crate::owner_sync::user_home(&owner)?;
-    Some(PathBuf::from(home))
+        .filter(|o| !o.is_empty())
+    else {
+        return Ok(None);
+    };
+    Ok(crate::owner_sync::user_home(&owner).map(PathBuf::from))
 }
 
-/// PUT the archive to the presigned URL.
-async fn upload(archive: &Path, url: &str) -> Result<()> {
-    let body = tokio::fs::read(archive)
+/// PUT the archive to the presigned URL, streaming from disk (archives can be
+/// large; buffering one in memory risks OOMing the box). The explicit
+/// Content-Length keeps the request identity-encoded — S3 rejects chunked
+/// uploads without a length.
+async fn upload(archive: &Path, url: &str, size_bytes: u64) -> Result<()> {
+    let file = tokio::fs::File::open(archive)
         .await
-        .with_context(|| format!("read {}", archive.display()))?;
+        .with_context(|| format!("open {}", archive.display()))?;
+    let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
     let http = reqwest::Client::builder()
         .user_agent("devbox-agent")
         .timeout(UPLOAD_TIMEOUT)
@@ -160,6 +186,7 @@ async fn upload(archive: &Path, url: &str) -> Result<()> {
         .context("build upload HTTP client")?;
     let resp = http
         .put(url)
+        .header(reqwest::header::CONTENT_LENGTH, size_bytes)
         .body(body)
         .send()
         .await

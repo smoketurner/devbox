@@ -48,14 +48,15 @@ pub(crate) async fn run(session_id: &str, owner: &str) -> Result<()> {
     Ok(())
 }
 
-/// GET the presigned URL to `dest`.
+/// GET the presigned URL to `dest`, streaming to disk (archives can be large;
+/// buffering one in memory risks OOMing the box).
 async fn download(url: &str, dest: &Path) -> Result<()> {
     let http = reqwest::Client::builder()
         .user_agent("devbox-agent")
         .timeout(DOWNLOAD_TIMEOUT)
         .build()
         .context("build download HTTP client")?;
-    let resp = http
+    let mut resp = http
         .get(url)
         .send()
         .await
@@ -65,8 +66,17 @@ async fn download(url: &str, dest: &Path) -> Result<()> {
         let body = resp.text().await.unwrap_or_default();
         bail!("archive download failed ({status}): {body}");
     }
-    let bytes = resp.bytes().await.context("read session archive body")?;
-    std::fs::write(dest, &bytes).with_context(|| format!("write {}", dest.display()))?;
+    let mut file = tokio::fs::File::create(dest)
+        .await
+        .with_context(|| format!("create {}", dest.display()))?;
+    while let Some(chunk) = resp.chunk().await.context("read session archive body")? {
+        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
+            .await
+            .with_context(|| format!("write {}", dest.display()))?;
+    }
+    tokio::io::AsyncWriteExt::flush(&mut file)
+        .await
+        .with_context(|| format!("flush {}", dest.display()))?;
     Ok(())
 }
 
