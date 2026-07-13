@@ -763,6 +763,8 @@ mod tests {
             owner_email: None,
             claimed_at: None,
             ready_at: None,
+            archive: None,
+            restore_session_id: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
             warmup_report: None,

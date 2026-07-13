@@ -53,6 +53,15 @@ pub struct DevboxDoc {
     /// for boxes that never reached Ready.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready_at: Option<Timestamp>,
+    /// The session archive this box was asked to produce (`release --keep`).
+    /// Present only while the box is `Archiving`; cleared when the archive
+    /// completes, fails, or times out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive: Option<PendingArchive>,
+    /// The session to restore onto this box (`claim --resume`). Exposed to the
+    /// host as the `devbox:session-restore` tag via [`DevboxDoc::owner_tags`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_session_id: Option<String>,
     /// When the devbox record was created.
     pub created_at: Timestamp,
     /// Whether the EC2 "devbox:owner" tag has been applied after claiming. The
@@ -66,6 +75,16 @@ pub struct DevboxDoc {
     /// arrived.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warmup_report: Option<WarmupReport>,
+}
+
+/// A requested-but-unfinished session archive, recorded on the [`DevboxDoc`]
+/// while the box is `Archiving`. `requested_at` drives the reconciler's archive
+/// deadline (a box whose agent never reports done is terminated anyway).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingArchive {
+    /// The `SessionDoc` id the box is uploading.
+    pub session_id: String,
+    pub requested_at: Timestamp,
 }
 
 /// Warm-up metrics as stored on the [`DevboxDoc`] — the wire request plus the
@@ -146,6 +165,11 @@ impl DevboxDoc {
             if let Some(email) = self.owner_email.as_deref() {
                 tags.push(("devbox:owner-email", email));
             }
+            // Ride the same inline-tag path so a resumed claim's restore signal
+            // reaches the box together with its owner tag.
+            if let Some(session) = self.restore_session_id.as_deref() {
+                tags.push(("devbox:session-restore", session));
+            }
         }
         tags
     }
@@ -205,6 +229,8 @@ mod tests {
             owner_email: None,
             claimed_at: None,
             ready_at: None,
+            archive: None,
+            restore_session_id: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
             warmup_report: None,

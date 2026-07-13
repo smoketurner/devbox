@@ -512,7 +512,7 @@ async fn submit_claim(
     // Claim through the shared routine (validation, uniqueness, and the
     // race-safe re-check all live there). On failure, re-render the form with
     // the same message the API would return, echoing back the typed name.
-    match crate::service::claim_devbox(&state, &claimant, form.name.as_deref()).await {
+    match crate::service::claim_devbox(&state, &claimant, form.name.as_deref(), None).await {
         Ok(doc) => Redirect::to(&format!("/devboxes/{}", doc.id)).into_response(),
         Err(e) => ClaimFormTemplate {
             name: form.name,
@@ -537,7 +537,7 @@ async fn submit_release(
         Err(redirect) => return redirect,
     };
 
-    match crate::service::release_devbox(&state, &user.principal, &id).await {
+    match crate::service::release_devbox(&state, &user.principal, &id, false).await {
         Ok(_) => Redirect::to(&format!("/devboxes/{id}")).into_response(),
         Err(e) => {
             // Re-fetch so the template reflects the current box state.
@@ -666,6 +666,8 @@ mod tests {
             owner_email: None,
             claimed_at: None,
             ready_at: None,
+            archive: None,
+            restore_session_id: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
             warmup_report: warm.map(|warm| {
