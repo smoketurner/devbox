@@ -964,13 +964,20 @@ mod reconcile_tests {
             .await
             .unwrap();
 
-        // Instance survives the tick with the archive tag asserted.
+        // Instance survives the tick with the archive tag asserted, and the
+        // owner tag keeps being re-asserted (session-watch resolves the
+        // claimant's home from it).
         let tags = compute
             .get_instance_tags(&instance_id)
             .expect("archiving instance must not be terminated");
         assert_eq!(
             tags.get("devbox:archive-session").map(String::as_str),
             Some(session_id.as_str())
+        );
+        assert_eq!(
+            tags.get("devbox:owner").map(String::as_str),
+            Some("alice"),
+            "owner tag must stay asserted while Archiving"
         );
 
         // Doc unchanged; session still pending.

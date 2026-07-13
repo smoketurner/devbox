@@ -837,7 +837,13 @@ async fn apply_pending_owner_tags(
     all_docs: &[crate::db::document_type::Document<DevboxDoc>],
 ) {
     for doc in all_docs {
-        if doc.data.state != DevboxState::Claimed {
+        // Archiving boxes keep their owner, and session-watch resolves the
+        // claimant's home from the devbox:owner tag — keep re-asserting it
+        // until the box actually terminates.
+        if !matches!(
+            doc.data.state,
+            DevboxState::Claimed | DevboxState::Archiving
+        ) {
             continue;
         }
         apply_owner_tag(store, compute, doc).await;
