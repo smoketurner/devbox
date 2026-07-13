@@ -617,6 +617,13 @@ pub(crate) async fn session_archive_url(
 /// Record the outcome of an archive upload: mark the [`SessionDoc`]
 /// complete/failed and flip the box `Archiving → Terminating` (owner cleared,
 /// name freed) so the reconciler terminates it on its next tick.
+///
+/// Idempotent for duplicates: when the assignment was already cleared (the
+/// reconciler resolved the session — completion healed or deadline-failed)
+/// a re-report for this instance's own, already-resolved session is
+/// acknowledged as a no-op. The agent keeps seeing the `devbox:archive-session`
+/// tag until termination, so rejecting the duplicate would put its retry loop
+/// into a pointless crash-restart cycle.
 pub(crate) async fn session_archive_done(
     state: &AppState,
     agent: &AgentIdentity,
@@ -629,6 +636,17 @@ pub(crate) async fn session_archive_done(
         .as_ref()
         .is_some_and(|a| a.session_id == report.session_id);
     if !assigned {
+        let session = get_session(state, &report.session_id).await?;
+        if session.data.source_instance_id == agent.instance_id.as_str()
+            && session.data.state != SessionState::Pending
+        {
+            tracing::info!(
+                instance_id = %agent.instance_id,
+                session_id = %report.session_id,
+                "duplicate archive report for an already-resolved session; acknowledged"
+            );
+            return Ok(());
+        }
         return Err(AppError::Forbidden(
             "session does not match this instance's archive assignment".into(),
         ));
@@ -1767,6 +1785,54 @@ mod tests {
 
         let doc = state.store.get::<DevboxDoc>(&id).await.unwrap().unwrap();
         assert_eq!(doc.data.state, DevboxState::Terminating);
+    }
+
+    #[tokio::test]
+    async fn archive_done_duplicate_report_is_acknowledged() {
+        let state = setup_state_with_sessions().await;
+        let id = claimed_box(&state, "jdoe").await;
+        let (_, session) = release_devbox(&state, "jdoe", &id, true)
+            .await
+            .ok()
+            .unwrap();
+        let session_id = session.unwrap().id;
+
+        let report = devbox_common::SessionArchiveDoneRequest {
+            session_id: session_id.clone(),
+            success: true,
+            size_bytes: Some(4096),
+            error: None,
+        };
+        session_archive_done(&state, &pool_agent(), &report)
+            .await
+            .ok()
+            .unwrap();
+
+        // The assignment is now cleared; a re-report (agent restarted while
+        // the tag was still visible) must be acknowledged, not rejected...
+        session_archive_done(&state, &pool_agent(), &report)
+            .await
+            .ok()
+            .unwrap();
+        // ...and must not disturb the stored outcome.
+        let stored = state
+            .store
+            .get::<SessionDoc>(&session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.data.state, SessionState::Complete);
+
+        // A different instance's report for the same session stays forbidden.
+        let stranger = agent_on("i-someoneelse00000");
+        let err = session_archive_done(&state, &stranger, &report)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(
+            err,
+            AppError::Forbidden(_) | AppError::NotFound(_)
+        ));
     }
 
     #[tokio::test]
