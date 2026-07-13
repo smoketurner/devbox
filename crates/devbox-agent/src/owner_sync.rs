@@ -109,39 +109,34 @@ async fn tick(client: &Client) -> Result<Pass> {
         }
         Decision::Provision(owner) => {
             ensure_user(&owner)?;
-            // The email tag must be read before we finish. A transient IMDS error
-            // propagates so the poll loop retries instead of permanently skipping
-            // the git identity; an absent tag (`Ok(None)`) is final and just leaves
-            // it unset.
+            // The email and session-restore tags must be read before we finish.
+            // A transient IMDS error propagates so the poll loop retries
+            // (provisioning is idempotent) instead of permanently skipping the
+            // git identity or the restore; an absent tag (`Ok(None)`) is final.
             let email = imds::instance_tag(client, "devbox:owner-email")
                 .await
                 .context("read devbox:owner-email")?;
             configure_git_identity(&owner, email.as_deref());
-            // Best-effort session restore (claim --resume): any failure logs
-            // and continues — the account is already usable and a restore
-            // failure must never brick the claim.
-            restore_session_if_requested(client, &owner).await;
+            let restore = imds::instance_tag(client, "devbox:session-restore")
+                .await
+                .context("read devbox:session-restore")?;
+            // The restore itself stays best-effort: any failure past the tag
+            // read logs and continues — the account is already usable and a
+            // restore failure must never brick the claim.
+            restore_session_if_requested(restore.as_deref(), &owner).await;
             Ok(Pass::Done)
         }
     }
 }
 
-/// Restore the session named by the `devbox:session-restore` tag, if any, onto
-/// `/workspace` and the claimant's home. Strictly best-effort.
-async fn restore_session_if_requested(client: &Client, owner: &str) {
-    let session_id = match imds::instance_tag(client, "devbox:session-restore").await {
-        Ok(Some(id)) if !id.trim().is_empty() => id.trim().to_string(),
-        Ok(_) => return,
-        Err(e) => {
-            tracing::warn!(
-                error = %format!("{e:#}"),
-                "could not read devbox:session-restore tag; skipping restore"
-            );
-            return;
-        }
+/// Restore the session named by the `devbox:session-restore` tag value, if
+/// any, onto `/workspace` and the claimant's home. Strictly best-effort.
+async fn restore_session_if_requested(session_id: Option<&str>, owner: &str) {
+    let Some(session_id) = session_id.map(str::trim).filter(|s| !s.is_empty()) else {
+        return;
     };
     tracing::info!(session_id, "restoring session onto this box");
-    if let Err(e) = crate::session_restore::run(&session_id, owner).await {
+    if let Err(e) = crate::session_restore::run(session_id, owner).await {
         tracing::warn!(
             session_id,
             error = %format!("{e:#}"),
