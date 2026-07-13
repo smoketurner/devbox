@@ -35,14 +35,20 @@ const WORKSPACE: &str = "/workspace";
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Poll for the archive request, then archive, report, and exit.
-pub(crate) async fn run() {
+///
+/// # Errors
+///
+/// Returns an error when the archive request arrived but the control-plane
+/// client could not be built (e.g. a transient IMDS failure) — without it
+/// neither the upload nor a failure report can happen. The process exits
+/// non-zero so systemd's `Restart=on-failure` retries with the tag still set.
+pub(crate) async fn run() -> Result<()> {
     tracing::info!("session-watch started; waiting for devbox:archive-session");
     let client = imds::client();
     loop {
         match imds::instance_tag(&client, "devbox:archive-session").await {
             Ok(Some(session_id)) if !session_id.trim().is_empty() => {
-                archive_and_report(&client, session_id.trim()).await;
-                return;
+                return archive_and_report(&client, session_id.trim()).await;
             }
             Ok(_) => {}
             Err(e) => {
@@ -58,10 +64,15 @@ pub(crate) async fn run() {
 
 /// Run the archive and report the outcome (both success and failure) so the
 /// server resolves the session promptly instead of waiting out its deadline.
-async fn archive_and_report(imds_client: &aws_config::imds::client::Client, session_id: &str) {
+async fn archive_and_report(
+    imds_client: &aws_config::imds::client::Client,
+    session_id: &str,
+) -> Result<()> {
     let Some(mut control_plane) = crate::git::control_plane_client().await else {
-        tracing::error!("no control-plane client; cannot archive session");
-        return;
+        // Neither the upload nor a failure report is possible without the
+        // client; fail the process so systemd restarts it and the next attempt
+        // retries (the archive tag stays set until the box terminates).
+        bail!("control-plane client unavailable; cannot archive session {session_id}");
     };
 
     let report = match archive(imds_client, &mut control_plane, session_id).await {
@@ -97,6 +108,7 @@ async fn archive_and_report(imds_client: &aws_config::imds::client::Client, sess
             "could not report archive outcome; the server deadline will resolve it"
         );
     }
+    Ok(())
 }
 
 /// Pack the session and upload it via the presigned PUT; returns the uploaded

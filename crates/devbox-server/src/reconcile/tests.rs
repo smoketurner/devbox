@@ -984,6 +984,39 @@ mod reconcile_tests {
         assert_eq!(asg.desired_capacity, 2);
     }
 
+    /// An Archiving box whose session already resolved (e.g. the agent's done
+    /// report completed the session but the devbox flip failed mid-write) is
+    /// healed on the next tick: flipped to Terminating without waiting out the
+    /// archive deadline, and the session is left as-is.
+    #[tokio::test]
+    async fn archiving_box_with_resolved_session_terminates_before_deadline() {
+        let store = setup_store().await;
+        let compute = MockCompute::new();
+        let config = test_config(); // archive_timeout = 60s — NOT expired here
+
+        compute.seed_asg(1, 5, 1);
+        let (_, session_id) = seed_archiving_box(&store, &compute, Timestamp::now()).await;
+
+        // Resolve the session out-of-band (as session_archive_done would).
+        let session = store.get::<SessionDoc>(&session_id).await.unwrap().unwrap();
+        let mut updated = session.data.clone();
+        updated.state = SessionState::Complete;
+        store
+            .compare_and_update(&session.id, session.version, &updated)
+            .await
+            .unwrap();
+
+        reconciliation_tick(&store, &compute, &config)
+            .await
+            .unwrap();
+
+        let doc = find_doc_by_state(&store, DevboxState::Terminating).await;
+        assert!(doc.data.archive.is_none(), "gate must be cleared");
+        // The resolved session is untouched — not failed by the heal path.
+        let session = store.get::<SessionDoc>(&session_id).await.unwrap().unwrap();
+        assert_eq!(session.data.state, SessionState::Complete);
+    }
+
     /// Past the archive deadline the session is failed and the box flips to
     /// Terminating (terminated on the following tick) — never wedged.
     #[tokio::test]

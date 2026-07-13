@@ -114,8 +114,15 @@ async fn main() -> ExitCode {
         }
         Command::SessionWatch => {
             init_tracing();
-            session_watch::run().await;
-            ExitCode::SUCCESS
+            match session_watch::run().await {
+                Ok(()) => ExitCode::SUCCESS,
+                // Non-zero exit → systemd Restart=on-failure retries the
+                // archive; the request tag stays set until the box terminates.
+                Err(e) => {
+                    tracing::error!(error = %format!("{e:#}"), "session-watch failed");
+                    ExitCode::FAILURE
+                }
+            }
         }
     }
 }

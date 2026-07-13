@@ -167,14 +167,18 @@ pub(super) async fn reconciliation_tick(
 /// Step 6: Drive Archiving instances.
 ///
 /// While a box is `Archiving` its termination is deferred so the on-box agent
-/// can upload the session archive. Each tick:
-/// - **Before the deadline** (`archive.requested_at + config.archive_timeout`):
-///   re-assert the `devbox:archive-session` tag (idempotent; self-heals a failed
-///   inline tag at release time) and leave the box alone.
-/// - **Past the deadline**: mark the session Failed and flip the box to
-///   `Terminating` (owner cleared, name freed) — the archive is lost but the
-///   box is never wedged. The agent's own done-report path clears the state
-///   earlier in the happy case (see `service::session_archive_done`).
+/// can upload the session archive. Each tick, per box:
+/// - **Session already resolved** (complete/failed/gone): flip the box to
+///   `Terminating` now. This heals a partial `session_archive_done` — the
+///   session write landed but the devbox flip failed — so a finished archive
+///   never holds a protected box until the deadline.
+/// - **Pending, before the deadline** (`archive.requested_at +
+///   config.archive_timeout`): re-assert the `devbox:archive-session` tag
+///   (idempotent; self-heals a failed inline tag at release time) and leave
+///   the box alone.
+/// - **Pending, past the deadline**: mark the session Failed and flip the box
+///   to `Terminating` (owner cleared, name freed) — the archive is lost but
+///   the box is never wedged.
 ///
 /// An `Archiving` doc with no `archive` field is inconsistent (should not
 /// happen); it is flipped straight to `Terminating`.
@@ -192,17 +196,18 @@ async fn handle_archiving_instances(
             continue;
         }
 
-        let expired_session = match doc.data.archive.as_ref() {
-            Some(pending) => {
-                let deadline = pending.requested_at.checked_add(timeout).unwrap_or(now);
-                if now < deadline {
-                    apply_archive_tag(compute, &doc.data).await;
-                    continue;
-                }
-                Some(pending.session_id.clone())
+        let mut expired_session = None;
+        if let Some(pending) = doc.data.archive.as_ref() {
+            let resolved = session_resolved(store, &pending.session_id).await;
+            let deadline = pending.requested_at.checked_add(timeout).unwrap_or(now);
+            if !resolved && now < deadline {
+                apply_archive_tag(compute, &doc.data).await;
+                continue;
             }
-            None => None,
-        };
+            if !resolved {
+                expired_session = Some(pending.session_id.clone());
+            }
+        }
 
         if let Some(session_id) = expired_session.as_deref() {
             fail_session(store, session_id, "archive deadline exceeded").await;
@@ -218,12 +223,20 @@ async fn handle_archiving_instances(
             .await
         {
             Ok(true) => {
-                tracing::warn!(
-                    instance_id = %doc.data.instance_id,
-                    doc_id = %doc.id,
-                    session_id = expired_session.as_deref().unwrap_or("<none>"),
-                    "archive deadline exceeded; terminating without a session"
-                );
+                if expired_session.is_some() {
+                    tracing::warn!(
+                        instance_id = %doc.data.instance_id,
+                        doc_id = %doc.id,
+                        session_id = expired_session.as_deref().unwrap_or("<none>"),
+                        "archive deadline exceeded; terminating without a session"
+                    );
+                } else {
+                    tracing::info!(
+                        instance_id = %doc.data.instance_id,
+                        doc_id = %doc.id,
+                        "session resolved; terminating archiving box"
+                    );
+                }
             }
             Ok(false) => {
                 // The agent's done report won the race; nothing to do.
@@ -232,6 +245,20 @@ async fn handle_archiving_instances(
             Err(e) => {
                 tracing::error!(error = %e, doc_id = %doc.id, "failed to expire archiving doc");
             }
+        }
+    }
+}
+
+/// Whether the session is no longer pending: complete, failed, or its record
+/// is gone (nothing left to wait for). A transient read error counts as
+/// unresolved so the box gets its full deadline rather than an early kill.
+async fn session_resolved(store: &DocumentStore, session_id: &str) -> bool {
+    match store.get::<SessionDoc>(session_id).await {
+        Ok(Some(doc)) => doc.data.state != SessionState::Pending,
+        Ok(None) => true,
+        Err(e) => {
+            tracing::error!(error = %e, session_id, "failed to read session record");
+            false
         }
     }
 }
