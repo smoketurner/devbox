@@ -159,7 +159,15 @@ async fn pack_repo(repo: &Path, repos_dir: &Path) -> Result<Option<RepoEntry>> {
 
     let head_before = git_stdout(repo, &["rev-parse", "HEAD"]).await?;
     let branch = match git_stdout(repo, &["rev-parse", "--abbrev-ref", "HEAD"]).await? {
-        b if b == "HEAD" => "devbox-session".to_string(),
+        b if b == "HEAD" => {
+            // Detached HEAD: put the work on a real branch, or the `--branches`
+            // selectors below would miss it — the snapshot commit would exist
+            // only on HEAD, the repo would look clean to rev-list, and the
+            // bundle would silently drop the work. The branch also gives the
+            // restore something to recreate.
+            run_git(repo, &["checkout", "--quiet", "-B", "devbox-session"]).await?;
+            "devbox-session".to_string()
+        }
         b => b,
     };
 
@@ -601,6 +609,71 @@ mod tests {
             .ok()
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    }
+
+    #[tokio::test]
+    async fn detached_head_work_is_packed_and_restored() {
+        let root = temp_root();
+        let repo = seeded_repo(&root, "detached").await;
+        let workspace = root.join("workspace");
+
+        // Work on a detached HEAD: dirty tracked file + untracked file, no branch.
+        git(&repo, &["checkout", "--quiet", "--detach"]).await;
+        std::fs::write(repo.join("README.md"), "detached edit\n").unwrap();
+        std::fs::write(repo.join("scratch.txt"), "wip\n").unwrap();
+
+        let staging = root.join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let archive = pack_session(&workspace, None, &staging)
+            .await
+            .expect("pack");
+
+        // The detached work must be in the manifest, on the synthetic branch.
+        let manifest: Manifest =
+            serde_json::from_str(&std::fs::read_to_string(staging.join("manifest.json")).unwrap())
+                .unwrap();
+        let entry = manifest
+            .repos
+            .first()
+            .expect("detached work must be packed");
+        assert_eq!(entry.branch, "devbox-session");
+
+        // Restore into a fresh clone and verify the work landed.
+        let root2 = temp_root();
+        let origin = root.join("detached-origin.git");
+        let fresh_ws = root2.join("workspace");
+        let fresh_repo = fresh_ws.join("detached");
+        std::fs::create_dir_all(&fresh_ws).unwrap();
+        run_tool(
+            "git",
+            &[
+                "clone".to_string(),
+                "--quiet".to_string(),
+                origin.display().to_string(),
+                fresh_repo.display().to_string(),
+            ],
+        )
+        .await
+        .expect("clone fresh repo");
+        let extracted = root2.join("extracted");
+        std::fs::create_dir_all(&extracted).unwrap();
+        extract_archive(&archive, &extracted).await.unwrap();
+        restore_session(&extracted, &fresh_ws, None, "nobody")
+            .await
+            .expect("restore");
+
+        assert_eq!(
+            std::fs::read_to_string(fresh_repo.join("README.md")).unwrap(),
+            "detached edit\n"
+        );
+        assert!(fresh_repo.join("scratch.txt").exists());
+        let branch = git_stdout(&fresh_repo, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .await
+            .unwrap();
+        assert_eq!(branch, "devbox-session");
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&root2).ok();
     }
 
     #[tokio::test]
