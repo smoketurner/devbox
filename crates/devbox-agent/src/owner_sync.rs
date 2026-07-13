@@ -16,6 +16,7 @@
 //! their first commit is attributed correctly with no manual setup.
 
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -129,12 +130,37 @@ async fn tick(client: &Client) -> Result<Pass> {
     }
 }
 
+/// Directory for on-box state markers (root-owned, survives reboots).
+const STATE_DIR: &str = "/var/lib/devbox";
+
 /// Restore the session named by the `devbox:session-restore` tag value, if
-/// any, onto `/workspace` and the claimant's home. Strictly best-effort.
+/// any, onto `/workspace` and the claimant's home. Strictly best-effort, and
+/// **at most once per box**: the tag stays on the instance for the whole claim
+/// (the reconciler re-asserts it and never deletes tags), so a host reboot
+/// re-runs owner-sync with the tag still visible — without the marker a second
+/// restore would reset the repos to the archived snapshot, destroying work
+/// done since the first restore.
 async fn restore_session_if_requested(session_id: Option<&str>, owner: &str) {
     let Some(session_id) = session_id.map(str::trim).filter(|s| !s.is_empty()) else {
         return;
     };
+    match mark_restore_attempted(Path::new(STATE_DIR), session_id) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!(session_id, "session restore already attempted; skipping");
+            return;
+        }
+        Err(e) => {
+            // Without the marker a restore could repeat on the next run and
+            // overwrite newer work — losing the restore is the safer failure.
+            tracing::error!(
+                session_id,
+                error = %format!("{e:#}"),
+                "could not record restore attempt; skipping restore"
+            );
+            return;
+        }
+    }
     tracing::info!(session_id, "restoring session onto this box");
     if let Err(e) = crate::session_restore::run(session_id, owner).await {
         tracing::warn!(
@@ -144,6 +170,25 @@ async fn restore_session_if_requested(session_id: Option<&str>, owner: &str) {
         );
     } else {
         tracing::info!(session_id, "session restored");
+    }
+}
+
+/// Atomically record that a restore of `session_id` was attempted on this box.
+/// `Ok(true)` = first attempt (proceed); `Ok(false)` = a marker already exists
+/// (skip). The marker is written *before* the restore runs, so even an
+/// interrupted restore is never repeated over newer work.
+fn mark_restore_attempted(state_dir: &Path, session_id: &str) -> Result<bool> {
+    std::fs::create_dir_all(state_dir)
+        .with_context(|| format!("create {}", state_dir.display()))?;
+    let marker = state_dir.join(format!("session-restore-{session_id}.attempted"));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+    {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("create {}", marker.display())),
     }
 }
 
@@ -286,7 +331,7 @@ fn set_mode(path: &str, mode: u32) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Decision, decide};
+    use super::{Decision, decide, mark_restore_attempted};
 
     #[test]
     fn absent_or_empty_owner_waits() {
@@ -327,5 +372,25 @@ mod tests {
             decide(Some("ec2-user")),
             Decision::Unsafe("ec2-user".to_string())
         );
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test setup; a failure should fail the test"
+    )]
+    fn restore_marker_allows_exactly_one_attempt() {
+        let dir =
+            std::env::temp_dir().join(format!("devbox-restore-marker-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        // First attempt proceeds (and creates the state dir itself)...
+        assert!(mark_restore_attempted(&dir, "sess-1").unwrap());
+        // ...every later attempt for the same session is refused.
+        assert!(!mark_restore_attempted(&dir, "sess-1").unwrap());
+        // A different session id on the same box is independent.
+        assert!(mark_restore_attempted(&dir, "sess-2").unwrap());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
