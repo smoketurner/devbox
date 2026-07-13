@@ -39,12 +39,22 @@ enum Commands {
         /// Leave unset to keep the auto-generated name.
         #[arg(long)]
         name: Option<String>,
+        /// Restore a previously archived session onto the box (a session name
+        /// or id from `devbox sessions`).
+        #[arg(long)]
+        resume: Option<String>,
     },
     /// Release a claimed devbox.
     Release {
         /// Devbox name or id to release (defaults to your active claim).
         target: Option<String>,
+        /// Archive the session (git work-in-progress + agent context) before
+        /// the box terminates, restorable later with `claim --resume`.
+        #[arg(long)]
+        keep: bool,
     },
+    /// List your archived sessions (created by `release --keep`).
+    Sessions,
     /// Rename a claimed devbox.
     Rename {
         /// Devbox name or id to rename.
@@ -116,11 +126,14 @@ async fn main() -> Result<()> {
         Commands::Logout => {
             command::cmd_logout(&server)?;
         }
-        Commands::Claim { name } => {
-            command::cmd_claim(&http, &server, name).await?;
+        Commands::Claim { name, resume } => {
+            command::cmd_claim(&http, &server, name, resume).await?;
         }
-        Commands::Release { target } => {
-            command::cmd_release(&http, &server, target).await?;
+        Commands::Release { target, keep } => {
+            command::cmd_release(&http, &server, target, keep).await?;
+        }
+        Commands::Sessions => {
+            command::cmd_sessions(&http, &server).await?;
         }
         Commands::Rename { target, new_name } => {
             command::cmd_rename(&http, &server, target, new_name).await?;
@@ -172,7 +185,7 @@ mod tests {
         let cli = Cli::try_parse_from(["devbox", "claim", "--name", "my-proj"]).unwrap();
         assert!(matches!(
             &cli.command,
-            Commands::Claim { name } if name.as_deref() == Some("my-proj")
+            Commands::Claim { name, resume } if name.as_deref() == Some("my-proj") && resume.is_none()
         ));
     }
 
@@ -197,13 +210,38 @@ mod tests {
         let rel = Cli::try_parse_from(["devbox", "release", "calm-quilt"]).unwrap();
         assert!(matches!(
             &rel.command,
-            Commands::Release { target } if target.as_deref() == Some("calm-quilt")
+            Commands::Release { target, keep } if target.as_deref() == Some("calm-quilt") && !keep
         ));
         let stat = Cli::try_parse_from(["devbox", "status", "calm-quilt"]).unwrap();
         assert!(matches!(
             &stat.command,
             Commands::Status { target } if target.as_deref() == Some("calm-quilt")
         ));
+    }
+
+    #[test]
+    fn release_parses_keep_flag() {
+        let cli = Cli::try_parse_from(["devbox", "release", "calm-quilt", "--keep"]).unwrap();
+        assert!(matches!(
+            &cli.command,
+            Commands::Release { target, keep } if target.as_deref() == Some("calm-quilt") && *keep
+        ));
+    }
+
+    #[test]
+    fn claim_parses_resume_flag() {
+        let cli = Cli::try_parse_from(["devbox", "claim", "--resume", "calm-quilt"]).unwrap();
+        assert!(matches!(
+            &cli.command,
+            Commands::Claim { name, resume }
+                if name.is_none() && resume.as_deref() == Some("calm-quilt")
+        ));
+    }
+
+    #[test]
+    fn sessions_parses() {
+        let cli = Cli::try_parse_from(["devbox", "sessions"]).unwrap();
+        assert!(matches!(&cli.command, Commands::Sessions));
     }
 
     #[test]

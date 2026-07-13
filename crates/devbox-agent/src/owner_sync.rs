@@ -16,6 +16,7 @@
 //! their first commit is attributed correctly with no manual setup.
 
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -109,16 +110,118 @@ async fn tick(client: &Client) -> Result<Pass> {
         }
         Decision::Provision(owner) => {
             ensure_user(&owner)?;
-            // The email tag must be read before we finish. A transient IMDS error
-            // propagates so the poll loop retries instead of permanently skipping
-            // the git identity; an absent tag (`Ok(None)`) is final and just leaves
-            // it unset.
+            // The email and session-restore tags must be read before we finish.
+            // A transient IMDS error propagates so the poll loop retries
+            // (provisioning is idempotent) instead of permanently skipping the
+            // git identity or the restore; an absent tag (`Ok(None)`) is final.
             let email = imds::instance_tag(client, "devbox:owner-email")
                 .await
                 .context("read devbox:owner-email")?;
             configure_git_identity(&owner, email.as_deref());
+            let restore = imds::instance_tag(client, "devbox:session-restore")
+                .await
+                .context("read devbox:session-restore")?;
+            // The restore itself stays best-effort: any failure past the tag
+            // read logs and continues — the account is already usable and a
+            // restore failure must never brick the claim.
+            restore_session_if_requested(restore.as_deref(), &owner).await;
             Ok(Pass::Done)
         }
+    }
+}
+
+/// Directory for on-box state markers (root-owned, survives reboots).
+const STATE_DIR: &str = "/var/lib/devbox";
+
+/// Gate file present while a session restore is rewriting `/workspace`. The
+/// `principals` resolver authorizes no one while it is fresh, so the claimant
+/// cannot SSH in and race the restore mid-rewrite.
+pub(crate) const RESTORE_GATE: &str = "/var/lib/devbox/restore-in-progress";
+
+/// Age past which the gate is ignored: a restore killed hard (crash, OOM)
+/// leaves the file behind, and a stale gate must delay logins, not brick the
+/// box. Far above any realistic restore duration (the download itself caps at
+/// 300 s).
+pub(crate) const RESTORE_GATE_MAX_AGE: Duration = Duration::from_secs(900);
+
+/// Whether the restore gate at `path` is active (present and fresher than
+/// `max_age`). Missing file, unreadable metadata, or an old mtime all read as
+/// inactive — the gate bounds a short race window; it must never permanently
+/// lock a box out.
+pub(crate) fn restore_gate_active(path: &Path, max_age: Duration) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    meta.modified()
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age <= max_age)
+}
+
+/// Restore the session named by the `devbox:session-restore` tag value, if
+/// any, onto `/workspace` and the claimant's home. Strictly best-effort, and
+/// **at most once per box**: the tag stays on the instance for the whole claim
+/// (the reconciler re-asserts it and never deletes tags), so a host reboot
+/// re-runs owner-sync with the tag still visible — without the marker a second
+/// restore would reset the repos to the archived snapshot, destroying work
+/// done since the first restore.
+async fn restore_session_if_requested(session_id: Option<&str>, owner: &str) {
+    let Some(session_id) = session_id.map(str::trim).filter(|s| !s.is_empty()) else {
+        return;
+    };
+    match mark_restore_attempted(Path::new(STATE_DIR), session_id) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!(session_id, "session restore already attempted; skipping");
+            return;
+        }
+        Err(e) => {
+            // Without the marker a restore could repeat on the next run and
+            // overwrite newer work — losing the restore is the safer failure.
+            tracing::error!(
+                session_id,
+                error = %format!("{e:#}"),
+                "could not record restore attempt; skipping restore"
+            );
+            return;
+        }
+    }
+    tracing::info!(session_id, "restoring session onto this box");
+    // Gate SSH while the restore rewrites /workspace: the account already
+    // exists, so without this a fast claimant could log in and race the
+    // restore mid-rewrite. principals ignores the gate past
+    // RESTORE_GATE_MAX_AGE, so a crash here delays logins, never bricks the box.
+    if let Err(e) = std::fs::write(RESTORE_GATE, b"") {
+        tracing::warn!(error = %e, "could not write restore gate; restoring anyway");
+    }
+    if let Err(e) = crate::session_restore::run(session_id, owner).await {
+        tracing::warn!(
+            session_id,
+            error = %format!("{e:#}"),
+            "session restore failed; continuing with a fresh box"
+        );
+    } else {
+        tracing::info!(session_id, "session restored");
+    }
+    std::fs::remove_file(RESTORE_GATE).ok();
+}
+
+/// Atomically record that a restore of `session_id` was attempted on this box.
+/// `Ok(true)` = first attempt (proceed); `Ok(false)` = a marker already exists
+/// (skip). The marker is written *before* the restore runs, so even an
+/// interrupted restore is never repeated over newer work.
+fn mark_restore_attempted(state_dir: &Path, session_id: &str) -> Result<bool> {
+    std::fs::create_dir_all(state_dir)
+        .with_context(|| format!("create {}", state_dir.display()))?;
+    let marker = state_dir.join(format!("session-restore-{session_id}.attempted"));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+    {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("create {}", marker.display())),
     }
 }
 
@@ -209,7 +312,7 @@ fn configure_git_identity(user: &str, email: Option<&str>) {
 }
 
 /// The home directory of an existing Unix account, read from `getent passwd`.
-fn user_home(user: &str) -> Option<String> {
+pub(crate) fn user_home(user: &str) -> Option<String> {
     let output = Command::new("getent")
         .arg("passwd")
         .arg(user)
@@ -261,7 +364,7 @@ fn set_mode(path: &str, mode: u32) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Decision, decide};
+    use super::{Decision, decide, mark_restore_attempted};
 
     #[test]
     fn absent_or_empty_owner_waits() {
@@ -302,5 +405,57 @@ mod tests {
             decide(Some("ec2-user")),
             Decision::Unsafe("ec2-user".to_string())
         );
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test setup; a failure should fail the test"
+    )]
+    fn restore_gate_reads_presence_and_age() {
+        let dir = std::env::temp_dir().join(format!("devbox-restore-gate-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let gate = dir.join("restore-in-progress");
+
+        // Missing gate: inactive.
+        assert!(!super::restore_gate_active(
+            &gate,
+            super::RESTORE_GATE_MAX_AGE
+        ));
+        // Fresh gate: active.
+        std::fs::write(&gate, b"").unwrap();
+        assert!(super::restore_gate_active(
+            &gate,
+            super::RESTORE_GATE_MAX_AGE
+        ));
+        // Past its max age the gate is ignored (a crashed restore must delay
+        // logins, not brick the box).
+        assert!(!super::restore_gate_active(
+            &gate,
+            std::time::Duration::ZERO
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test setup; a failure should fail the test"
+    )]
+    fn restore_marker_allows_exactly_one_attempt() {
+        let dir =
+            std::env::temp_dir().join(format!("devbox-restore-marker-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        // First attempt proceeds (and creates the state dir itself)...
+        assert!(mark_restore_attempted(&dir, "sess-1").unwrap());
+        // ...every later attempt for the same session is refused.
+        assert!(!mark_restore_attempted(&dir, "sess-1").unwrap());
+        // A different session id on the same box is independent.
+        assert!(mark_restore_attempted(&dir, "sess-2").unwrap());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -26,6 +26,12 @@ pub struct ReconcilerConfig {
     /// A Warming doc older than this whose instance has not set `devbox:ready=true`
     /// is terminated (ASG relaunches a replacement) and its doc set to Terminating.
     pub ready_timeout: Duration,
+    /// Maximum time an Archiving box may spend uploading its session archive.
+    ///
+    /// Past this deadline the session is marked Failed and the box flips to
+    /// Terminating anyway — a `release --keep` can lose its archive but can
+    /// never wedge an instance.
+    pub archive_timeout: Duration,
 }
 
 impl ReconcilerConfig {
@@ -41,6 +47,10 @@ impl ReconcilerConfig {
         let ready_secs = self.ready_timeout.as_secs();
         if !(60..=3600).contains(&ready_secs) {
             bail!("ready_timeout must be between 60 and 3600 seconds, got {ready_secs}");
+        }
+        let archive_secs = self.archive_timeout.as_secs();
+        if !(60..=3600).contains(&archive_secs) {
+            bail!("archive_timeout must be between 60 and 3600 seconds, got {archive_secs}");
         }
         if self.polling_interval.is_zero() {
             bail!("polling_interval must be greater than zero");
@@ -66,6 +76,7 @@ impl Default for ReconcilerConfig {
             polling_interval: Duration::from_secs(30),
             lock_ttl: Duration::from_secs(60),
             ready_timeout: Duration::from_secs(300),
+            archive_timeout: Duration::from_secs(600),
         }
     }
 }
@@ -82,7 +93,19 @@ mod tests {
             polling_interval: Duration::from_secs(30),
             lock_ttl: Duration::from_secs(60),
             ready_timeout: Duration::from_secs(300),
+            archive_timeout: Duration::from_secs(600),
         }
+    }
+
+    #[test]
+    fn archive_timeout_out_of_range_is_rejected() {
+        let mut cfg = valid_config();
+        cfg.archive_timeout = Duration::from_secs(59);
+        assert!(cfg.validate().is_err());
+        cfg.archive_timeout = Duration::from_secs(3601);
+        assert!(cfg.validate().is_err());
+        cfg.archive_timeout = Duration::from_secs(600);
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

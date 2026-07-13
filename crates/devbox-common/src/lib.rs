@@ -384,7 +384,9 @@ pub struct ProtectedResourceMetadata {
 
 /// State machine for devbox instances.
 ///
-/// Lifecycle: Launching -> Warming -> Ready -> Claimed -> Terminating
+/// Lifecycle: Launching -> Warming -> Ready -> Claimed -> Terminating.
+/// A `release --keep` detours through Archiving between Claimed and
+/// Terminating while the on-box agent uploads the session archive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DevboxState {
@@ -396,6 +398,10 @@ pub enum DevboxState {
     Ready,
     /// Instance has been claimed by a user.
     Claimed,
+    /// Instance is uploading its session archive before terminating
+    /// (`release --keep`). Owner and name are kept until the archive
+    /// completes or times out.
+    Archiving,
     /// Instance is being terminated.
     Terminating,
 }
@@ -407,6 +413,7 @@ impl std::fmt::Display for DevboxState {
             Self::Warming => "warming",
             Self::Ready => "ready",
             Self::Claimed => "claimed",
+            Self::Archiving => "archiving",
             Self::Terminating => "terminating",
         };
         // `f.pad` (not `write!`) so format width/alignment like `{:<12}` is
@@ -432,6 +439,21 @@ pub struct ClaimRequest {
     /// auto-generated name. Must satisfy [`is_valid_devbox_name`].
     #[serde(default)]
     pub name: Option<String>,
+    /// Optional session to restore onto the claimed box: a session name or id
+    /// previously produced by `release --keep`. The session must belong to the
+    /// caller and be complete.
+    #[serde(default)]
+    pub resume: Option<String>,
+}
+
+/// Request to release a claimed devbox.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReleaseRequest {
+    /// Archive the session (git work-in-progress + agent context) to durable
+    /// storage before the box terminates, so it can be restored later with
+    /// `claim --resume`.
+    #[serde(default)]
+    pub keep_session: bool,
 }
 
 /// Request to rename a claimed devbox.
@@ -569,6 +591,59 @@ pub struct WarmupReportRequest {
 pub struct WarmupReportResponse {}
 
 // ============================================================================
+// Agent session-archive API
+// ============================================================================
+
+/// Request body for `POST /api/v1/agent/session-archive-url`: mint a presigned
+/// PUT URL for the session archive this box was asked to produce (the
+/// `devbox:archive-session` tag value).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionArchiveUrlRequest {
+    pub session_id: String,
+}
+
+/// Response body for `POST /api/v1/agent/session-archive-url`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionArchiveUrlResponse {
+    /// Presigned S3 PUT URL for the archive object.
+    pub url: String,
+}
+
+/// Request body for `POST /api/v1/agent/session-archive-done`: report the
+/// outcome of the archive upload. A failure report lets the server fail the
+/// session immediately instead of waiting out the archive deadline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionArchiveDoneRequest {
+    pub session_id: String,
+    pub success: bool,
+    /// Uploaded archive size, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    /// Truncated failure summary when `success` is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Response body for `POST /api/v1/agent/session-archive-done`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionArchiveDoneResponse {}
+
+/// Request body for `POST /api/v1/agent/session-restore-url`: mint a presigned
+/// GET URL for the session this box was asked to restore (the
+/// `devbox:session-restore` tag value).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRestoreUrlRequest {
+    pub session_id: String,
+}
+
+/// Response body for `POST /api/v1/agent/session-restore-url`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRestoreUrlResponse {
+    /// Presigned S3 GET URL for the archive object.
+    pub url: String,
+}
+
+// ============================================================================
 // API Response Types
 // ============================================================================
 
@@ -591,6 +666,55 @@ pub struct DevboxResponse {
     pub region: String,
     pub created_at: String,
     pub claimed_at: Option<String>,
+    /// The session created by `release --keep`, echoed on the release
+    /// response so the CLI can tell the user what to `--resume` later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionResponse>,
+}
+
+/// Lifecycle of a session archive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionState {
+    /// Archive requested; the box has not finished uploading yet.
+    Pending,
+    /// Archive uploaded and restorable.
+    Complete,
+    /// Archive never completed (upload failure or deadline hit).
+    Failed,
+}
+
+impl std::fmt::Display for SessionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Pending => "pending",
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+        };
+        f.pad(s)
+    }
+}
+
+/// Response representing a stored session archive.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionResponse {
+    pub id: String,
+    /// The name of the box the session was archived from; the selector for
+    /// `claim --resume`.
+    pub name: String,
+    pub state: SessionState,
+    pub source_devbox: String,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+}
+
+/// Response listing the caller's session archives.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionListResponse {
+    pub sessions: Vec<SessionResponse>,
 }
 
 /// Response representing a list of devboxes.
@@ -618,6 +742,9 @@ pub struct PoolMetricsResponse {
     pub warming: u32,
     pub ready: u32,
     pub claimed: u32,
+    /// Boxes uploading a session archive before terminating.
+    #[serde(default)]
+    pub archiving: u32,
     pub terminating: u32,
     /// Ready or Claimed boxes whose warm-up report says the caches were warm.
     /// Absent (0) when talking to a server that predates the field.
@@ -690,6 +817,7 @@ mod tests {
             DevboxState::Warming,
             DevboxState::Ready,
             DevboxState::Claimed,
+            DevboxState::Archiving,
             DevboxState::Terminating,
         ];
 
@@ -698,6 +826,46 @@ mod tests {
             let parsed: DevboxState = serde_json::from_str(&json).unwrap();
             assert_eq!(state, parsed);
         }
+    }
+
+    #[test]
+    fn archiving_state_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&DevboxState::Archiving).unwrap(),
+            r#""archiving""#
+        );
+        assert_eq!(DevboxState::Archiving.to_string(), "archiving");
+    }
+
+    #[test]
+    fn claim_request_without_resume_deserializes_to_none() {
+        let parsed: ClaimRequest = serde_json::from_str(r#"{"name":"calm-quilt"}"#).unwrap();
+        assert!(parsed.resume.is_none());
+    }
+
+    #[test]
+    fn release_request_defaults_to_not_keeping() {
+        let parsed: ReleaseRequest = serde_json::from_str("{}").unwrap();
+        assert!(!parsed.keep_session);
+    }
+
+    #[test]
+    fn session_response_serde_roundtrip() {
+        let resp = SessionResponse {
+            id: "0197-abc".to_string(),
+            name: "calm-quilt".to_string(),
+            state: SessionState::Complete,
+            source_devbox: "i-1234567890abcdef0".to_string(),
+            created_at: "2026-07-12T00:00:00Z".to_string(),
+            expires_at: Some("2026-08-11T00:00:00Z".to_string()),
+            size_bytes: Some(1024),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: SessionResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.state, SessionState::Complete);
+        assert_eq!(parsed.size_bytes, Some(1024));
+        assert_eq!(SessionState::Pending.to_string(), "pending");
+        assert_eq!(SessionState::Failed.to_string(), "failed");
     }
 
     #[test]
@@ -728,6 +896,7 @@ mod tests {
     fn test_claim_request_serde() {
         let req = ClaimRequest {
             name: Some("calm-quilt".to_string()),
+            resume: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ClaimRequest = serde_json::from_str(&json).unwrap();
@@ -846,6 +1015,7 @@ mod tests {
             warming: 2,
             ready: 3,
             claimed: 4,
+            archiving: 0,
             terminating: 5,
             warm: 1,
         };

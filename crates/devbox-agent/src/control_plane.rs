@@ -23,7 +23,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use aws_config::BehaviorVersion;
 use aws_sdk_sts::config::Region;
-use devbox_common::{GitTokenRequest, GitTokenResponse, WarmupReportRequest, env_non_empty};
+use devbox_common::{
+    GitTokenRequest, GitTokenResponse, SessionArchiveDoneRequest, SessionArchiveDoneResponse,
+    SessionArchiveUrlRequest, SessionArchiveUrlResponse, SessionRestoreUrlRequest,
+    SessionRestoreUrlResponse, WarmupReportRequest, env_non_empty,
+};
 
 const SERVER_URL_ENV: &str = "DEVBOX_SERVER_URL";
 
@@ -144,6 +148,57 @@ impl ControlPlaneClient {
             anyhow::bail!("warmup-report failed ({status}): {body}");
         }
         Ok(true)
+    }
+
+    /// A presigned S3 PUT URL for the session archive this box was asked to
+    /// produce (the `devbox:archive-session` tag value).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the web-identity mint or the control-plane request
+    /// fails (including a session/instance mismatch, which the server rejects).
+    pub(crate) async fn session_archive_url(&mut self, session_id: &str) -> Result<String> {
+        let req = SessionArchiveUrlRequest {
+            session_id: session_id.to_string(),
+        };
+        let resp: SessionArchiveUrlResponse = self
+            .post_json("/api/v1/agent/session-archive-url", &req)
+            .await?;
+        Ok(resp.url)
+    }
+
+    /// Report the archive upload outcome (success and failure both) so the
+    /// server resolves the session and lets the box terminate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the web-identity mint or the control-plane request
+    /// fails; the server's archive deadline still resolves the box.
+    pub(crate) async fn session_archive_done(
+        &mut self,
+        report: &SessionArchiveDoneRequest,
+    ) -> Result<()> {
+        let _resp: SessionArchiveDoneResponse = self
+            .post_json("/api/v1/agent/session-archive-done", report)
+            .await?;
+        Ok(())
+    }
+
+    /// A presigned S3 GET URL for the session this box was asked to restore
+    /// (the `devbox:session-restore` tag value).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the web-identity mint or the control-plane request
+    /// fails (including a session/instance mismatch or an incomplete session).
+    pub(crate) async fn session_restore_url(&mut self, session_id: &str) -> Result<String> {
+        let req = SessionRestoreUrlRequest {
+            session_id: session_id.to_string(),
+        };
+        let resp: SessionRestoreUrlResponse = self
+            .post_json("/api/v1/agent/session-restore-url", &req)
+            .await?;
+        Ok(resp.url)
     }
 
     /// Mint/refresh the cached web-identity JWT and POST `body` as JSON to
