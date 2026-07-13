@@ -101,12 +101,13 @@ async fn archive_and_report(
     };
 
     if let Err(e) = control_plane.session_archive_done(&report).await {
-        // The server's archive deadline still terminates the box.
-        tracing::warn!(
-            session_id,
-            error = %format!("{e:#}"),
-            "could not report archive outcome; the server deadline will resolve it"
-        );
+        // Exit non-zero so systemd restarts the service and the report is
+        // retried: without it the session would sit Pending until the server
+        // deadline marks it failed — even when the archive object is already
+        // in S3. A restart re-packs and re-uploads (both idempotent) and
+        // reports again; the box terminates either way once the server
+        // resolves the session or the deadline passes.
+        return Err(e.context("report archive outcome"));
     }
     Ok(())
 }
