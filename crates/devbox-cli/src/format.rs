@@ -1,6 +1,6 @@
 //! Output formatting functions for the devbox CLI.
 
-use devbox_common::{DevboxListResponse, DevboxResponse, format_timestamp_str};
+use devbox_common::{DevboxListResponse, DevboxResponse, SessionResponse, format_timestamp_str};
 
 /// Format a list of devboxes as a column-aligned table.
 pub(crate) fn format_list_table(list: &DevboxListResponse) -> String {
@@ -73,6 +73,55 @@ pub(crate) fn format_release_success(d: &DevboxResponse) -> String {
 /// Format a successful rename confirmation.
 pub(crate) fn format_rename_success(d: &DevboxResponse) -> String {
     format!("Renamed devbox to {}", d.name)
+}
+
+/// Format the caller's archived sessions as a column-aligned table.
+pub(crate) fn format_sessions_table(sessions: &[SessionResponse]) -> String {
+    if sessions.is_empty() {
+        return "No archived sessions. Create one with `devbox release --keep`.".to_string();
+    }
+    let header = format!(
+        "{:<18}  {:<10}  {:<10}  {:<20}  {}",
+        "NAME", "STATE", "SIZE", "CREATED", "EXPIRES"
+    );
+    let separator = "-".repeat(header.len());
+    let mut lines = vec![header, separator];
+
+    for s in sessions {
+        let size = s
+            .size_bytes
+            .map_or_else(|| "-".to_string(), format_size_bytes);
+        let created = format_timestamp_str(&s.created_at);
+        let expires = s
+            .expires_at
+            .as_deref()
+            .map_or_else(|| "-".to_string(), format_timestamp_str);
+        lines.push(format!(
+            "{:<18}  {:<10}  {:<10}  {:<20}  {}",
+            s.name, s.state, size, created, expires,
+        ));
+    }
+    lines.push(String::new());
+    lines.push("Resume one with `devbox claim --resume <name>`.".to_string());
+    lines.join("\n")
+}
+
+/// A byte count as a compact human-readable size.
+fn format_size_bytes(bytes: u64) -> String {
+    const UNITS: &[(u64, &str)] = &[(1 << 30, "GiB"), (1 << 20, "MiB"), (1 << 10, "KiB")];
+    for (scale, unit) in UNITS {
+        if bytes >= *scale {
+            let whole = bytes.checked_div(*scale).unwrap_or(0);
+            let tenths = bytes
+                .checked_rem(*scale)
+                .unwrap_or(0)
+                .saturating_mul(10)
+                .checked_div(*scale)
+                .unwrap_or(0);
+            return format!("{whole}.{tenths} {unit}");
+        }
+    }
+    format!("{bytes} B")
 }
 
 #[cfg(test)]
@@ -210,5 +259,37 @@ mod tests {
         let output = format_rename_success(&d);
         assert!(output.contains("Renamed devbox to my-feature"));
         assert!(!output.contains("test-id"));
+    }
+
+    #[test]
+    fn sessions_table_lists_and_hints_resume() {
+        use devbox_common::SessionState;
+        let sessions = vec![SessionResponse {
+            id: "0197-abc".to_string(),
+            name: "calm-quilt".to_string(),
+            state: SessionState::Complete,
+            source_devbox: "i-1234567890abcdef0".to_string(),
+            created_at: "2026-07-12T00:00:00Z".to_string(),
+            expires_at: Some("2026-08-11T00:00:00Z".to_string()),
+            size_bytes: Some(2 * 1024 * 1024),
+        }];
+        let output = format_sessions_table(&sessions);
+        assert!(output.contains("calm-quilt"));
+        assert!(output.contains("complete"));
+        assert!(output.contains("2.0 MiB"));
+        assert!(output.contains("--resume"));
+    }
+
+    #[test]
+    fn sessions_table_empty_suggests_keep() {
+        assert!(format_sessions_table(&[]).contains("release --keep"));
+    }
+
+    #[test]
+    fn size_formatting_covers_units() {
+        assert_eq!(format_size_bytes(512), "512 B");
+        assert_eq!(format_size_bytes(2048), "2.0 KiB");
+        assert_eq!(format_size_bytes(1024 * 1024 + 512 * 1024), "1.5 MiB");
+        assert_eq!(format_size_bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
     }
 }

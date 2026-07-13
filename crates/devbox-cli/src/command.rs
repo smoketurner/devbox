@@ -11,8 +11,8 @@ use anyhow::{Context, Result, bail};
 use dialoguer::Select;
 
 use devbox_common::{
-    ClaimRequest, DevboxListResponse, DevboxResponse, DevboxState, ErrorBody, RenameRequest,
-    is_valid_devbox_name,
+    ClaimRequest, DevboxListResponse, DevboxResponse, DevboxState, ErrorBody, ReleaseRequest,
+    RenameRequest, SessionListResponse, is_valid_devbox_name,
 };
 
 use crate::format;
@@ -340,6 +340,7 @@ pub(crate) async fn cmd_claim(
     http: &reqwest::Client,
     server: &str,
     name: Option<String>,
+    resume: Option<String>,
 ) -> Result<()> {
     let session = require_session(server)?;
     // Normalize blank → None and reject an obviously invalid name before
@@ -353,8 +354,11 @@ pub(crate) async fn cmd_claim(
              '_' or '-', not starting with '-'"
         );
     }
+    let resume = resume
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let url = format!("{server}/api/v1/devboxes/claim");
-    let req = ClaimRequest { name, resume: None };
+    let req = ClaimRequest { name, resume };
     let resp = with_auth(http.post(&url).json(&req), &session.token)
         .send()
         .await
@@ -370,16 +374,18 @@ pub(crate) async fn cmd_claim(
     }
 }
 
-/// Release a claimed devbox.
+/// Release a claimed devbox, optionally archiving its session (`--keep`).
 pub(crate) async fn cmd_release(
     http: &reqwest::Client,
     server: &str,
     target: Option<String>,
+    keep: bool,
 ) -> Result<()> {
     let session = require_session(server)?;
     let id = resolve_target(target, server, http, &session).await?;
     let url = format!("{server}/api/v1/devboxes/{id}/release");
-    let resp = with_auth(http.post(&url), &session.token)
+    let req = ReleaseRequest { keep_session: keep };
+    let resp = with_auth(http.post(&url).json(&req), &session.token)
         .send()
         .await
         .context("failed to send release request")?;
@@ -388,6 +394,30 @@ pub(crate) async fn cmd_release(
         let devbox: DevboxResponse = resp.json().await.context("failed to parse response")?;
         forget_claim(&id, server);
         println!("{}", format::format_release_success(&devbox));
+        if let Some(archived) = &devbox.session {
+            println!(
+                "Archiving session '{}' — resume it later with `devbox claim --resume {}`",
+                archived.name, archived.name
+            );
+        }
+        Ok(())
+    } else {
+        Err(http_error(resp).await)
+    }
+}
+
+/// List the caller's archived sessions.
+pub(crate) async fn cmd_sessions(http: &reqwest::Client, server: &str) -> Result<()> {
+    let session = require_session(server)?;
+    let url = format!("{server}/api/v1/sessions");
+    let resp = with_auth(http.get(&url), &session.token)
+        .send()
+        .await
+        .context("failed to query sessions")?;
+
+    if resp.status().is_success() {
+        let list: SessionListResponse = resp.json().await.context("failed to parse response")?;
+        println!("{}", format::format_sessions_table(&list.sessions));
         Ok(())
     } else {
         Err(http_error(resp).await)
