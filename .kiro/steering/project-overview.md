@@ -24,13 +24,14 @@ Devbox is a Rust workspace with these crates:
 Each devbox instance moves through a state machine:
 
 ```
-Launching -> Warming -> Ready -> Claimed -> Terminating
+Launching -> Warming -> Ready -> Claimed -> [Archiving ->] Terminating
 ```
 
 - **Launching** - EC2 RunInstances has been called, instance is starting
 - **Warming** - Instance is running but still initializing (installing tools, mounting EBS)
 - **Ready** - Instance is warm and available for claim
 - **Claimed** - A user/agent has claimed this instance and is using it
+- **Archiving** - Instance is uploading session archive before termination (`release --keep`)
 - **Terminating** - Instance is being torn down
 
 ### Pool Reconciliation (ASG-based)

@@ -7,7 +7,7 @@
 | Shared types (DevboxId, DevboxState, API types) | `crates/devbox-common/src/lib.rs` |
 | CLI binary + subcommands | `crates/devbox-cli/src/main.rs` (Clap definitions), `crates/devbox-cli/src/command.rs` (handlers), `crates/devbox-cli/src/state.rs`, `crates/devbox-cli/src/auth.rs`, `crates/devbox-cli/src/session.rs` |
 | Server binary entry point | `crates/devbox-server/src/main.rs` |
-| On-host agent (principals / owner-sync / warmup / checkout / doctor) | `crates/devbox-agent/src/` |
+| On-host agent (principals / owner-sync / warmup / checkout / doctor / session-watch) | `crates/devbox-agent/src/` |
 | Server library root | `crates/devbox-server/src/lib.rs` |
 | HTTP route handlers | `crates/devbox-server/src/routes.rs` (HTTP layer), `crates/devbox-server/src/service.rs` (domain logic) |
 | UI (HTML dashboard) routes | `crates/devbox-server/src/ui.rs` |
@@ -24,6 +24,10 @@
 | Migration runner | `crates/devbox-server/src/db/migrations.rs` |
 | Database tests | `crates/devbox-server/src/db/tests.rs` |
 | DevboxDoc document type | `crates/devbox-server/src/documents/devbox.rs` |
+| SessionDoc document type | `crates/devbox-server/src/documents/session.rs` |
+| Session archive pack/restore | `crates/devbox-agent/src/session.rs` |
+| Session-watch service (archives on release --keep) | `crates/devbox-agent/src/session_watch.rs` |
+| Presigned URL access to session bucket | `crates/devbox-server/src/sessions.rs` |
 | SQLite migrations | `crates/devbox-server/migrations/sqlite/` |
 | Postgres migrations | `crates/devbox-server/migrations/postgres/` |
 | HTML templates | `crates/devbox-server/templates/` |

@@ -8,8 +8,9 @@ control-plane HTTP API to claim, release, inspect, and SSH into remote dev boxes
 ```
 devbox login                                         # authenticate via device-code OAuth
 devbox logout                                        # clear the cached session token
-devbox claim   [--instance-type <t>]                 # claim a Ready devbox
-devbox release [--id <id>]                           # release a claimed devbox
+devbox claim   [--instance-type <t>] [--resume <session>]  # claim a Ready devbox
+devbox release [--id <id>] [--keep]                         # release a claimed devbox
+devbox sessions                                             # list archived sessions
 devbox rename  <target> <new-name>                   # rename a claimed devbox
 devbox list                                          # list all devboxes (table)
 devbox status  [--id <id>]                           # one devbox, key/value

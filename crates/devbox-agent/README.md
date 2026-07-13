@@ -7,7 +7,7 @@ never calls the devbox control plane — it only reads its own instance metadata
 (IMDS) and calls the AWS Auto Scaling API for its own instance, using the host
 instance profile.
 
-One binary, five subcommands, each wired to a different host trigger:
+One binary, six subcommands, each wired to a different host trigger:
 
 | Subcommand | Triggered by | Job |
 |------------|--------------|-----|
@@ -15,6 +15,7 @@ One binary, five subcommands, each wired to a different host trigger:
 | `owner-sync` | `devbox-owner-sync.service` (systemd) | Provision the claimant's Unix account + git identity, then exit |
 | `warmup` | `devbox-warmup.service` (systemd, at boot) | Freshen `/workspace` repos, then self-tag `devbox:ready=true` |
 | `checkout <urls>` | the snapshot-builder, or a developer/agent on a claimed box | Clone repos into `/workspace`, minting a read-only token per repo |
+| `session-watch` | `devbox-session-watch.service` (systemd) | Archive session on `release --keep`, then terminate |
 | `doctor` | operator on a claimed box, via `devbox ssh -- devbox-agent doctor` | Print a read-only diagnostic of warm-cache delivery |
 
 ## `principals` — per-claim SSH authorization
@@ -38,6 +39,10 @@ creates that account (`useradd -m -G docker`, passwordless sudo, ownership of
 `/workspace`) and **exits**. A devbox is claimed once and terminated on release,
 so there is nothing to do afterwards; the unit uses `Restart=on-failure` so a
 clean exit stays stopped.
+
+If the `devbox:session-restore` tag is present (set by `claim --resume`),
+`owner-sync` downloads the archived session via a presigned GET and restores the
+working state before exiting — best-effort, never bricks a claim.
 
 It then reads the `devbox:owner-email` tag (set inline at claim time from the
 claimant's token email, alongside `devbox:owner`) and writes their git identity —
