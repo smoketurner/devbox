@@ -323,12 +323,14 @@ pub(crate) async fn restore_session(
         }
         // The restore runs as root after owner-sync already handed /workspace
         // to the claimant, so files it (re)wrote are root-owned — hand them
-        // back. Best-effort like the rest of the restore.
+        // back. User only, no `:group` (the claimant's group name is not
+        // guaranteed to equal the login). Best-effort like the rest of the
+        // restore.
         if let Err(e) = run_tool(
             "chown",
             &[
                 "-R".to_string(),
-                format!("{owner}:{owner}"),
+                owner.to_string(),
                 repo.display().to_string(),
             ],
         )
@@ -382,7 +384,8 @@ async fn restore_repo(repo: &Path, bundle: &Path, entry: &RepoEntry) -> Result<(
 }
 
 /// Copy the archived home entries over the fresh home and chown them to the
-/// claimant.
+/// claimant. A failed chown warns and moves on — an entry the claimant may
+/// have to `sudo chown` beats silently dropping the entries after it.
 async fn restore_home(extracted: &Path, home: &Path, owner: &str) -> Result<()> {
     let source = extracted.join("home");
     let entries =
@@ -399,15 +402,22 @@ async fn restore_home(extracted: &Path, home: &Path, owner: &str) -> Result<()> 
         )
         .await?;
         let target = home.join(entry.file_name());
-        run_tool(
+        if let Err(e) = run_tool(
             "chown",
             &[
                 "-R".to_string(),
-                format!("{owner}:{owner}"),
+                owner.to_string(),
                 target.display().to_string(),
             ],
         )
-        .await?;
+        .await
+        {
+            tracing::warn!(
+                entry = %target.display(),
+                error = %format!("{e:#}"),
+                "failed to hand restored home entry to the claimant"
+            );
+        }
     }
     Ok(())
 }
@@ -680,7 +690,11 @@ mod tests {
         let extracted = root2.join("extracted");
         std::fs::create_dir_all(&extracted).unwrap();
         extract_archive(&archive, &extracted).await.unwrap();
-        restore_session(&extracted, &fresh_ws, None, "nobody")
+        // Restore as the current user: chowning to anyone else would either
+        // fail (unprivileged) or make the repo unreadable to this process's
+        // git (root + a foreign-owned repo trips safe.directory).
+        let owner = users_current().unwrap_or_else(|| "root".to_string());
+        restore_session(&extracted, &fresh_ws, None, &owner)
             .await
             .expect("restore");
 
