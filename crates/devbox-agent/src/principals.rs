@@ -8,12 +8,21 @@
 //! authorizes the certificate principal and pins the login account to it.
 //!
 //! Fail closed: any error, an absent tag, or a mismatch prints nothing, so sshd
-//! authorizes no principals and rejects the login.
+//! authorizes no principals and rejects the login. Logins are also held while
+//! a session restore is rewriting `/workspace` (`claim --resume`), so the
+//! claimant cannot race the restore — the gate self-expires, so a crashed
+//! restore only delays logins.
+
+use std::path::Path;
 
 use crate::imds;
+use crate::owner_sync::{RESTORE_GATE, RESTORE_GATE_MAX_AGE, restore_gate_active};
 
 /// Print the authorized principal for `login_user`, or nothing.
 pub(crate) async fn run(login_user: &str) {
+    if restore_gate_active(Path::new(RESTORE_GATE), RESTORE_GATE_MAX_AGE) {
+        return;
+    }
     let owner = current_owner().await;
     if let Some(principal) = authorized_principal(owner.as_deref(), login_user) {
         println!("{principal}");

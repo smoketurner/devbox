@@ -133,6 +133,31 @@ async fn tick(client: &Client) -> Result<Pass> {
 /// Directory for on-box state markers (root-owned, survives reboots).
 const STATE_DIR: &str = "/var/lib/devbox";
 
+/// Gate file present while a session restore is rewriting `/workspace`. The
+/// `principals` resolver authorizes no one while it is fresh, so the claimant
+/// cannot SSH in and race the restore mid-rewrite.
+pub(crate) const RESTORE_GATE: &str = "/var/lib/devbox/restore-in-progress";
+
+/// Age past which the gate is ignored: a restore killed hard (crash, OOM)
+/// leaves the file behind, and a stale gate must delay logins, not brick the
+/// box. Far above any realistic restore duration (the download itself caps at
+/// 300 s).
+pub(crate) const RESTORE_GATE_MAX_AGE: Duration = Duration::from_secs(900);
+
+/// Whether the restore gate at `path` is active (present and fresher than
+/// `max_age`). Missing file, unreadable metadata, or an old mtime all read as
+/// inactive — the gate bounds a short race window; it must never permanently
+/// lock a box out.
+pub(crate) fn restore_gate_active(path: &Path, max_age: Duration) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    meta.modified()
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age <= max_age)
+}
+
 /// Restore the session named by the `devbox:session-restore` tag value, if
 /// any, onto `/workspace` and the claimant's home. Strictly best-effort, and
 /// **at most once per box**: the tag stays on the instance for the whole claim
@@ -162,6 +187,13 @@ async fn restore_session_if_requested(session_id: Option<&str>, owner: &str) {
         }
     }
     tracing::info!(session_id, "restoring session onto this box");
+    // Gate SSH while the restore rewrites /workspace: the account already
+    // exists, so without this a fast claimant could log in and race the
+    // restore mid-rewrite. principals ignores the gate past
+    // RESTORE_GATE_MAX_AGE, so a crash here delays logins, never bricks the box.
+    if let Err(e) = std::fs::write(RESTORE_GATE, b"") {
+        tracing::warn!(error = %e, "could not write restore gate; restoring anyway");
+    }
     if let Err(e) = crate::session_restore::run(session_id, owner).await {
         tracing::warn!(
             session_id,
@@ -171,6 +203,7 @@ async fn restore_session_if_requested(session_id: Option<&str>, owner: &str) {
     } else {
         tracing::info!(session_id, "session restored");
     }
+    std::fs::remove_file(RESTORE_GATE).ok();
 }
 
 /// Atomically record that a restore of `session_id` was attempted on this box.
@@ -372,6 +405,38 @@ mod tests {
             decide(Some("ec2-user")),
             Decision::Unsafe("ec2-user".to_string())
         );
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test setup; a failure should fail the test"
+    )]
+    fn restore_gate_reads_presence_and_age() {
+        let dir = std::env::temp_dir().join(format!("devbox-restore-gate-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let gate = dir.join("restore-in-progress");
+
+        // Missing gate: inactive.
+        assert!(!super::restore_gate_active(
+            &gate,
+            super::RESTORE_GATE_MAX_AGE
+        ));
+        // Fresh gate: active.
+        std::fs::write(&gate, b"").unwrap();
+        assert!(super::restore_gate_active(
+            &gate,
+            super::RESTORE_GATE_MAX_AGE
+        ));
+        // Past its max age the gate is ignored (a crashed restore must delay
+        // logins, not brick the box).
+        assert!(!super::restore_gate_active(
+            &gate,
+            std::time::Duration::ZERO
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -319,6 +319,26 @@ pub(crate) async fn restore_session(
                 error = %format!("{e:#}"),
                 "failed to restore session repo; continuing"
             );
+            continue;
+        }
+        // The restore runs as root after owner-sync already handed /workspace
+        // to the claimant, so files it (re)wrote are root-owned — hand them
+        // back. Best-effort like the rest of the restore.
+        if let Err(e) = run_tool(
+            "chown",
+            &[
+                "-R".to_string(),
+                format!("{owner}:{owner}"),
+                repo.display().to_string(),
+            ],
+        )
+        .await
+        {
+            tracing::warn!(
+                repo = %entry.dir,
+                error = %format!("{e:#}"),
+                "failed to hand restored repo to the claimant"
+            );
         }
     }
 
