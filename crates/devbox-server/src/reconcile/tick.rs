@@ -15,8 +15,7 @@ use jiff::{SignedDuration, Timestamp};
 use crate::compute::{Compute, InstanceInfo};
 use crate::db::DocumentStore;
 use crate::documents::devbox::DevboxDoc;
-use crate::documents::session::SessionDoc;
-use devbox_common::{AmiId, DevboxState, InstanceType, SessionState, SubnetId};
+use devbox_common::{AmiId, DevboxState, InstanceType, SubnetId};
 
 use super::config::ReconcilerConfig;
 
@@ -63,12 +62,10 @@ fn count_by_state(
 /// 3. Sync DevboxDoc records with ASG membership.
 /// 4. Mark Warming instances Ready when `InstanceInfo.ready` is true.
 /// 5. Reap Warming instances that have exceeded `ready_timeout`.
-/// 6. Drive Archiving instances (re-assert the archive tag; enforce the deadline).
-/// 7. Terminate Terminating instances and delete their docs.
-/// 8. Recompute desired capacity (clamped to the ASG's max) and update.
-/// 9. Update scale-in protection.
-/// 10. Apply pending owner tags.
-/// 11. Sweep expired documents (session TTL).
+/// 6. Terminate Terminating instances and delete their docs.
+/// 7. Recompute desired capacity (clamped to the ASG's max) and update.
+/// 8. Update scale-in protection.
+/// 9. Apply pending owner tags.
 ///
 /// # Errors
 ///
@@ -140,192 +137,19 @@ pub(super) async fn reconciliation_tick(
         reap_unready_instances(store, compute, config, &all_docs, &info_by_id).await;
     }
 
-    // Step 6: Drive Archiving instances — re-assert the archive tag, and fail
-    // the archive past its deadline so the box always terminates.
-    handle_archiving_instances(store, compute, config, &all_docs).await;
-
-    // Step 7: Handle Terminating instances.
+    // Step 6: Handle Terminating instances.
     handle_terminating_instances(store, compute, &asg_name, &all_docs).await;
 
-    // Step 8: Recompute desired capacity and update if changed.
+    // Step 7: Recompute desired capacity and update if changed.
     recompute_desired_capacity(store, compute, &asg_name, &asg_desc).await;
 
-    // Step 9: Update scale-in protection.
+    // Step 8: Update scale-in protection.
     update_scale_in_protection(store, compute, &asg_name, &asg_desc.instances).await;
 
-    // Step 10: Apply pending owner tags.
+    // Step 9: Apply pending owner tags.
     apply_pending_owner_tags(store, compute, &all_docs).await;
 
-    // Step 11: Sweep expired documents (session archives past their TTL).
-    if let Err(e) = store.delete_expired().await {
-        tracing::error!(error = %e, "failed to sweep expired documents");
-    }
-
     Ok(())
-}
-
-/// Step 6: Drive Archiving instances.
-///
-/// While a box is `Archiving` its termination is deferred so the on-box agent
-/// can upload the session archive. Each tick, per box:
-/// - **Session already resolved** (complete/failed/gone): flip the box to
-///   `Terminating` now. This heals a partial `session_archive_done` — the
-///   session write landed but the devbox flip failed — so a finished archive
-///   never holds a protected box until the deadline.
-/// - **Pending, before the deadline** (`archive.requested_at +
-///   config.archive_timeout`): re-assert the `devbox:archive-session` tag
-///   (idempotent; self-heals a failed inline tag at release time) and leave
-///   the box alone.
-/// - **Pending, past the deadline**: mark the session Failed and flip the box
-///   to `Terminating` (owner cleared, name freed) — the archive is lost but
-///   the box is never wedged.
-///
-/// An `Archiving` doc with no `archive` field is inconsistent (should not
-/// happen); it is flipped straight to `Terminating`.
-async fn handle_archiving_instances(
-    store: &DocumentStore,
-    compute: &(impl Compute + ?Sized),
-    config: &ReconcilerConfig,
-    all_docs: &[crate::db::document_type::Document<DevboxDoc>],
-) {
-    let now = Timestamp::now();
-    let timeout = SignedDuration::try_from(config.archive_timeout).unwrap_or(SignedDuration::ZERO);
-
-    for doc in all_docs {
-        if doc.data.state != DevboxState::Archiving {
-            continue;
-        }
-
-        let mut expired_session = None;
-        if let Some(pending) = doc.data.archive.as_ref() {
-            let resolved = session_resolved(store, &pending.session_id).await;
-            let deadline = pending.requested_at.checked_add(timeout).unwrap_or(now);
-            if !resolved && now < deadline {
-                apply_archive_tag(compute, &doc.data).await;
-                continue;
-            }
-            if !resolved {
-                expired_session = Some(pending.session_id.clone());
-            }
-        }
-
-        // Past the deadline the session must be resolved (failed) BEFORE the
-        // box flips to Terminating: terminating first on a store error would
-        // strand the SessionDoc as pending forever once the instance is gone.
-        // A failure here just retries next tick — the deadline has already
-        // passed, so nothing extends the box's life beyond the store outage.
-        if let Some(session_id) = expired_session.as_deref()
-            && !fail_session(store, session_id, "archive deadline exceeded").await
-        {
-            tracing::warn!(
-                doc_id = %doc.id,
-                session_id,
-                "could not fail expired session; retrying next tick"
-            );
-            continue;
-        }
-
-        let mut updated = doc.data.clone();
-        updated.state = DevboxState::Terminating;
-        updated.archive = None;
-        updated.owner = None;
-        updated.name = String::new();
-        match store
-            .compare_and_update(&doc.id, doc.version, &updated)
-            .await
-        {
-            Ok(true) => {
-                if expired_session.is_some() {
-                    tracing::warn!(
-                        instance_id = %doc.data.instance_id,
-                        doc_id = %doc.id,
-                        session_id = expired_session.as_deref().unwrap_or("<none>"),
-                        "archive deadline exceeded; terminating without a session"
-                    );
-                } else {
-                    tracing::info!(
-                        instance_id = %doc.data.instance_id,
-                        doc_id = %doc.id,
-                        "session resolved; terminating archiving box"
-                    );
-                }
-            }
-            Ok(false) => {
-                // The agent's done report won the race; nothing to do.
-                tracing::debug!(doc_id = %doc.id, "archiving doc changed concurrently; skipping");
-            }
-            Err(e) => {
-                tracing::error!(error = %e, doc_id = %doc.id, "failed to expire archiving doc");
-            }
-        }
-    }
-}
-
-/// Whether the session is no longer pending: complete, failed, or its record
-/// is gone (nothing left to wait for). A transient read error counts as
-/// unresolved so the box gets its full deadline rather than an early kill.
-async fn session_resolved(store: &DocumentStore, session_id: &str) -> bool {
-    match store.get::<SessionDoc>(session_id).await {
-        Ok(Some(doc)) => doc.data.state != SessionState::Pending,
-        Ok(None) => true,
-        Err(e) => {
-            tracing::error!(error = %e, session_id, "failed to read session record");
-            false
-        }
-    }
-}
-
-/// Mark a session Failed with `reason`. Returns whether the session is now in
-/// a terminal state (failed here, already resolved, missing, or a version
-/// conflict — the agent's done report just landed); `false` only on a store
-/// error, so the caller can hold the box until the session record is settled.
-async fn fail_session(store: &DocumentStore, session_id: &str, reason: &str) -> bool {
-    let doc = match store.get::<SessionDoc>(session_id).await {
-        Ok(Some(doc)) => doc,
-        Ok(None) => {
-            tracing::warn!(session_id, "session record missing while failing it");
-            return true;
-        }
-        Err(e) => {
-            tracing::error!(error = %e, session_id, "failed to load session record");
-            return false;
-        }
-    };
-    if doc.data.state != SessionState::Pending {
-        return true;
-    }
-    let mut updated = doc.data.clone();
-    updated.state = SessionState::Failed;
-    updated.error = Some(reason.to_string());
-    updated.completed_at = Some(Timestamp::now());
-    match store
-        .compare_and_update(&doc.id, doc.version, &updated)
-        .await
-    {
-        Ok(_) => true,
-        Err(e) => {
-            tracing::error!(error = %e, session_id, "failed to mark session failed");
-            false
-        }
-    }
-}
-
-/// Re-assert the `devbox:archive-session` tag for a box that owes an archive.
-/// Shared by the release handler (inline, so archiving starts without waiting a
-/// tick) and the reconciler (idempotent re-assertion while `Archiving`).
-pub(crate) async fn apply_archive_tag(compute: &(impl Compute + ?Sized), doc: &DevboxDoc) {
-    let Some(pending) = doc.archive.as_ref() else {
-        return;
-    };
-    let tags = [("devbox:archive-session", pending.session_id.as_str())];
-    if let Err(e) = compute.tag_instance(&doc.instance_id, &tags).await {
-        tracing::warn!(
-            error = %e,
-            instance_id = %doc.instance_id,
-            session_id = %pending.session_id,
-            "failed to apply archive-session tag; will retry next tick"
-        );
-    }
 }
 
 /// Step 3: Sync DevboxDoc records with ASG membership.
@@ -439,8 +263,6 @@ async fn sync_docs_with_asg(
             owner_email: None,
             claimed_at: None,
             ready_at: None,
-            archive: None,
-            restore_session_id: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
             warmup_report: None,
@@ -731,12 +553,7 @@ async fn recompute_desired_capacity(
         }
     };
 
-    // Archiving boxes still occupy an instance on the claimant's behalf, so
-    // they count as claimed until their archive resolves — otherwise a
-    // release --keep would momentarily shrink desired capacity and invite the
-    // ASG to scale the pool while the box is mid-upload.
-    let claimed_count = count_by_state(&docs, DevboxState::Claimed)
-        .saturating_add(count_by_state(&docs, DevboxState::Archiving));
+    let claimed_count = count_by_state(&docs, DevboxState::Claimed);
     let desired = compute_desired_capacity(claimed_count, asg_desc.min_size, asg_desc.max_size);
 
     if desired != asg_desc.desired_capacity
@@ -781,25 +598,20 @@ async fn update_scale_in_protection(
         .map(|inst| (inst.instance_id.as_str(), inst.protected_from_scale_in))
         .collect();
 
-    // Archiving boxes keep their protection: the ASG must not scale one in
-    // while its agent is mid-upload.
-    let needs_protection =
-        |state: DevboxState| matches!(state, DevboxState::Claimed | DevboxState::Archiving);
-
-    // Collect Claimed/Archiving instances that are NOT protected → enable
+    // Collect Claimed instances that are NOT protected → enable
     let to_protect: Vec<&str> = doc_states
         .iter()
         .filter(|(id, state)| {
-            needs_protection(**state) && instance_protection.get(*id).copied() == Some(false)
+            **state == DevboxState::Claimed && instance_protection.get(*id).copied() == Some(false)
         })
         .map(|(id, _)| *id)
         .collect();
 
-    // Collect other instances that ARE protected → disable
+    // Collect non-Claimed instances that ARE protected → disable
     let to_unprotect: Vec<&str> = doc_states
         .iter()
         .filter(|(id, state)| {
-            !needs_protection(**state) && instance_protection.get(*id).copied() == Some(true)
+            **state != DevboxState::Claimed && instance_protection.get(*id).copied() == Some(true)
         })
         .map(|(id, _)| *id)
         .collect();
@@ -852,13 +664,7 @@ async fn apply_pending_owner_tags(
     all_docs: &[crate::db::document_type::Document<DevboxDoc>],
 ) {
     for doc in all_docs {
-        // Archiving boxes keep their owner, and session-watch resolves the
-        // claimant's home from the devbox:owner tag — keep re-asserting it
-        // until the box actually terminates.
-        if !matches!(
-            doc.data.state,
-            DevboxState::Claimed | DevboxState::Archiving
-        ) {
+        if doc.data.state != DevboxState::Claimed {
             continue;
         }
         apply_owner_tag(store, compute, doc).await;

@@ -16,10 +16,8 @@ use axum::{Extension, Router};
 
 use devbox_common::{
     ClaimRequest, DevboxListResponse, DevboxResponse, GitTokenRequest, GitTokenResponse,
-    HealthResponse, PoolMetricsResponse, ProtectedResourceMetadata, ReleaseRequest, RenameRequest,
-    SessionArchiveDoneRequest, SessionArchiveDoneResponse, SessionArchiveUrlRequest,
-    SessionArchiveUrlResponse, SessionListResponse, SessionRestoreUrlRequest,
-    SessionRestoreUrlResponse, WarmupReportRequest, WarmupReportResponse,
+    HealthResponse, PoolMetricsResponse, ProtectedResourceMetadata, RenameRequest,
+    WarmupReportRequest, WarmupReportResponse,
 };
 
 use crate::auth::{AgentIdentity, Authenticator, Principal};
@@ -55,10 +53,6 @@ pub struct AppState {
     /// reconciler tick. `None` in tests (and any deployment without AWS), where
     /// the reconciler's `apply_pending_owner_tags` remains the sole tagger.
     pub compute: Option<Arc<crate::compute::ec2::Ec2>>,
-    /// Presigner for the session-archive bucket. `None` when session archiving
-    /// is not configured (`DEVBOX_SESSION_BUCKET` unset): `release --keep` is
-    /// rejected and the agent's session endpoints report unavailable.
-    pub sessions: Option<Arc<crate::sessions::SessionArchives>>,
 }
 
 /// Handle to the shared application state, passed to every handler.
@@ -132,7 +126,6 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/api/v1/devboxes/{id}/release", post(handle_release))
         .route("/api/v1/devboxes/{id}/rename", post(handle_rename))
         .route("/api/v1/pool/metrics", get(handle_pool_metrics))
-        .route("/api/v1/sessions", get(list_sessions))
         .route_layer(from_fn_with_state(state.clone(), require_auth));
 
     // The agent subtree authenticates devbox hosts by their AWS web-identity
@@ -143,18 +136,6 @@ pub fn build_router(state: SharedState) -> Router {
         .route(
             "/api/v1/agent/warmup-report",
             post(handle_agent_warmup_report),
-        )
-        .route(
-            "/api/v1/agent/session-archive-url",
-            post(handle_agent_session_archive_url),
-        )
-        .route(
-            "/api/v1/agent/session-archive-done",
-            post(handle_agent_session_archive_done),
-        )
-        .route(
-            "/api/v1/agent/session-restore-url",
-            post(handle_agent_session_restore_url),
         )
         .route_layer(from_fn_with_state(state.clone(), require_agent_iam));
 
@@ -240,37 +221,18 @@ async fn handle_claim(
     Extension(principal): Extension<Principal>,
     JsonBody(req): JsonBody<ClaimRequest>,
 ) -> Result<Json<DevboxResponse>, AppError> {
-    let doc = service::claim_devbox(
-        &state,
-        &principal,
-        req.name.as_deref(),
-        req.resume.as_deref(),
-    )
-    .await?;
+    let doc = service::claim_devbox(&state, &principal, req.name.as_deref()).await?;
     Ok(Json(doc.into()))
 }
 
-/// HTTP adapter: release a claimed devbox, optionally archiving its session.
+/// HTTP adapter: release a claimed devbox.
 async fn handle_release(
     State(state): State<SharedState>,
     Path(id): Path<String>,
     Extension(principal): Extension<Principal>,
-    JsonBody(req): JsonBody<ReleaseRequest>,
 ) -> Result<Json<DevboxResponse>, AppError> {
-    let (doc, session) =
-        service::release_devbox(&state, &principal.owner, &id, req.keep_session).await?;
-    let mut resp: DevboxResponse = doc.into();
-    resp.session = session;
-    Ok(Json(resp))
-}
-
-/// HTTP adapter: list the caller's session archives.
-async fn list_sessions(
-    State(state): State<SharedState>,
-    Extension(principal): Extension<Principal>,
-) -> Result<Json<SessionListResponse>, AppError> {
-    let sessions = service::list_sessions(&state, &principal.owner).await?;
-    Ok(Json(SessionListResponse { sessions }))
+    let doc = service::release_devbox(&state, &principal.owner, &id).await?;
+    Ok(Json(doc.into()))
 }
 
 /// HTTP adapter: rename a claimed devbox.
@@ -316,39 +278,6 @@ async fn handle_agent_warmup_report(
     Ok(Json(WarmupReportResponse {}))
 }
 
-/// HTTP adapter: mint a presigned PUT URL for the session archive this box was
-/// asked to produce (see [`service::session_archive_url`]).
-async fn handle_agent_session_archive_url(
-    State(state): State<SharedState>,
-    Extension(agent): Extension<AgentIdentity>,
-    JsonBody(req): JsonBody<SessionArchiveUrlRequest>,
-) -> Result<Json<SessionArchiveUrlResponse>, AppError> {
-    let url = service::session_archive_url(&state, &agent, &req.session_id).await?;
-    Ok(Json(SessionArchiveUrlResponse { url }))
-}
-
-/// HTTP adapter: record an archive upload outcome and let the box terminate
-/// (see [`service::session_archive_done`]).
-async fn handle_agent_session_archive_done(
-    State(state): State<SharedState>,
-    Extension(agent): Extension<AgentIdentity>,
-    JsonBody(req): JsonBody<SessionArchiveDoneRequest>,
-) -> Result<Json<SessionArchiveDoneResponse>, AppError> {
-    service::session_archive_done(&state, &agent, &req).await?;
-    Ok(Json(SessionArchiveDoneResponse {}))
-}
-
-/// HTTP adapter: mint a presigned GET URL for the session this box was asked to
-/// restore (see [`service::session_restore_url`]).
-async fn handle_agent_session_restore_url(
-    State(state): State<SharedState>,
-    Extension(agent): Extension<AgentIdentity>,
-    JsonBody(req): JsonBody<SessionRestoreUrlRequest>,
-) -> Result<Json<SessionRestoreUrlResponse>, AppError> {
-    let url = service::session_restore_url(&state, &agent, &req.session_id).await?;
-    Ok(Json(SessionRestoreUrlResponse { url }))
-}
-
 #[cfg(test)]
 #[expect(
     clippy::unwrap_used,
@@ -382,7 +311,6 @@ mod tests {
             aws_account_id: None,
             minter: None,
             compute: None,
-            sessions: None,
         })
     }
 
@@ -410,7 +338,6 @@ mod tests {
             aws_account_id: None,
             minter: None,
             compute: None,
-            sessions: None,
         })
     }
 
@@ -436,8 +363,6 @@ mod tests {
             owner_email: None,
             claimed_at: None,
             ready_at: None,
-            archive: None,
-            restore_session_id: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
             warmup_report: None,
@@ -491,7 +416,6 @@ mod tests {
             aws_account_id: Some("123456789012".to_string()),
             minter: None,
             compute: None,
-            sessions: None,
         });
 
         let Json(meta) = protected_resource_metadata(State(state), HeaderMap::new()).await;
@@ -622,15 +546,7 @@ mod tests {
         let state = setup_state().await;
         let id = insert(&state, ready_devbox()).await;
 
-        let status = status_of(
-            handle_release(
-                State(state),
-                Path(id),
-                principal("jdoe"),
-                JsonBody(ReleaseRequest::default()),
-            )
-            .await,
-        );
+        let status = status_of(handle_release(State(state), Path(id), principal("jdoe")).await);
         assert_eq!(status, StatusCode::CONFLICT);
     }
 
@@ -642,15 +558,7 @@ mod tests {
         doc.owner = Some("alice".to_string());
         let id = insert(&state, doc).await;
 
-        let status = status_of(
-            handle_release(
-                State(state),
-                Path(id),
-                principal("bob"),
-                JsonBody(ReleaseRequest::default()),
-            )
-            .await,
-        );
+        let status = status_of(handle_release(State(state), Path(id), principal("bob")).await);
         assert_eq!(status, StatusCode::FORBIDDEN);
     }
 }

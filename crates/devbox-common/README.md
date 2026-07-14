@@ -9,7 +9,7 @@ library — no I/O.
 - **Identifiers** — `DevboxId` (UUIDv7) and strongly-typed newtypes over AWS ids:
   `InstanceType`, `AmiId`, `SubnetId`, `SecurityGroupId`.
 - **`DevboxState`** — the lifecycle enum: `Launching → Warming → Ready → Claimed
-  → [Archiving →] Terminating`.
+  → Terminating`.
 - **API request/response types** — `ClaimRequest`, `DevboxResponse`,
   `DevboxListResponse`, `HealthResponse`, `PoolMetricsResponse`,
   `ProtectedResourceMetadata`. Release takes no body — the owner is the
