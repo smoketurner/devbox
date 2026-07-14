@@ -123,7 +123,6 @@ aws-lc-rs = { version = "=1.17.1", default-features = false }
 aws-sdk-autoscaling = { version = "=1.121.0", default-features = false }
 aws-sdk-dsql = { version = "=1.60.0", default-features = false }
 aws-sdk-ec2 = { version = "=1.236.0", default-features = false }
-aws-sdk-s3 = { version = "=1.130.0", default-features = false }
 aws-sdk-ssm = { version = "=1.113.0", default-features = false }
 aws-sdk-sts = { version = "=1.107.0", default-features = false }
 axum = { version = "=0.8.9", default-features = false }

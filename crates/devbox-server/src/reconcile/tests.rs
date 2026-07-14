@@ -17,13 +17,12 @@ mod reconcile_tests {
     use crate::db::migrations::run_sqlite_migrations;
     use crate::db::pool::{Pool, PoolConfig};
     use crate::db::store::DocumentStore;
-    use crate::documents::devbox::{DevboxDoc, PendingArchive};
-    use crate::documents::session::SessionDoc;
+    use crate::documents::devbox::DevboxDoc;
     use crate::reconcile::config::ReconcilerConfig;
     use crate::reconcile::tick::{
         compute_desired_capacity, reap_unready_instances, reconciliation_tick,
     };
-    use devbox_common::{AmiId, DevboxState, InstanceType, SessionState, SubnetId};
+    use devbox_common::{AmiId, DevboxState, InstanceType, SubnetId};
 
     /// Build an in-memory SQLite document store with migrations applied.
     async fn setup_store() -> DocumentStore {
@@ -47,7 +46,6 @@ mod reconcile_tests {
             polling_interval: Duration::from_secs(30),
             lock_ttl: Duration::from_secs(60),
             ready_timeout: Duration::from_secs(60),
-            archive_timeout: Duration::from_secs(60),
         }
     }
 
@@ -327,8 +325,6 @@ mod reconcile_tests {
             owner_email: None,
             claimed_at: None,
             ready_at: None,
-            archive: None,
-            restore_session_id: None,
             created_at: past,
             owner_tag_applied: false,
             warmup_report: None,
@@ -346,8 +342,6 @@ mod reconcile_tests {
             owner_email: None,
             claimed_at: None,
             ready_at: None,
-            archive: None,
-            restore_session_id: None,
             created_at: past,
             owner_tag_applied: false,
             warmup_report: None,
@@ -403,8 +397,6 @@ mod reconcile_tests {
             owner_email: None,
             claimed_at: None,
             ready_at: None,
-            archive: None,
-            restore_session_id: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
             warmup_report: None,
@@ -424,8 +416,6 @@ mod reconcile_tests {
             owner_email: None,
             claimed_at: None,
             ready_at: None,
-            archive: None,
-            restore_session_id: None,
             created_at: past,
             owner_tag_applied: false,
             warmup_report: None,
@@ -483,8 +473,6 @@ mod reconcile_tests {
             owner_email: Some("alice@example.com".to_string()),
             claimed_at: None,
             ready_at: None,
-            archive: None,
-            restore_session_id: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
             warmup_report: None,
@@ -540,8 +528,6 @@ mod reconcile_tests {
             owner_email: None,
             claimed_at: None,
             ready_at: None,
-            archive: None,
-            restore_session_id: None,
             created_at: past,
             owner_tag_applied: false,
             warmup_report: None,
@@ -600,8 +586,6 @@ mod reconcile_tests {
             owner_email: Some("alice@example.com".to_string()),
             claimed_at: None,
             ready_at: None,
-            archive: None,
-            restore_session_id: None,
             created_at: Timestamp::now(),
             owner_tag_applied: true,
             warmup_report: None,
@@ -665,8 +649,6 @@ mod reconcile_tests {
             owner_email: None,
             claimed_at: None,
             ready_at: None,
-            archive: None,
-            restore_session_id: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
             warmup_report: None,
@@ -727,8 +709,6 @@ mod reconcile_tests {
             owner_email: None,
             claimed_at: None,
             ready_at: None,
-            archive: None,
-            restore_session_id: None,
             created_at: Timestamp::now(),
             owner_tag_applied: true,
             warmup_report: None,
@@ -792,8 +772,6 @@ mod reconcile_tests {
             owner_email: None,
             claimed_at: None,
             ready_at: None,
-            archive: None,
-            restore_session_id: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
             warmup_report: None,
@@ -842,8 +820,6 @@ mod reconcile_tests {
             owner_email: None,
             claimed_at: None,
             ready_at: None,
-            archive: None,
-            restore_session_id: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
             warmup_report: None,
@@ -889,172 +865,5 @@ mod reconcile_tests {
     fn desired_capacity_saturates_without_overflow() {
         // saturating_add must not panic; the .min() still clamps to max.
         assert_eq!(compute_desired_capacity(u32::MAX, 2, 10), 10);
-    }
-
-    // =========================================================================
-    // Archiving (session archive) tests
-    // =========================================================================
-
-    /// Seed an Archiving box (with its pending session record) whose archive
-    /// was requested at `requested_at`. Returns (instance_id, session_id).
-    async fn seed_archiving_box(
-        store: &DocumentStore,
-        compute: &MockCompute,
-        requested_at: Timestamp,
-    ) -> (String, String) {
-        let instance_id = compute.add_instance("InService");
-        let session_id = "sess-under-test".to_string();
-
-        let session = SessionDoc {
-            name: "archived-box".to_string(),
-            owner: "alice".to_string(),
-            state: SessionState::Pending,
-            source_instance_id: instance_id.clone(),
-            s3_key: format!("sessions/{session_id}.tar.gz"),
-            size_bytes: None,
-            created_at: requested_at,
-            completed_at: None,
-            // Far future: the tick's delete_expired sweep must not eat the
-            // record mid-test.
-            expires_at: Timestamp::from_second(4_102_444_800).unwrap(),
-            error: None,
-        };
-        store.insert_with_id(&session_id, &session).await.unwrap();
-
-        let doc = DevboxDoc {
-            instance_id: instance_id.clone(),
-            name: "archived-box".to_string(),
-            state: DevboxState::Archiving,
-            instance_type: InstanceType("m7g.large".to_string()),
-            ami_id: AmiId("ami-mock".to_string()),
-            subnet_id: SubnetId("subnet-mock".to_string()),
-            region: "us-east-1".to_string(),
-            ebs_volume_id: None,
-            owner: Some("alice".to_string()),
-            owner_email: None,
-            claimed_at: None,
-            ready_at: None,
-            archive: Some(PendingArchive {
-                session_id: session_id.clone(),
-                requested_at,
-            }),
-            restore_session_id: None,
-            created_at: requested_at,
-            owner_tag_applied: false,
-            warmup_report: None,
-        };
-        store.insert(&doc).await.unwrap();
-
-        (instance_id, session_id)
-    }
-
-    /// An Archiving box before its deadline is left alone: not terminated, tag
-    /// re-asserted, still counted as claimed for desired capacity.
-    #[tokio::test]
-    async fn archiving_box_waits_for_archive_with_tag_asserted() {
-        let store = setup_store().await;
-        let compute = MockCompute::new();
-        let config = test_config(); // archive_timeout = 60s
-
-        compute.seed_asg(1, 5, 1);
-        let (instance_id, session_id) =
-            seed_archiving_box(&store, &compute, Timestamp::now()).await;
-
-        reconciliation_tick(&store, &compute, &config)
-            .await
-            .unwrap();
-
-        // Instance survives the tick with the archive tag asserted, and the
-        // owner tag keeps being re-asserted (session-watch resolves the
-        // claimant's home from it).
-        let tags = compute
-            .get_instance_tags(&instance_id)
-            .expect("archiving instance must not be terminated");
-        assert_eq!(
-            tags.get("devbox:archive-session").map(String::as_str),
-            Some(session_id.as_str())
-        );
-        assert_eq!(
-            tags.get("devbox:owner").map(String::as_str),
-            Some("alice"),
-            "owner tag must stay asserted while Archiving"
-        );
-
-        // Doc unchanged; session still pending.
-        let doc = find_doc_by_state(&store, DevboxState::Archiving).await;
-        assert!(doc.data.archive.is_some());
-        let session = store.get::<SessionDoc>(&session_id).await.unwrap().unwrap();
-        assert_eq!(session.data.state, SessionState::Pending);
-
-        // Desired capacity treats the archiving box as claimed: min 1 + 1.
-        let asg = compute.describe_asg("devbox-pool-test").await.unwrap();
-        assert_eq!(asg.desired_capacity, 2);
-    }
-
-    /// An Archiving box whose session already resolved (e.g. the agent's done
-    /// report completed the session but the devbox flip failed mid-write) is
-    /// healed on the next tick: flipped to Terminating without waiting out the
-    /// archive deadline, and the session is left as-is.
-    #[tokio::test]
-    async fn archiving_box_with_resolved_session_terminates_before_deadline() {
-        let store = setup_store().await;
-        let compute = MockCompute::new();
-        let config = test_config(); // archive_timeout = 60s — NOT expired here
-
-        compute.seed_asg(1, 5, 1);
-        let (_, session_id) = seed_archiving_box(&store, &compute, Timestamp::now()).await;
-
-        // Resolve the session out-of-band (as session_archive_done would).
-        let session = store.get::<SessionDoc>(&session_id).await.unwrap().unwrap();
-        let mut updated = session.data.clone();
-        updated.state = SessionState::Complete;
-        store
-            .compare_and_update(&session.id, session.version, &updated)
-            .await
-            .unwrap();
-
-        reconciliation_tick(&store, &compute, &config)
-            .await
-            .unwrap();
-
-        let doc = find_doc_by_state(&store, DevboxState::Terminating).await;
-        assert!(doc.data.archive.is_none(), "gate must be cleared");
-        // The resolved session is untouched — not failed by the heal path.
-        let session = store.get::<SessionDoc>(&session_id).await.unwrap().unwrap();
-        assert_eq!(session.data.state, SessionState::Complete);
-    }
-
-    /// Past the archive deadline the session is failed and the box flips to
-    /// Terminating (terminated on the following tick) — never wedged.
-    #[tokio::test]
-    async fn archiving_box_past_deadline_fails_session_and_terminates() {
-        let store = setup_store().await;
-        let compute = MockCompute::new();
-        let config = test_config(); // archive_timeout = 60s
-
-        compute.seed_asg(1, 5, 1);
-        let past = Timestamp::from_second(0).unwrap();
-        let (instance_id, session_id) = seed_archiving_box(&store, &compute, past).await;
-
-        reconciliation_tick(&store, &compute, &config)
-            .await
-            .unwrap();
-
-        let session = store.get::<SessionDoc>(&session_id).await.unwrap().unwrap();
-        assert_eq!(session.data.state, SessionState::Failed);
-
-        let doc = find_doc_by_state(&store, DevboxState::Terminating).await;
-        assert!(doc.data.archive.is_none(), "gate must be cleared");
-        assert!(doc.data.owner.is_none(), "owner must be cleared");
-        assert!(doc.data.name.is_empty(), "name must be freed");
-
-        // The next tick terminates the instance through the normal path.
-        reconciliation_tick(&store, &compute, &config)
-            .await
-            .unwrap();
-        assert!(
-            compute.get_instance_tags(&instance_id).is_none(),
-            "expired archiving instance must be terminated"
-        );
     }
 }

@@ -15,7 +15,6 @@ use devbox_server::compute::ec2::Ec2;
 use devbox_server::db::{DocumentStore, Pool, PoolConfig};
 use devbox_server::reconcile::{ReconcilerConfig, spawn_reconciliation_loop};
 use devbox_server::routes::{AppState, build_router};
-use devbox_server::sessions::SessionArchives;
 use secrecy::SecretString;
 
 #[tokio::main]
@@ -77,12 +76,6 @@ async fn main() -> Result<()> {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(300),
         ),
-        archive_timeout: Duration::from_secs(
-            std::env::var("SESSION_ARCHIVE_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(600),
-        ),
     };
 
     reconciler_config
@@ -129,10 +122,6 @@ async fn main() -> Result<()> {
         .context("initialize GitHub token minter")?
         .map(Arc::new);
 
-    // Session archiving: enabled iff DEVBOX_SESSION_BUCKET is set. The presigner
-    // signs against the task role's S3 grants; hosts get URLs, never S3 IAM.
-    let sessions = build_session_archives(&aws_config).map(Arc::new);
-
     // Build router. State is shared as a single Arc<AppState>.
     let app = build_router(Arc::new(AppState {
         store: Arc::clone(&store),
@@ -140,7 +129,6 @@ async fn main() -> Result<()> {
         aws_account_id,
         minter,
         compute: Some(ec2_client),
-        sessions,
     }));
 
     // Start server
@@ -160,26 +148,6 @@ async fn main() -> Result<()> {
     tracing::info!("server shut down");
 
     Ok(())
-}
-
-/// Build the session-archive presigner from the environment.
-///
-/// Enabled iff `DEVBOX_SESSION_BUCKET` is set (the companion Terraform sets it
-/// on the ECS task). `SESSION_TTL_DAYS` (default 30) bounds how long a session
-/// record survives; the bucket's lifecycle rule expires the objects on the
-/// same clock.
-fn build_session_archives(aws_config: &aws_config::SdkConfig) -> Option<SessionArchives> {
-    let bucket = env_non_empty("DEVBOX_SESSION_BUCKET")?;
-    let ttl_days = std::env::var("SESSION_TTL_DAYS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(30);
-    tracing::info!(bucket = %bucket, ttl_days, "session archiving enabled");
-    Some(SessionArchives::new(
-        aws_sdk_s3::Client::new(aws_config),
-        bucket,
-        ttl_days,
-    ))
 }
 
 /// Build the request authenticator, resolving OIDC endpoints from the issuer.

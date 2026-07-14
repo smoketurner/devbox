@@ -13,19 +13,16 @@
 use std::future::Future;
 
 use devbox_common::{
-    DEVBOX_NAME_MAX_LEN, DevboxState, GitTokenResponse, PoolMetricsResponse,
-    SessionArchiveDoneRequest, SessionResponse, SessionState, WarmupReportRequest,
+    DEVBOX_NAME_MAX_LEN, DevboxState, GitTokenResponse, PoolMetricsResponse, WarmupReportRequest,
     is_valid_devbox_name,
 };
 
 use crate::auth::{AgentIdentity, AgentRole, Principal};
 use crate::db::UpdateOutcome;
 use crate::db::document_type::Document;
-use crate::documents::devbox::{DevboxDoc, PendingArchive, WarmupReport};
-use crate::documents::session::SessionDoc;
+use crate::documents::devbox::{DevboxDoc, WarmupReport};
 use crate::error::AppError;
 use crate::routes::AppState;
-use crate::sessions::SessionArchives;
 
 // ============================================================================
 // Name validation helpers
@@ -282,25 +279,8 @@ pub(crate) async fn claim_devbox(
     state: &AppState,
     claimant: &Principal,
     name: Option<&str>,
-    resume: Option<&str>,
 ) -> Result<Document<DevboxDoc>, AppError> {
     let name_override = validate_name_override(name)?;
-
-    // Resolve the session to restore before racing for a box, so a bad
-    // selector fails without consuming a claim. Requires session archiving to
-    // be configured: without the bucket the box's restore-url call would 503
-    // and the claim would quietly come up without the session.
-    let restore_session_id = match resume {
-        Some(selector) => {
-            if state.sessions.is_none() {
-                return Err(AppError::Conflict(
-                    "session archiving is not configured on this server".into(),
-                ));
-            }
-            Some(resolve_resumable_session(state, &claimant.owner, selector).await?)
-        }
-        None => None,
-    };
 
     let ready_docs = state.store.find_all::<DevboxDoc>("state", "ready").await?;
     if ready_docs.is_empty() {
@@ -332,9 +312,6 @@ pub(crate) async fn claim_devbox(
         updated.owner_email = Some(claimant.email.clone());
         updated.claimed_at = Some(jiff::Timestamp::now());
         updated.owner_tag_applied = false;
-        // The restore signal reaches the box as the `devbox:session-restore`
-        // tag, applied together with the owner tags (see DevboxDoc::owner_tags).
-        updated.restore_session_id = restore_session_id.clone();
 
         let claimed = match name_override {
             Some(ref name) => {
@@ -405,25 +382,14 @@ pub(crate) async fn claim_devbox(
 /// Shared by the JSON API and the HTML dashboard. Enforces:
 /// - State must be `Claimed` (409 otherwise).
 /// - Caller must be the box's owner (403 otherwise).
-///
-/// A plain release flips the box to `Terminating`, clearing `owner` and freeing
-/// `name` (so both can be reused on a fresh claim) atomically. The returned
-/// document still carries the released box's `name` so callers can render a
-/// friendly confirmation.
-///
-/// With `keep_session` the box detours through `Archiving` instead: a pending
-/// [`SessionDoc`] is created, the box keeps its owner and name while the on-box
-/// agent uploads the archive, and the `devbox:archive-session` tag signals the
-/// agent (asserted inline here, re-asserted by the reconciler). The box flips to
-/// `Terminating` when the agent reports done — or when the reconciler's archive
-/// deadline passes. Requires session archiving to be configured (409 otherwise),
-/// and returns the created session so the caller learns the `--resume` selector.
+/// - Clears `owner` and frees `name` in the store (so both can be reused on a
+///   fresh claim) atomically. The returned document still carries the released
+///   box's `name` so callers can render a friendly confirmation.
 pub(crate) async fn release_devbox(
     state: &AppState,
     caller: &str,
     id: &str,
-    keep_session: bool,
-) -> Result<(Document<DevboxDoc>, Option<SessionResponse>), AppError> {
+) -> Result<Document<DevboxDoc>, AppError> {
     let doc = state
         .store
         .get::<DevboxDoc>(id)
@@ -440,10 +406,6 @@ pub(crate) async fn release_devbox(
     let current_owner = doc.data.owner.as_deref().unwrap_or("");
     if current_owner != caller {
         return Err(AppError::Forbidden("ownership mismatch".into()));
-    }
-
-    if keep_session {
-        return release_with_archive(state, caller, doc).await;
     }
 
     let released_name = doc.data.name.clone();
@@ -472,309 +434,7 @@ pub(crate) async fn release_devbox(
     // The store record has freed the name for reuse; the response still reports
     // the released box's name so the caller's confirmation is friendly.
     refreshed.data.name = released_name;
-    Ok((refreshed, None))
-}
-
-/// The `--keep` half of [`release_devbox`]: create the pending session and move
-/// the box to `Archiving` (owner and name kept — the box is still doing work on
-/// the caller's behalf, and the session inherits the name when it completes).
-async fn release_with_archive(
-    state: &AppState,
-    caller: &str,
-    doc: Document<DevboxDoc>,
-) -> Result<(Document<DevboxDoc>, Option<SessionResponse>), AppError> {
-    let Some(archives) = state.sessions.as_deref() else {
-        return Err(AppError::Conflict(
-            "session archiving is not configured on this server".into(),
-        ));
-    };
-
-    let now = jiff::Timestamp::now();
-    let session_id = uuid::Uuid::now_v7().to_string();
-    let session = SessionDoc {
-        name: doc.data.name.clone(),
-        owner: caller.to_string(),
-        state: SessionState::Pending,
-        source_instance_id: doc.data.instance_id.clone(),
-        s3_key: SessionArchives::object_key(&session_id),
-        size_bytes: None,
-        created_at: now,
-        completed_at: None,
-        expires_at: archives.expires_at(now),
-        error: None,
-    };
-    let inserted = state.store.insert_with_id(&session_id, &session).await?;
-
-    let mut updated = doc.data.clone();
-    updated.state = DevboxState::Archiving;
-    updated.archive = Some(PendingArchive {
-        session_id: session_id.clone(),
-        requested_at: now,
-    });
-
-    let success = state
-        .store
-        .compare_and_update(&doc.id, doc.version, &updated)
-        .await?;
-    if !success {
-        // The box moved under us; drop the just-created session record.
-        state.store.delete(&session_id).await?;
-        return Err(AppError::Conflict(
-            "devbox was modified concurrently".into(),
-        ));
-    }
-
-    // Signal the box inline so archiving starts without waiting a reconciler
-    // tick; the reconciler re-asserts this tag every tick while Archiving, so
-    // a failure here only delays the start.
-    if let Some(compute) = state.compute.as_deref() {
-        crate::reconcile::apply_archive_tag(compute, &updated).await;
-    }
-
-    let refreshed = state
-        .store
-        .get::<DevboxDoc>(&doc.id)
-        .await?
-        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("devbox vanished after release")))?;
-    Ok((refreshed, Some(inserted.into())))
-}
-
-/// The caller's session archives, newest first.
-pub(crate) async fn list_sessions(
-    state: &AppState,
-    caller: &str,
-) -> Result<Vec<SessionResponse>, AppError> {
-    let mut docs = state.store.find_all::<SessionDoc>("owner", caller).await?;
-    docs.sort_by_key(|d| std::cmp::Reverse(d.data.created_at));
-    Ok(docs.into_iter().map(SessionResponse::from).collect())
-}
-
-/// Resolve a `--resume` selector (session id or name) to the caller's newest
-/// **complete** session id.
-///
-/// A selector that matches only pending/failed sessions is a 409 (it exists but
-/// cannot be restored); no match at all is a 404.
-async fn resolve_resumable_session(
-    state: &AppState,
-    caller: &str,
-    selector: &str,
-) -> Result<String, AppError> {
-    let mut docs = state.store.find_all::<SessionDoc>("owner", caller).await?;
-    docs.sort_by_key(|d| std::cmp::Reverse(d.data.created_at));
-
-    let mut matched_incomplete = false;
-    for doc in docs {
-        if doc.id != selector && doc.data.name != selector {
-            continue;
-        }
-        if doc.data.state == SessionState::Complete {
-            return Ok(doc.id);
-        }
-        matched_incomplete = true;
-    }
-
-    if matched_incomplete {
-        Err(AppError::Conflict(format!(
-            "session '{selector}' is not complete and cannot be resumed"
-        )))
-    } else {
-        Err(AppError::NotFound(format!("no session '{selector}'")))
-    }
-}
-
-// ============================================================================
-// Agent session archive/restore
-// ============================================================================
-
-/// Mint a presigned PUT URL for the archive this box was asked to produce.
-///
-/// The caller must be a pool host whose `DevboxDoc.archive` names exactly this
-/// session — the box can only upload the archive it was assigned.
-pub(crate) async fn session_archive_url(
-    state: &AppState,
-    agent: &AgentIdentity,
-    session_id: &str,
-) -> Result<String, AppError> {
-    let archives = require_sessions(state)?;
-    let doc = devbox_for_agent(state, agent).await?;
-    let assigned = doc
-        .data
-        .archive
-        .as_ref()
-        .is_some_and(|a| a.session_id == session_id);
-    if !assigned {
-        return Err(AppError::Forbidden(
-            "session does not match this instance's archive assignment".into(),
-        ));
-    }
-    let session = get_session(state, session_id).await?;
-    archives
-        .presigned_put(&session.data.s3_key)
-        .await
-        .map_err(AppError::Internal)
-}
-
-/// Record the outcome of an archive upload: mark the [`SessionDoc`]
-/// complete/failed and flip the box `Archiving → Terminating` (owner cleared,
-/// name freed) so the reconciler terminates it on its next tick.
-///
-/// Idempotent for duplicates: when the assignment was already cleared (the
-/// reconciler resolved the session — completion healed or deadline-failed)
-/// a re-report for this instance's own, already-resolved session is
-/// acknowledged as a no-op. The agent keeps seeing the `devbox:archive-session`
-/// tag until termination, so rejecting the duplicate would put its retry loop
-/// into a pointless crash-restart cycle.
-pub(crate) async fn session_archive_done(
-    state: &AppState,
-    agent: &AgentIdentity,
-    report: &SessionArchiveDoneRequest,
-) -> Result<(), AppError> {
-    let doc = devbox_for_agent(state, agent).await?;
-    let assigned = doc
-        .data
-        .archive
-        .as_ref()
-        .is_some_and(|a| a.session_id == report.session_id);
-    if !assigned {
-        let session = get_session(state, &report.session_id).await?;
-        if session.data.source_instance_id == agent.instance_id.as_str()
-            && session.data.state != SessionState::Pending
-        {
-            tracing::info!(
-                instance_id = %agent.instance_id,
-                session_id = %report.session_id,
-                "duplicate archive report for an already-resolved session; acknowledged"
-            );
-            return Ok(());
-        }
-        return Err(AppError::Forbidden(
-            "session does not match this instance's archive assignment".into(),
-        ));
-    }
-
-    let now = jiff::Timestamp::now();
-    finish_session(state, &report.session_id, |session| {
-        if report.success {
-            session.state = SessionState::Complete;
-            session.size_bytes = report.size_bytes;
-        } else {
-            session.state = SessionState::Failed;
-            session.error = report
-                .error
-                .as_deref()
-                .map(SessionDoc::truncate_error)
-                .or_else(|| Some("archive failed".to_string()));
-        }
-        session.completed_at = Some(now);
-    })
-    .await?;
-
-    update_devbox_by_instance(state, agent.instance_id.as_str(), |doc| {
-        doc.state = DevboxState::Terminating;
-        doc.archive = None;
-        doc.owner = None;
-        doc.name = String::new();
-    })
-    .await?;
-
-    tracing::info!(
-        instance_id = %agent.instance_id,
-        session_id = %report.session_id,
-        success = report.success,
-        "recorded session archive outcome"
-    );
-    Ok(())
-}
-
-/// Mint a presigned GET URL for the session this box was asked to restore
-/// (`DevboxDoc.restore_session_id`, set by `claim --resume`).
-pub(crate) async fn session_restore_url(
-    state: &AppState,
-    agent: &AgentIdentity,
-    session_id: &str,
-) -> Result<String, AppError> {
-    let archives = require_sessions(state)?;
-    let doc = devbox_for_agent(state, agent).await?;
-    if doc.data.restore_session_id.as_deref() != Some(session_id) {
-        return Err(AppError::Forbidden(
-            "session does not match this instance's restore assignment".into(),
-        ));
-    }
-    let session = get_session(state, session_id).await?;
-    if session.data.state != SessionState::Complete {
-        return Err(AppError::Conflict(
-            "session is not complete and cannot be restored".into(),
-        ));
-    }
-    archives
-        .presigned_get(&session.data.s3_key)
-        .await
-        .map_err(AppError::Internal)
-}
-
-/// The configured session-archive presigner, or a 503 when the server has no
-/// bucket configured (`DEVBOX_SESSION_BUCKET` unset).
-fn require_sessions(state: &AppState) -> Result<&SessionArchives, AppError> {
-    state.sessions.as_deref().ok_or_else(|| {
-        AppError::ServiceUnavailable("session archiving is not configured".to_string())
-    })
-}
-
-/// The pool host's own [`DevboxDoc`] (403 for builder identities, 404 when the
-/// instance has no record).
-async fn devbox_for_agent(
-    state: &AppState,
-    agent: &AgentIdentity,
-) -> Result<Document<DevboxDoc>, AppError> {
-    if agent.role != AgentRole::Pool {
-        return Err(AppError::Forbidden(
-            "only pool hosts have a devbox record".into(),
-        ));
-    }
-    state
-        .store
-        .find_one::<DevboxDoc>("instance_id", agent.instance_id.as_str())
-        .await?
-        .ok_or_else(|| {
-            AppError::NotFound(format!(
-                "no devbox record for instance '{}'",
-                agent.instance_id
-            ))
-        })
-}
-
-/// Fetch a [`SessionDoc`] by id (404 when absent).
-async fn get_session(state: &AppState, id: &str) -> Result<Document<SessionDoc>, AppError> {
-    state
-        .store
-        .get::<SessionDoc>(id)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("no session '{id}'")))
-}
-
-/// Apply `mutate` to a [`SessionDoc`] under [`with_occ_retry`] (the reconciler's
-/// deadline pass races the agent's done report on the same record).
-async fn finish_session(
-    state: &AppState,
-    session_id: &str,
-    mutate: impl Fn(&mut SessionDoc),
-) -> Result<(), AppError> {
-    let mutate = &mutate;
-    with_occ_retry(move || async move {
-        let doc = get_session(state, session_id).await?;
-        let mut updated = doc.data.clone();
-        mutate(&mut updated);
-        if state
-            .store
-            .compare_and_update(&doc.id, doc.version, &updated)
-            .await?
-        {
-            Ok(OccAttempt::Done(()))
-        } else {
-            Ok(OccAttempt::Retry)
-        }
-    })
-    .await
+    Ok(refreshed)
 }
 
 /// Rename a Claimed devbox to `new_name` on behalf of `caller`.
@@ -856,7 +516,6 @@ pub(crate) async fn pool_metrics(state: &AppState) -> Result<PoolMetricsResponse
     let mut warming = 0u32;
     let mut ready = 0u32;
     let mut claimed = 0u32;
-    let mut archiving = 0u32;
     let mut terminating = 0u32;
     let mut warm = 0u32;
 
@@ -866,11 +525,10 @@ pub(crate) async fn pool_metrics(state: &AppState) -> Result<PoolMetricsResponse
             DevboxState::Warming => warming = warming.saturating_add(1),
             DevboxState::Ready => ready = ready.saturating_add(1),
             DevboxState::Claimed => claimed = claimed.saturating_add(1),
-            DevboxState::Archiving => archiving = archiving.saturating_add(1),
             DevboxState::Terminating => terminating = terminating.saturating_add(1),
         }
         // Warmth is only meaningful for claimable/claimed boxes: Warming can't
-        // have a report yet and Archiving/Terminating are leaving the pool.
+        // have a report yet and Terminating is leaving the pool.
         if matches!(doc.data.state, DevboxState::Ready | DevboxState::Claimed)
             && doc.data.warmup_report.as_ref().is_some_and(|r| r.warm)
         {
@@ -882,7 +540,6 @@ pub(crate) async fn pool_metrics(state: &AppState) -> Result<PoolMetricsResponse
         warming,
         ready,
         claimed,
-        archiving,
         terminating,
         warm,
     })
@@ -931,7 +588,6 @@ mod tests {
             aws_account_id: None,
             minter: None,
             compute: None,
-            sessions: None,
         }
     }
 
@@ -949,8 +605,6 @@ mod tests {
             owner_email: Some(format!("{owner}@example.com")),
             claimed_at: Some(Timestamp::now()),
             ready_at: None,
-            archive: None,
-            restore_session_id: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
             warmup_report: None,
@@ -1011,8 +665,6 @@ mod tests {
             owner_email: None,
             claimed_at: None,
             ready_at: None,
-            archive: None,
-            restore_session_id: None,
             created_at: Timestamp::now(),
             owner_tag_applied: false,
             warmup_report: None,
@@ -1327,7 +979,7 @@ mod tests {
         let state = setup_state().await;
         insert(&state, ready_devbox()).await;
 
-        let doc = claim_devbox(&state, &claimant("jdoe"), None, None)
+        let doc = claim_devbox(&state, &claimant("jdoe"), None)
             .await
             .ok()
             .unwrap();
@@ -1342,7 +994,7 @@ mod tests {
         let state = setup_state().await;
         insert(&state, ready_devbox()).await;
 
-        let doc = claim_devbox(&state, &claimant("jdoe"), None, None)
+        let doc = claim_devbox(&state, &claimant("jdoe"), None)
             .await
             .ok()
             .unwrap();
@@ -1357,7 +1009,7 @@ mod tests {
         let state = setup_state().await;
         insert(&state, ready_devbox()).await;
 
-        let doc = claim_devbox(&state, &claimant("jdoe"), None, None)
+        let doc = claim_devbox(&state, &claimant("jdoe"), None)
             .await
             .ok()
             .unwrap();
@@ -1370,7 +1022,7 @@ mod tests {
         let state = setup_state().await;
         insert(&state, ready_devbox()).await;
 
-        let doc = claim_devbox(&state, &claimant("jdoe"), Some("my-project"), None)
+        let doc = claim_devbox(&state, &claimant("jdoe"), Some("my-project"))
             .await
             .ok()
             .unwrap();
@@ -1384,7 +1036,7 @@ mod tests {
         let state = setup_state().await;
         insert(&state, ready_devbox()).await;
 
-        let doc = claim_devbox(&state, &claimant("jdoe"), Some("   "), None)
+        let doc = claim_devbox(&state, &claimant("jdoe"), Some("   "))
             .await
             .ok()
             .unwrap();
@@ -1397,7 +1049,7 @@ mod tests {
         let state = setup_state().await;
         insert(&state, ready_devbox()).await;
 
-        let err = claim_devbox(&state, &claimant("jdoe"), Some("Bad Name"), None)
+        let err = claim_devbox(&state, &claimant("jdoe"), Some("Bad Name"))
             .await
             .err()
             .unwrap();
@@ -1420,7 +1072,7 @@ mod tests {
         // The box that already has the requested name (i-1234…, "calm-quilt").
         insert(&state, ready_devbox()).await;
 
-        let doc = claim_devbox(&state, &claimant("jdoe"), Some("calm-quilt"), None)
+        let doc = claim_devbox(&state, &claimant("jdoe"), Some("calm-quilt"))
             .await
             .ok()
             .unwrap();
@@ -1445,7 +1097,7 @@ mod tests {
         // A ready box to claim with the colliding name.
         insert(&state, ready_devbox()).await;
 
-        let err = claim_devbox(&state, &claimant("jdoe"), Some("taken"), None)
+        let err = claim_devbox(&state, &claimant("jdoe"), Some("taken"))
             .await
             .err()
             .unwrap();
@@ -1466,8 +1118,8 @@ mod tests {
         let s2 = state.clone();
         let p = claimant("jdoe");
         let (r1, r2) = tokio::join!(
-            claim_devbox(&s1, &p, Some("shared"), None),
-            claim_devbox(&s2, &p, Some("shared"), None),
+            claim_devbox(&s1, &p, Some("shared")),
+            claim_devbox(&s2, &p, Some("shared")),
         );
 
         let ok_count = [r1.is_ok(), r2.is_ok()].iter().filter(|b| **b).count();
@@ -1495,7 +1147,7 @@ mod tests {
     async fn claim_empty_pool_is_conflict() {
         let state = setup_state().await;
 
-        let err = claim_devbox(&state, &claimant("jdoe"), None, None)
+        let err = claim_devbox(&state, &claimant("jdoe"), None)
             .await
             .err()
             .unwrap();
@@ -1510,7 +1162,7 @@ mod tests {
         doc.state = DevboxState::Warming;
         insert(&state, doc).await;
 
-        let err = claim_devbox(&state, &claimant("jdoe"), None, None)
+        let err = claim_devbox(&state, &claimant("jdoe"), None)
             .await
             .err()
             .unwrap();
@@ -1528,10 +1180,7 @@ mod tests {
         let s1 = state.clone();
         let s2 = state.clone();
         let p = claimant("jdoe");
-        let (r1, r2) = tokio::join!(
-            claim_devbox(&s1, &p, None, None),
-            claim_devbox(&s2, &p, None, None),
-        );
+        let (r1, r2) = tokio::join!(claim_devbox(&s1, &p, None), claim_devbox(&s2, &p, None),);
 
         let ok = [r1.is_ok(), r2.is_ok()].iter().filter(|b| **b).count();
         let conflict = [r1.is_err(), r2.is_err()].iter().filter(|b| **b).count();
@@ -1551,10 +1200,7 @@ mod tests {
         doc.owner = Some("alice".to_string());
         let id = insert(&state, doc).await;
 
-        let err = release_devbox(&state, "bob", &id, false)
-            .await
-            .err()
-            .unwrap();
+        let err = release_devbox(&state, "bob", &id).await.err().unwrap();
 
         assert!(matches!(err, AppError::Forbidden(_)));
     }
@@ -1564,10 +1210,7 @@ mod tests {
         let state = setup_state().await;
         let id = insert(&state, ready_devbox()).await;
 
-        let err = release_devbox(&state, "jdoe", &id, false)
-            .await
-            .err()
-            .unwrap();
+        let err = release_devbox(&state, "jdoe", &id).await.err().unwrap();
 
         assert!(matches!(err, AppError::Conflict(_)));
     }
@@ -1580,11 +1223,7 @@ mod tests {
         doc.owner = Some("jdoe".to_string());
         let id = insert(&state, doc).await;
 
-        let (refreshed, session) = release_devbox(&state, "jdoe", &id, false)
-            .await
-            .ok()
-            .unwrap();
-        assert!(session.is_none(), "plain release creates no session");
+        let refreshed = release_devbox(&state, "jdoe", &id).await.ok().unwrap();
 
         assert_eq!(refreshed.data.state, DevboxState::Terminating);
         assert!(
@@ -1606,420 +1245,6 @@ mod tests {
             persisted.data.name.is_empty(),
             "name must be freed in the store"
         );
-    }
-
-    // -----------------------------------------------------------------------
-    // session archive/restore tests
-    // -----------------------------------------------------------------------
-
-    /// A presigner over placeholder static credentials (SigV4 presigning is
-    /// offline — no AWS access involved).
-    fn test_archives() -> SessionArchives {
-        let creds =
-            aws_sdk_s3::config::Credentials::new("AKIDEXAMPLE", "test-secret", None, None, "test");
-        let config = aws_sdk_s3::Config::builder()
-            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
-            .region(aws_sdk_s3::config::Region::new("us-east-1"))
-            .credentials_provider(creds)
-            .build();
-        SessionArchives::new(
-            aws_sdk_s3::Client::from_conf(config),
-            "devbox-sessions-test".to_string(),
-            30,
-        )
-    }
-
-    async fn setup_state_with_sessions() -> AppState {
-        let mut state = setup_state().await;
-        state.sessions = Some(std::sync::Arc::new(test_archives()));
-        state
-    }
-
-    /// Insert a Claimed box for `owner` and return its doc id.
-    async fn claimed_box(state: &AppState, owner: &str) -> String {
-        let mut doc = ready_devbox();
-        doc.state = DevboxState::Claimed;
-        doc.owner = Some(owner.to_string());
-        insert(state, doc).await
-    }
-
-    /// Insert a Claimed box for `owner` on a distinct instance, so several
-    /// archive flows can coexist in one store without instance-id collisions.
-    async fn claimed_box_on(state: &AppState, owner: &str, instance: &str, name: &str) -> String {
-        let mut doc = ready_devbox();
-        doc.instance_id = instance.to_string();
-        doc.name = name.to_string();
-        doc.state = DevboxState::Claimed;
-        doc.owner = Some(owner.to_string());
-        insert(state, doc).await
-    }
-
-    fn agent_on(instance: &str) -> AgentIdentity {
-        AgentIdentity {
-            instance_id: InstanceId(instance.to_string()),
-            role: AgentRole::Pool,
-            owner: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn release_keep_without_config_is_conflict() {
-        let state = setup_state().await; // sessions: None
-        let id = claimed_box(&state, "jdoe").await;
-
-        let err = release_devbox(&state, "jdoe", &id, true)
-            .await
-            .err()
-            .unwrap();
-
-        assert!(matches!(err, AppError::Conflict(_)));
-        // The box is untouched — still Claimed, still owned.
-        let doc = state.store.get::<DevboxDoc>(&id).await.unwrap().unwrap();
-        assert_eq!(doc.data.state, DevboxState::Claimed);
-    }
-
-    #[tokio::test]
-    async fn release_keep_creates_pending_session_and_archives_box() {
-        let state = setup_state_with_sessions().await;
-        let id = claimed_box(&state, "jdoe").await;
-
-        let (doc, session) = release_devbox(&state, "jdoe", &id, true)
-            .await
-            .ok()
-            .unwrap();
-        let session = session.unwrap();
-
-        // The box is Archiving, keeping its owner and name until the archive
-        // resolves; the archive assignment names the created session.
-        assert_eq!(doc.data.state, DevboxState::Archiving);
-        assert_eq!(doc.data.owner.as_deref(), Some("jdoe"));
-        assert_eq!(doc.data.name, "calm-quilt");
-        let pending = doc.data.archive.unwrap();
-        assert_eq!(pending.session_id, session.id);
-
-        // The session record is pending, owner-scoped, named after the box.
-        let stored = state
-            .store
-            .get::<SessionDoc>(&session.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(stored.data.state, SessionState::Pending);
-        assert_eq!(stored.data.owner, "jdoe");
-        assert_eq!(stored.data.name, "calm-quilt");
-        assert_eq!(
-            stored.data.s3_key,
-            format!("sessions/{}.tar.gz", session.id)
-        );
-        assert!(stored.data.expires_at > stored.data.created_at);
-    }
-
-    #[tokio::test]
-    async fn archive_done_completes_session_and_flips_box_to_terminating() {
-        let state = setup_state_with_sessions().await;
-        let id = claimed_box(&state, "jdoe").await;
-        let (_, session) = release_devbox(&state, "jdoe", &id, true)
-            .await
-            .ok()
-            .unwrap();
-        let session_id = session.unwrap().id;
-
-        // pool_agent()'s instance id matches ready_devbox()'s.
-        let report = devbox_common::SessionArchiveDoneRequest {
-            session_id: session_id.clone(),
-            success: true,
-            size_bytes: Some(4096),
-            error: None,
-        };
-        session_archive_done(&state, &pool_agent(), &report)
-            .await
-            .ok()
-            .unwrap();
-
-        let stored = state
-            .store
-            .get::<SessionDoc>(&session_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(stored.data.state, SessionState::Complete);
-        assert_eq!(stored.data.size_bytes, Some(4096));
-        assert!(stored.data.completed_at.is_some());
-
-        let doc = state.store.get::<DevboxDoc>(&id).await.unwrap().unwrap();
-        assert_eq!(doc.data.state, DevboxState::Terminating);
-        assert!(doc.data.archive.is_none());
-        assert!(doc.data.owner.is_none());
-        assert!(doc.data.name.is_empty(), "name must be freed");
-    }
-
-    #[tokio::test]
-    async fn archive_done_failure_fails_session_but_still_terminates() {
-        let state = setup_state_with_sessions().await;
-        let id = claimed_box(&state, "jdoe").await;
-        let (_, session) = release_devbox(&state, "jdoe", &id, true)
-            .await
-            .ok()
-            .unwrap();
-        let session_id = session.unwrap().id;
-
-        let report = devbox_common::SessionArchiveDoneRequest {
-            session_id: session_id.clone(),
-            success: false,
-            size_bytes: None,
-            error: Some("disk full".to_string()),
-        };
-        session_archive_done(&state, &pool_agent(), &report)
-            .await
-            .ok()
-            .unwrap();
-
-        let stored = state
-            .store
-            .get::<SessionDoc>(&session_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(stored.data.state, SessionState::Failed);
-        assert_eq!(stored.data.error.as_deref(), Some("disk full"));
-
-        let doc = state.store.get::<DevboxDoc>(&id).await.unwrap().unwrap();
-        assert_eq!(doc.data.state, DevboxState::Terminating);
-    }
-
-    #[tokio::test]
-    async fn archive_done_duplicate_report_is_acknowledged() {
-        let state = setup_state_with_sessions().await;
-        let id = claimed_box(&state, "jdoe").await;
-        let (_, session) = release_devbox(&state, "jdoe", &id, true)
-            .await
-            .ok()
-            .unwrap();
-        let session_id = session.unwrap().id;
-
-        let report = devbox_common::SessionArchiveDoneRequest {
-            session_id: session_id.clone(),
-            success: true,
-            size_bytes: Some(4096),
-            error: None,
-        };
-        session_archive_done(&state, &pool_agent(), &report)
-            .await
-            .ok()
-            .unwrap();
-
-        // The assignment is now cleared; a re-report (agent restarted while
-        // the tag was still visible) must be acknowledged, not rejected...
-        session_archive_done(&state, &pool_agent(), &report)
-            .await
-            .ok()
-            .unwrap();
-        // ...and must not disturb the stored outcome.
-        let stored = state
-            .store
-            .get::<SessionDoc>(&session_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(stored.data.state, SessionState::Complete);
-
-        // A different instance's report for the same session stays forbidden.
-        let stranger = agent_on("i-someoneelse00000");
-        let err = session_archive_done(&state, &stranger, &report)
-            .await
-            .err()
-            .unwrap();
-        assert!(matches!(
-            err,
-            AppError::Forbidden(_) | AppError::NotFound(_)
-        ));
-    }
-
-    #[tokio::test]
-    async fn archive_url_requires_matching_assignment() {
-        let state = setup_state_with_sessions().await;
-        let id = claimed_box(&state, "jdoe").await;
-        let (_, session) = release_devbox(&state, "jdoe", &id, true)
-            .await
-            .ok()
-            .unwrap();
-        let session_id = session.unwrap().id;
-
-        let url = session_archive_url(&state, &pool_agent(), &session_id)
-            .await
-            .ok()
-            .unwrap();
-        assert!(url.contains(&format!("sessions/{session_id}.tar.gz")));
-        assert!(url.contains("X-Amz-Signature="));
-
-        // A session id the box was not assigned is refused.
-        let err = session_archive_url(&state, &pool_agent(), "some-other-session")
-            .await
-            .err()
-            .unwrap();
-        assert!(matches!(err, AppError::Forbidden(_)));
-    }
-
-    #[tokio::test]
-    async fn archive_url_unconfigured_is_service_unavailable() {
-        let state = setup_state().await; // sessions: None
-        let err = session_archive_url(&state, &pool_agent(), "whatever")
-            .await
-            .err()
-            .unwrap();
-        assert!(matches!(err, AppError::ServiceUnavailable(_)));
-    }
-
-    /// Drive a full archive to completion on a dedicated instance and return
-    /// the session id. `tag` makes the instance id and box name unique so
-    /// several sessions coexist without index collisions.
-    async fn archived_session(state: &AppState, owner: &str, tag: &str) -> String {
-        let instance = format!("i-archive-{tag}");
-        let name = format!("box-{tag}");
-        let id = claimed_box_on(state, owner, &instance, &name).await;
-        let (_, session) = release_devbox(state, owner, &id, true).await.ok().unwrap();
-        let session_id = session.unwrap().id;
-        let report = devbox_common::SessionArchiveDoneRequest {
-            session_id: session_id.clone(),
-            success: true,
-            size_bytes: Some(1),
-            error: None,
-        };
-        session_archive_done(state, &agent_on(&instance), &report)
-            .await
-            .ok()
-            .unwrap();
-        session_id
-    }
-
-    #[tokio::test]
-    async fn claim_resume_assigns_restore_session() {
-        let state = setup_state_with_sessions().await;
-        let session_id = archived_session(&state, "jdoe", "resume").await;
-
-        // A fresh Ready box to claim onto.
-        insert(&state, ready_devbox_other()).await;
-
-        // Resolvable by the released box's name...
-        let doc = claim_devbox(&state, &claimant("jdoe"), None, Some("box-resume"))
-            .await
-            .ok()
-            .unwrap();
-        assert_eq!(
-            doc.data.restore_session_id.as_deref(),
-            Some(session_id.as_str())
-        );
-        // ...and the restore tag rides the owner tag set.
-        assert!(
-            doc.data
-                .owner_tags()
-                .contains(&("devbox:session-restore", session_id.as_str()))
-        );
-    }
-
-    #[tokio::test]
-    async fn claim_resume_rejects_foreign_or_missing_sessions() {
-        let state = setup_state_with_sessions().await;
-        let session_id = archived_session(&state, "alice", "foreign").await;
-        insert(&state, ready_devbox_other()).await;
-
-        // Another owner's session is invisible: 404, and no box is consumed.
-        let err = claim_devbox(&state, &claimant("jdoe"), None, Some(session_id.as_str()))
-            .await
-            .err()
-            .unwrap();
-        assert!(matches!(err, AppError::NotFound(_)));
-
-        let err = claim_devbox(&state, &claimant("jdoe"), None, Some("no-such-session"))
-            .await
-            .err()
-            .unwrap();
-        assert!(matches!(err, AppError::NotFound(_)));
-    }
-
-    #[tokio::test]
-    async fn claim_resume_without_config_is_conflict() {
-        let state = setup_state().await; // sessions: None
-        insert(&state, ready_devbox()).await;
-
-        let err = claim_devbox(&state, &claimant("jdoe"), None, Some("anything"))
-            .await
-            .err()
-            .unwrap();
-
-        assert!(matches!(err, AppError::Conflict(_)));
-        // No box was consumed by the failed resume.
-        let doc = state
-            .store
-            .find_one::<DevboxDoc>("state", "ready")
-            .await
-            .unwrap();
-        assert!(doc.is_some(), "the ready box must remain claimable");
-    }
-
-    #[tokio::test]
-    async fn claim_resume_rejects_incomplete_session() {
-        let state = setup_state_with_sessions().await;
-        let id = claimed_box(&state, "jdoe").await;
-        let (_, session) = release_devbox(&state, "jdoe", &id, true)
-            .await
-            .ok()
-            .unwrap();
-        let session_id = session.unwrap().id;
-        insert(&state, ready_devbox_other()).await;
-
-        // Still pending — resumable only once complete.
-        let err = claim_devbox(&state, &claimant("jdoe"), None, Some(session_id.as_str()))
-            .await
-            .err()
-            .unwrap();
-        assert!(matches!(err, AppError::Conflict(_)));
-    }
-
-    #[tokio::test]
-    async fn restore_url_requires_matching_assignment_and_complete_session() {
-        let state = setup_state_with_sessions().await;
-        let session_id = archived_session(&state, "jdoe", "restore").await;
-
-        let mut fresh = ready_devbox_other();
-        fresh.state = DevboxState::Claimed;
-        fresh.owner = Some("jdoe".to_string());
-        fresh.restore_session_id = Some(session_id.clone());
-        insert(&state, fresh).await;
-
-        let other_agent = AgentIdentity {
-            instance_id: InstanceId("i-0987654321fedcba0".to_string()),
-            role: AgentRole::Pool,
-            owner: None,
-        };
-        let url = session_restore_url(&state, &other_agent, &session_id)
-            .await
-            .ok()
-            .unwrap();
-        assert!(url.contains(&format!("sessions/{session_id}.tar.gz")));
-
-        let err = session_restore_url(&state, &other_agent, "not-assigned")
-            .await
-            .err()
-            .unwrap();
-        assert!(matches!(err, AppError::Forbidden(_)));
-    }
-
-    #[tokio::test]
-    async fn list_sessions_is_owner_scoped_and_newest_first() {
-        let state = setup_state_with_sessions().await;
-        let first = archived_session(&state, "jdoe", "one").await;
-        let second = archived_session(&state, "jdoe", "two").await;
-        archived_session(&state, "alice", "three").await;
-
-        let sessions = list_sessions(&state, "jdoe").await.ok().unwrap();
-
-        assert_eq!(sessions.len(), 2);
-        assert_eq!(
-            sessions.first().map(|s| s.id.as_str()),
-            Some(second.as_str())
-        );
-        assert_eq!(sessions.last().map(|s| s.id.as_str()), Some(first.as_str()));
     }
 
     // -----------------------------------------------------------------------
@@ -2201,7 +1426,7 @@ mod tests {
             .unwrap();
 
         // The old name must now be claimable (uniqueness constraint freed).
-        let claimed = claim_devbox(&state, &claimant("alice"), Some("old-name"), None).await;
+        let claimed = claim_devbox(&state, &claimant("alice"), Some("old-name")).await;
         assert!(claimed.is_ok(), "old name must be reclaimable after rename");
     }
 }

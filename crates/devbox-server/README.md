@@ -34,7 +34,6 @@ warm pool of EC2 dev boxes that callers claim over SSH. See the
 | `POST /api/v1/devboxes/claim` | Claim a Ready devbox |
 | `POST /api/v1/devboxes/{id}/release` | Release a Claimed devbox |
 | `POST /api/v1/devboxes/{id}/rename` | Rename a Claimed devbox |
-| `GET /api/v1/sessions` | List caller's archived sessions |
 | `GET /api/v1/pool/metrics` | Pool counts vs target |
 | `GET /` | HTML dashboard |
 
@@ -46,8 +45,7 @@ RUST_LOG=info,devbox_server=debug \
 cargo run --bin devbox-server            # serves http://localhost:3000
 ```
 
-Key env vars: `DATABASE_URL`, `PORT`, `POOL_ID`, `DEVBOX_SESSION_BUCKET`,
-`SESSION_ARCHIVE_TIMEOUT_SECS`, `SESSION_TTL_DAYS`, and `AUTH_OIDC_ISSUER` (default
+Key env vars: `DATABASE_URL`, `PORT`, `POOL_ID`, and `AUTH_OIDC_ISSUER` (default
 Vouch; authentication is always on). The JWKS URI and the dashboard
 authorize/token/end-session endpoints are discovered at startup from
 `{AUTH_OIDC_ISSUER}/.well-known/openid-configuration`. Token audience is not

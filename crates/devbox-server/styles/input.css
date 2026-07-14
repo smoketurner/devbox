@@ -43,10 +43,6 @@
     @apply bg-devbox-surface border border-devbox-accent text-devbox-accent px-2 py-0.5 rounded text-xs font-medium;
   }
 
-  .status-archiving {
-    @apply bg-devbox-warning-bg border border-devbox-warning text-devbox-warning px-2 py-0.5 rounded text-xs font-medium;
-  }
-
   .status-terminating {
     @apply bg-devbox-error-bg border border-devbox-error text-devbox-error px-2 py-0.5 rounded text-xs font-medium;
   }

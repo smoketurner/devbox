@@ -92,13 +92,11 @@ component (sshd drop-in + Vouch CA key + `devbox-agent`); the SSH login itself i
 
 ## Architecture (30-second version)
 
-**Lifecycle:** `Launching → Warming → Ready → Claimed → [Archiving →] Terminating`
-(`DevboxState` in `crates/devbox-common/src/lib.rs`). The ASG launches a box
-(`Launching`); `devbox-agent warmup` self-tags `devbox:ready=true` and the
-reconciler flips `Warming → Ready`; `claim` moves `Ready → Claimed` and applies
-the `devbox:owner` tag; `release` or the ready-timeout reaper drives
-`Terminating`. `release --keep` detours through `Archiving` while the on-box
-agent uploads the session archive (see "Durable sessions" under Status).
+**Lifecycle:** `Launching → Warming → Ready → Claimed → Terminating` (`DevboxState`
+in `crates/devbox-common/src/lib.rs`). The ASG launches a box (`Launching`);
+`devbox-agent warmup` self-tags `devbox:ready=true` and the reconciler flips
+`Warming → Ready`; `claim` moves `Ready → Claimed` and applies the `devbox:owner`
+tag; `release` or the ready-timeout reaper drives `Terminating`.
 
 Rust workspace, four crates:
 
@@ -106,8 +104,8 @@ Rust workspace, four crates:
 |-------|------|
 | `devbox-common` | Shared types: `DevboxId`, `DevboxState`, API request/response |
 | `devbox-server` | Axum API (`/api/v1/devboxes/*`) + HTML dashboard, document store (SQLite dev / Aurora DSQL prod), ASG-adopting pool reconciler, AWS compute layer |
-| `devbox-cli`    | `claim` / `release` / `rename` / `list` / `status` / `sessions` / `ssh` |
-| `devbox-agent`  | On-host binary baked into the AMI: `principals` (sshd resolver), `owner-sync` (provision the claimant's account + session restore), `warmup` (self-tags `devbox:ready=true` once warmed), `checkout` (clone repos into `/workspace`), `session-watch` (archive the session on `release --keep`), `doctor` (diagnose warm-cache delivery). musl static; built/released by CI, downloaded into the golden AMI |
+| `devbox-cli`    | `claim` / `release` / `rename` / `list` / `status` / `ssh` |
+| `devbox-agent`  | On-host binary baked into the AMI: `principals` (sshd resolver), `owner-sync` (provision the claimant's account), `warmup` (self-tags `devbox:ready=true` once warmed), `checkout` (clone repos into `/workspace`), `doctor` (diagnose warm-cache delivery). musl static; built/released by CI, downloaded into the golden AMI |
 
 **Pool management is ASG-based and the reconciler is adopt-only.** The Launch
 Template and ASG are **provisioned by Terraform** in `devbox-infra`; there is no
@@ -212,10 +210,9 @@ in-memory SQLite.
 | `GET /health` | Server + database health |
 | `GET /api/v1/devboxes` | List all devboxes |
 | `GET /api/v1/devboxes/{id}` | Get one devbox |
-| `POST /api/v1/devboxes/claim` | Claim a Ready devbox (body: optional `name` override, optional `resume` session; `owner` from token) |
-| `POST /api/v1/devboxes/{id}/release` | Release a Claimed devbox (body: optional `keep_session`; `owner` from token) |
+| `POST /api/v1/devboxes/claim` | Claim a Ready devbox (body: optional `name` override; `owner` from token) |
+| `POST /api/v1/devboxes/{id}/release` | Release a Claimed devbox (no body; `owner` from token) |
 | `POST /api/v1/devboxes/{id}/rename` | Rename a Claimed devbox (body: `name`; `owner` from token) |
-| `GET /api/v1/sessions` | List the caller's archived sessions (`release --keep`) |
 | `GET /api/v1/pool/metrics` | Pool counts by state, plus `warm` (Ready/Claimed boxes whose warm-up report says the caches were warm) |
 | `GET /` | HTML dashboard |
 
@@ -310,26 +307,6 @@ reads included (list/get/pool metrics) — an unauthenticated API call is a 401,
 never data. Only `/health` (infrastructure health checks present no credential)
 and the RFC 9728 discovery document (fetched pre-login to bootstrap auth) are
 open; the CLI's `list`/`status`/`ssh` therefore require `devbox login` too.
-**Durable sessions** _(cf. Ramp Inspect)_: `devbox release --keep` archives the
-session before the box terminates — the box detours `Claimed → Archiving`, the
-new on-box `devbox-agent session-watch` service (signaled by the
-`devbox:archive-session` tag; there is no push channel to a box) packs per-repo
-git bundles of everything not on origin (a synthetic snapshot commit carries
-dirty/untracked files) plus a home allowlist (`~/.claude`, `~/.gitconfig`, …),
-uploads one `session.tar.gz` through a **server-minted presigned S3 PUT** (hosts
-have no S3 IAM; the ECS task role holds the only grants), and reports done —
-which flips the box to `Terminating`. The reconciler enforces
-`SESSION_ARCHIVE_TIMEOUT_SECS` (default 600 s): past it the session is marked
-failed and the box terminates anyway — never wedged; Archiving boxes count as
-claimed for capacity and keep scale-in protection. `devbox claim --resume
-<name|id>` restores: the session rides the `devbox:session-restore` tag through
-the owner-tag path, and `owner-sync` (best-effort, never bricks a claim)
-downloads via presigned GET, recreates the branch at the snapshot, and resets so
-WIP lands as unstaged changes. `devbox sessions` lists archives (`SessionDoc`,
-TTL `SESSION_TTL_DAYS`, default 30 d, swept each reconciler tick; the bucket's
-lifecycle rule expires the objects). Enabled by `DEVBOX_SESSION_BUCKET`;
-unconfigured servers 409 `--keep`. The bucket + task-role IAM + systemd unit
-live in `devbox-infra` (`control-plane` + `image-builder` modules).
 
 **Planned / not yet built** (ideas borrowed from [`.kiro/references.md`](.kiro/references.md)
 are tagged inline):
@@ -380,6 +357,13 @@ are tagged inline):
 - **Predictive / multi-pool warming** — pre-claim warming and pools keyed by
   profile/repo rather than one generic pool. _(cf. Ramp Inspect)_
 - **Stop/resume long-lived claims** (persist EBS) as a cost lever. _(cf. WorkOS Horizon)_
+
+**Rejected — do not re-propose:** *durable agent sessions* (archive git WIP + agent
+context to S3 on `release --keep`, restore on `claim --resume`; cf. Ramp Inspect) was
+built in #87 and removed. It re-implemented `git push` with bespoke machinery (an extra
+lifecycle state, an on-box systemd watcher, S3 + presign IAM, TTL sweeps) and cut
+against the cattle-not-pets thesis. WIP durability is git's job: push a WIP branch
+before releasing.
 
 ## Related repositories
 
