@@ -71,6 +71,52 @@ Objects for per-session state, and GitHub App tokens for VCS.
 
 ---
 
+## Stripe — Minions (one-shot coding agents on devboxes)
+
+<https://stripe.dev/blog/minions-stripes-one-shot-end-to-end-coding-agents>
+([part 2](https://stripe.dev/blog/minions-stripes-one-shot-end-to-end-coding-agents-part-2))
+
+Stripe's homegrown coding agents (1,000+ merged PRs a week) run on "devboxes" —
+pre-warmed, isolated EC2 instances originally built for human engineers, claimable
+in ~10 seconds, isolated from production and the open internet.
+
+**What devbox borrows**
+
+- **Same substrate for humans and agents.** Minions run on the exact environment
+  human engineers use, not a separate agent-only sandbox — direct validation of
+  devbox's core thesis.
+- **No-arbitrary-egress is what unlocks unattended agents.** Stripe enforces it in
+  production with [smokescreen](https://github.com/stripe/smokescreen), their
+  allowlisting egress proxy — the enforcement layer the devbox-infra egress plan
+  adopts (smoketurner/devbox-infra#16).
+- **Caches, not boot, make a box hot — and warmth is measured.** A pre-warmed box
+  is only fast if code, deps, and build artifacts are already present. Shaped the
+  warm/cold probe (smoketurner/devbox#79); full claim-to-first-build measurement
+  was considered and declined (smoketurner/devbox#86) in favor of the probe.
+
+---
+
+## Joe Magerramov — "Disposable Environments, Durable Sessions"
+
+<https://blog.joemag.dev/2026/01/disposable-environments-durable.html>
+
+An ideal agentic workflow: environments are declarative, reproducible, and
+disposable; the *session* — the ongoing developer↔agent collaboration — is the
+durable thing. The environment earns deletion only after its work is pushed.
+
+**What devbox borrows**
+
+- **The session, not the disk, is the durable thing.** Sharpens cattle-not-pets:
+  durability belongs to git (push a WIP branch before releasing), not to instance
+  state. Devbox built S3-archived durable sessions on this framing (#87) and
+  removed them (#91) — the archive machinery re-implemented `git push`; the
+  insight survives as "WIP durability is git's job."
+- **Declarative, versioned environment templates.** The golden AMI pipeline plus
+  the per-repo `.devbox/warm.sh` hook are devbox's version of the reproducible,
+  never-think-about-it template.
+
+---
+
 ## How to use this file
 
 When adopting an idea here, link back to the entry from the relevant spec or PR so

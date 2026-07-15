@@ -214,7 +214,15 @@ in-memory SQLite.
 | `POST /api/v1/devboxes/{id}/release` | Release a Claimed devbox (no body; `owner` from token) |
 | `POST /api/v1/devboxes/{id}/rename` | Rename a Claimed devbox (body: `name`; `owner` from token) |
 | `GET /api/v1/pool/metrics` | Pool counts by state, plus `warm` (Ready/Claimed boxes whose warm-up report says the caches were warm) |
+| `POST /api/v1/agent/warmup-report` | Ingest a host's warm-up probe report (agent auth: AWS web-identity token, pool role only) |
+| `POST /api/v1/agent/git-token` | Mint a short-lived, repo-scoped read-only GitHub App token for the workspace fetch (agent auth: pool or builder role) |
 | `GET /` | HTML dashboard |
+
+The `/api/v1/agent/*` endpoints sit behind a separate auth layer from the human
+API: `require_agent_iam` verifies an AWS web-identity Bearer token against
+trusted role ARNs (`crates/devbox-server/src/auth/agent_identity.rs`), so Vouch
+tokens can never reach agent endpoints and agent identities can never claim or
+release.
 
 ## Status: implemented vs planned
 
@@ -225,8 +233,7 @@ protection, `devbox:owner` tagging via `apply_pending_owner_tags`), graceful
 shutdown, Tailwind-styled HTML dashboard, unit tests. **Tag-based readiness gate:** instances
 auto-join the ASG (no launch lifecycle hook); `devbox-agent warmup` starts Docker,
 freshens the snapshot-seeded repos under `/workspace`
-(`crates/devbox-agent/src/freshen.rs`; see the "Workspace freshening" planned item
-below for the infra half), then self-sets `devbox:ready=true` via `ec2:CreateTags`; the reconciler flips
+(`crates/devbox-agent/src/freshen.rs`), then self-sets `devbox:ready=true` via `ec2:CreateTags`; the reconciler flips
 `DevboxDoc` `Warming → Ready` on that tag; boxes that never tag ready within
 `ready_timeout` (`POOL_READY_TIMEOUT_SECS`, default 300 s, validated 60–3600 s) are
 terminated and the ASG relaunches them. **Warmth is measured, not assumed:**
@@ -235,7 +242,33 @@ terminated and the ASG relaunches them. **Warmth is measured, not assumed:**
 checks) and reports a `warm` flag with its timings to
 `POST /api/v1/agent/warmup-report`; the reconciler stamps `ready_at` on the
 `Warming → Ready` flip; `/api/v1/pool/metrics` counts warm Ready/Claimed boxes
-and the dashboard shows warm/cold per box. **SSH/Vouch-CA path:** `devbox-agent` (principals resolver
+and the dashboard shows warm/cold per box. **Workspace seeding + warm caches are
+end-to-end (both repos):** the `devbox-infra` `snapshot-builder` module launches a
+builder on an EventBridge schedule (SSM Automation), runs `devbox-agent checkout` —
+which clones the repos into `/workspace` and executes each repo's `.devbox/warm.sh`
+hook (`run_warm_hook`, 30-min budget, `crates/devbox-agent/src/checkout.rs`; this
+repo's hook runs `make build` + `cargo test --all-features --no-run`, pre-building
+release+debug `target/`) — snapshots the volume, and publishes
+`/devbox/workspace-snapshot/latest`; the pool Launch Template seeds an encrypted,
+`DeleteOnTermination=true` per-instance `/workspace` volume from that snapshot; and
+the AMI sets `RUSTUP_HOME`/`CARGO_HOME` (plus Go/uv/pnpm cache homes) system-wide
+onto the `/workspace` volume via `/etc/environment`, so warmed toolchains and
+`target/` survive into the claimant's per-principal session (warmup's freshen
+preserves them: `git clean -fd`, no `-x`). The read-only fetch credential is
+**server-backed**: the agent authenticates to devbox-server with an AWS
+web-identity token (STS `GetWebIdentityToken` — no static secret on the box) at
+`POST /api/v1/agent/git-token`, and the server mints a short-lived, repo-scoped
+GitHub App installation token (`crates/devbox-server/src/github/minter.rs`,
+`crates/devbox-agent/src/control_plane.rs`; the App private key lives only on the
+control plane, read from an SSM SecureString). The warmup fetch is time-budgeted
+(`WARMUP_FETCH_TIMEOUT_SECS`, default 120 s) and **degrades, does not reap** — a
+too-large delta, a token failure, or an absent/empty `/workspace` still becomes
+Ready on whatever checkout is present. Freshness is **warming-time only** (no
+claim-time fetch / lazy write-gating — the claimant fetches HEAD post-claim).
+_(cf. Ramp Inspect, Stripe Minions)_ The warm path has not been re-verified on a
+live claimed box since the infra half landed (see devbox-infra#13's closing note;
+the dev pool's `t4g.small` override, devbox-infra#14, can mask cache warmth by
+OOM-thrashing). **SSH/Vouch-CA path:** `devbox-agent` (principals resolver
 + per-principal account provisioning + warmup) baked into the AMI; Terraform `pool`
 module provides the host instance profile (SSM core + `ec2:CreateTags` for
 `devbox:ready`), `InstanceMetadataTags=enabled`, and sshd `AuthorizedPrincipalsCommand`
@@ -315,45 +348,17 @@ are tagged inline):
   above), but the Vouch config must still be set so `AUTH_PRINCIPAL_CLAIM` emits a
   Unix-safe username (not the default UUID `sub`) that equals the SSH cert
   principal. Verify end-to-end (OIDC claim == cert principal == `owner-sync` account).
-- **Workspace freshening (snapshot-seeded EBS workspace)** — *Agent half
-  implemented:* `devbox-agent warmup` discovers git repos under `/workspace` and
-  `git fetch` + hard-resets each to upstream HEAD before tagging ready
-  (`crates/devbox-agent/src/freshen.rs`). The read-only credential is **server-backed**:
-  the agent authenticates to devbox-server with an AWS web-identity token (STS
-  `GetWebIdentityToken`, IAM Outbound Identity Federation — no static secret on the box),
-  and the server mints a short-lived, repo-scoped GitHub App installation token and returns
-  it to the agent (see `crates/devbox-agent/src/control_plane.rs`). The GitHub App private
-  key lives only on the control plane, read from an SSM SecureString by the server; the host
-  needs only `sts:GetWebIdentityToken` and egress to `api.github.com`. The fetch is
-  time-budgeted (`WARMUP_FETCH_TIMEOUT_SECS`, default 120 s) and **degrades, does not reap** —
-  a too-large delta, a token failure, or an absent/empty `/workspace` still becomes Ready on
-  whatever checkout is present.
-  Freshness is **warming-time only** (no claim-time fetch / lazy write-gating — the
-  claimant fetches HEAD themselves post-claim). *Still in `devbox-infra`:* the
-  periodic snapshot-builder pipeline + `/devbox/workspace-snapshot/latest` SSM param
-  + Launch Template block-device-mapping (per-instance volume, encrypted,
-  `DeleteOnTermination=true`) that seeds the volume, and the GitHub
-  egress allowlist (`api.github.com` + the git host). _(cf. Ramp Inspect)_
-- **Warm dependency/build caches** — *Agent half implemented:* the per-repo
-  `.devbox/warm.sh` hook (this repo ships one that runs `make build` +
-  `cargo test --all-features --no-run`, pre-building release+debug `target/`) is
-  executed by `devbox-agent checkout` while it seeds repos
-  (`run_warm_hook`, 30-min budget — `crates/devbox-agent/src/checkout.rs`), and
-  warmup's freshen preserves the warmed `target/` by using `git clean -fd` without
-  `-x` (`crates/devbox-agent/src/freshen.rs`). *Still in `devbox-infra`:* having the
-  snapshot-builder actually run `checkout` on a schedule, the Launch Template
-  block-device-mapping that seeds the `/workspace` volume, and — the piece whose
-  absence shows up as a cold rebuild (toolchain re-download) on a claimed box —
-  `RUSTUP_HOME`/`CARGO_HOME` set system-wide on the `/workspace` volume so the
-  pinned toolchain and caches survive into the claimant's fresh per-principal home.
-  Optional remote cache (sccache / Bazel) through the allowlist. _(cf. Ramp Inspect)_
+- **Remote build cache** — optional sccache / Bazel remote cache through the
+  egress allowlist, on top of the snapshot-seeded local caches. _(cf. Ramp Inspect)_
 - **Health-check gating of "warming"** — `devbox-agent warmup` already gates Ready on
   Docker + repo freshen; extend to network and richer health, plus **idle-claim
-  reclaim**.
+  reclaim** (smoketurner/devbox#80 — unblocked now that the agent channel exists).
 - **Allowlisting egress proxy** — route outbound through a controlled proxy that
-  enforces allowlists and **injects per-claim VCS tokens**, instead of baking a
-  shared `devbox/git-token` secret onto the box (today's `03-repos` credential
-  helper). _(cf. WorkOS Horizon)_
+  enforces destination allowlists (`api.github.com`, the git host, package
+  registries) and **injects per-claim VCS tokens**; today the pool SG restricts
+  egress by port only (TCP 443 anywhere). Tracked in smoketurner/devbox-infra#16
+  (DNS Firewall → smokescreen → NFW Proxy tiers) and smoketurner/devbox#81
+  (per-claim claimant credentials). _(cf. WorkOS Horizon, Stripe Minions)_
 - **Predictive / multi-pool warming** — pre-claim warming and pools keyed by
   profile/repo rather than one generic pool. _(cf. Ramp Inspect)_
 - **Stop/resume long-lived claims** (persist EBS) as a cost lever. _(cf. WorkOS Horizon)_
@@ -375,7 +380,8 @@ before releasing.
 ## Related reading
 
 External systems that inform devbox's roadmap — annotated with what we borrow — in
-[`.kiro/references.md`](.kiro/references.md) (WorkOS Project Horizon, Ramp Inspect).
+[`.kiro/references.md`](.kiro/references.md) (WorkOS Project Horizon, Ramp Inspect,
+Stripe Minions, Joe Magerramov's "Disposable Environments, Durable Sessions").
 
 ## Source of truth
 
