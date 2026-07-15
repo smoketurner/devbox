@@ -105,10 +105,11 @@ falls back to the root disk) simply skips freshening — the box still becomes R
 The minted token is read-only; the claimant's per-claim write credential is a
 separate concern. Warming build/dependency caches into the snapshot is the job of
 `checkout`'s per-repo `.devbox/warm.sh` hook (see below), not warmup; warmup only
-freshens and preserves the warmed `target/`. What is **still in `devbox-infra`** is
-running the snapshot-builder on a schedule, the Launch Template block-device-mapping
-that seeds `/workspace`, and `RUSTUP_HOME`/`CARGO_HOME=/workspace` set system-wide so
-the toolchain and caches survive into the claimant's fresh per-principal home.
+freshens and preserves the warmed `target/`. The `devbox-infra` half of this
+warm path — running the snapshot-builder on a schedule, the Launch Template
+block-device-mapping that seeds `/workspace`, and `RUSTUP_HOME`/`CARGO_HOME=/workspace`
+set system-wide so the toolchain and caches survive into the claimant's fresh
+per-principal home — is implemented in its `snapshot-builder` and `pool` modules.
 
 ## `checkout` — clone and warm repositories
 
