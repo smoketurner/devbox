@@ -71,6 +71,40 @@ Objects for per-session state, and GitHub App tokens for VCS.
 
 ---
 
+## edjgeek — Claude Code Sandbox for iPad
+
+<https://edjgeek.com/blog/claude-code-sandbox-for-ipad/>
+
+A single-user Claude Code sandbox reachable from an iPad: Lambda MicroVMs (8GB/4vCPU
+baseline, burstable) with a per-user home directory mounted from S3, Cognito + API
+Gateway minting short-lived (55-minute, port-scoped) tokens, and a browser terminal —
+xterm.js over a WebSocket to a Node PTY server (ttyd protocol) inside the VM — with
+Claude Code preinstalled against Bedrock. Idle policy: suspend after 2 h of no proxy
+traffic, resume from a memory snapshot within 30 min, terminate beyond that, 8 h hard
+cap. Deployed as one SAM template.
+
+**What devbox borrows**
+
+- **Suspend-to-memory-snapshot as the idle state.** Their suspend/resume preserves
+  full process state, not just disk — a sharper version of devbox's planned
+  **stop/resume long-lived claims** item (EC2 hibernation is the rough equivalent;
+  persisting EBS alone loses running processes).
+- **Idle measured at the proxy.** Inactivity is inferred from ingress-proxy traffic
+  rather than an on-box agent. Pairs with devbox's planned **allowlisting egress
+  proxy**: the same proxy that injects per-claim tokens could drive **idle-claim
+  reclaim** with no extra on-host machinery.
+- **Hard-cap termination.** An absolute session lifetime (their 8 h) backstops any
+  idle heuristic so forgotten claims can't accumulate cost indefinitely.
+- **Not borrowed — browser-terminal access.** Their xterm.js/WebSocket path is what
+  makes the iPad case work (iPadOS has no Remote-SSH IDE), but it forfeits the IDE
+  ecosystem; devbox's deciding constraint is **SSH as the universal adapter**. An
+  iPad against devbox is an SSH terminal app (Blink, Termius), not a browser tab.
+- **Not borrowed — persistent per-user home (S3-mounted).** A pet home directory on
+  cattle VMs cuts against the cattle-not-pets thesis; devbox built and removed the
+  equivalent (durable agent sessions, #87). WIP durability is git's job.
+
+---
+
 ## How to use this file
 
 When adopting an idea here, link back to the entry from the relevant spec or PR so

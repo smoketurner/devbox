@@ -375,7 +375,8 @@ before releasing.
 ## Related reading
 
 External systems that inform devbox's roadmap — annotated with what we borrow — in
-[`.kiro/references.md`](.kiro/references.md) (WorkOS Project Horizon, Ramp Inspect).
+[`.kiro/references.md`](.kiro/references.md) (WorkOS Project Horizon, Ramp Inspect,
+edjgeek's Claude Code Sandbox for iPad).
 
 ## Source of truth
 

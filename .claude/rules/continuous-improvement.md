@@ -78,6 +78,7 @@ Prone to silent breakage not caught by unit tests — live-test before any PR th
 
 - **WorkOS Project Horizon** — allowlisting egress proxy, per-claim VCS token injection, stop/resume long-lived claims
 - **Ramp Inspect** — snapshot-seeded EBS workspaces, predictive/multi-pool warming
+- **edjgeek Claude Code Sandbox for iPad** — suspend-to-memory-snapshot idle state, proxy-measured idleness, hard-cap termination
 - **`../vouch`** — production-proven source for shared DSQL/migration/serve/auth patterns; diff against it before "fixing" a shared pattern
 - See `.kiro/references.md` for annotations on what devbox borrows.
 
