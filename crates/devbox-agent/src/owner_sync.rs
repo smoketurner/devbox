@@ -31,6 +31,10 @@ use crate::imds;
 /// The control-plane base URL; the claimant's git is pointed at its reverse proxy.
 const SERVER_URL_ENV: &str = "DEVBOX_SERVER_URL";
 
+/// Absolute path to this binary on the golden AMI (matches the systemd units), used
+/// in the git credential helper so it resolves regardless of the claimant's `PATH`.
+const AGENT_BIN: &str = "/usr/local/sbin/devbox-agent";
+
 /// How often to poll IMDS for the owner tag. Kept short so the claimant's account
 /// is provisioned within a couple of seconds of the `devbox:owner` tag becoming
 /// visible (the tag is now applied inline at claim time, not on the next
@@ -257,7 +261,7 @@ fn git_config_entries(user: &str, email: Option<&str>, server_base: Option<&str>
             section: "credential",
             subsection: Some(base.to_string()),
             name: "helper",
-            value: "!devbox-agent git-credential".to_string(),
+            value: format!("!{AGENT_BIN} git-credential"),
         });
     }
     entries
@@ -371,7 +375,7 @@ mod tests {
         assert!(out.contains("insteadOf = https://github.com/"), "{out}");
         assert!(out.contains("[credential \"https://cp.example\"]"), "{out}");
         assert!(
-            out.contains("helper = !devbox-agent git-credential"),
+            out.contains("helper = !/usr/local/sbin/devbox-agent git-credential"),
             "{out}"
         );
         assert!(out.contains("[user]"), "{out}");
