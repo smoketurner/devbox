@@ -6,9 +6,10 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Request, State};
-use axum::http::HeaderMap;
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, Path, RawQuery, Request, State};
 use axum::http::header::AUTHORIZATION;
+use axum::http::{HeaderMap, Method};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{Json, Response};
 use axum::routing::{get, post};
@@ -23,8 +24,14 @@ use devbox_common::{
 use crate::auth::{AgentIdentity, Authenticator, Principal};
 use crate::documents::devbox::DevboxDoc;
 use crate::error::{AppError, JsonBody};
+use crate::github::git_proxy;
 use crate::service;
 use crate::ui::build_ui_router;
+
+/// Body cap for a proxied git request (50 MiB). Fetch negotiations are far
+/// smaller; the cap only bounds a pathological `git-upload-pack` request body
+/// (the large data — the packfile — flows the other way, as a streamed response).
+const GIT_PROXY_BODY_LIMIT: usize = 50 * 1024 * 1024;
 
 /// Application state shared across handlers.
 ///
@@ -48,6 +55,9 @@ pub struct AppState {
     /// `DEVBOX_GITHUB_KEY_PARAM` unset), in which case `/api/v1/agent/git-token`
     /// reports minting unavailable.
     pub minter: Option<Arc<crate::github::Minter>>,
+    /// Git reverse proxy for the claimant's fetch/push traffic. `None` when the
+    /// minter is unconfigured, in which case `/git/*` returns 503.
+    pub git_proxy: Option<Arc<crate::github::GitProxy>>,
     /// EC2 client used to apply the `devbox:owner` tag inline at claim time, so a
     /// freshly-claimed box becomes loginable without waiting for the next
     /// reconciler tick. `None` in tests (and any deployment without AWS), where
@@ -139,6 +149,16 @@ pub fn build_router(state: SharedState) -> Router {
         )
         .route_layer(from_fn_with_state(state.clone(), require_agent_iam));
 
+    // The git proxy authenticates inline (basic-auth, not a Bearer header), so it
+    // carries no shared route layer. The raised body limit covers large fetch
+    // negotiations; the packfile streams back as the response.
+    let git = Router::new()
+        .route(
+            "/git/{owner}/{repo}/{*rest}",
+            get(handle_git_proxy).post(handle_git_proxy),
+        )
+        .layer(DefaultBodyLimit::max(GIT_PROXY_BODY_LIMIT));
+
     Router::new()
         .route("/health", get(health_check))
         .route(
@@ -147,6 +167,7 @@ pub fn build_router(state: SharedState) -> Router {
         )
         .merge(api)
         .merge(agent)
+        .merge(git)
         .merge(build_ui_router())
         .with_state(state)
 }
@@ -267,6 +288,51 @@ async fn handle_agent_git_token(
     Ok(Json(resp))
 }
 
+/// HTTP adapter: git smart-HTTP reverse proxy for a devbox.
+///
+/// Authenticates inline — the box presents its web-identity token as basic-auth,
+/// not a `Bearer` header — then forwards to GitHub with a repo-scoped token injected
+/// (see [`crate::github::git_proxy`]). Fetch is always allowed; push additionally
+/// requires the box to be claimed and mints a `contents:write` token.
+async fn handle_git_proxy(
+    State(state): State<SharedState>,
+    method: Method,
+    Path((owner, repo, rest)): Path<(String, String, String)>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let token = git_proxy::basic_auth_password(&headers)
+        .ok_or_else(|| AppError::Unauthorized("no git proxy credential".to_string()))?;
+    // Verify the box's web-identity token against the trusted devbox roles, as the
+    // agent JSON endpoints do.
+    let agent = state.auth.verify_agent_token(&token).await?;
+
+    let target = git_proxy::authorize(&method, &owner, &repo, &rest, query.as_deref()).map_err(
+        |reject| match reject {
+            git_proxy::GitReject::NotFound(msg) => AppError::NotFound(msg),
+            git_proxy::GitReject::BadRequest(msg) => AppError::BadRequest(msg),
+        },
+    )?;
+
+    // Push writes to the repo, so it is gated on the box being claimed (an
+    // accountable claimant); fetch stays open to warming boxes.
+    if target.is_write() {
+        service::authorize_git_push(&state, &agent).await?;
+    }
+
+    let proxy = state
+        .git_proxy
+        .as_ref()
+        .ok_or_else(|| AppError::ServiceUnavailable("git proxy is not configured".to_string()))?;
+
+    let upstream = proxy
+        .forward(&target, &method, &headers, body)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(git_proxy::into_axum_response(upstream))
+}
+
 /// HTTP adapter: record a warm-up report from a verified devbox host onto its
 /// `DevboxDoc` (see [`service::record_warmup_report`]).
 async fn handle_agent_warmup_report(
@@ -310,6 +376,7 @@ mod tests {
             auth: Authenticator::with_test_owner(owner),
             aws_account_id: None,
             minter: None,
+            git_proxy: None,
             compute: None,
         })
     }
@@ -337,6 +404,7 @@ mod tests {
             auth,
             aws_account_id: None,
             minter: None,
+            git_proxy: None,
             compute: None,
         })
     }
@@ -415,6 +483,7 @@ mod tests {
             auth: Authenticator::with_test_owner("jdoe"),
             aws_account_id: Some("123456789012".to_string()),
             minter: None,
+            git_proxy: None,
             compute: None,
         });
 
@@ -487,6 +556,29 @@ mod tests {
             let state = setup_state_no_principal().await;
             let status = router_status(state, "POST", uri).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED, "expected 401 for {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn git_proxy_route_requires_a_credential() {
+        // The git proxy authenticates inline (basic-auth, not a Bearer header). A
+        // request with no credential is 401 — and wired (not 404), pinning the
+        // read-proxy path. Both the fetch advertisement and the upload-pack POST
+        // resolve to the handler.
+        for (method, uri) in [
+            (
+                "GET",
+                "/git/smoketurner/devbox/info/refs?service=git-upload-pack",
+            ),
+            ("POST", "/git/smoketurner/devbox/git-upload-pack"),
+        ] {
+            let state = setup_state_no_principal().await;
+            let status = router_status(state, method, uri).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "expected 401 for {method} {uri}"
+            );
         }
     }
 

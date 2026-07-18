@@ -11,9 +11,11 @@
 //! fail-closed). This service only makes the account *exist*; an extra account
 //! with no valid certificate cannot be logged into, so staleness is harmless.
 //!
-//! On provisioning it also reads the `devbox:owner-email` tag and writes the
-//! claimant's git identity (`user.email`/`user.name`) into their `~/.gitconfig`, so
-//! their first commit is attributed correctly with no manual setup.
+//! On provisioning it also writes the claimant's `~/.gitconfig`: their git identity
+//! (`user.email`/`user.name`, from the `devbox:owner-email` tag) so commits are
+//! attributed with no manual setup, and — when `DEVBOX_SERVER_URL` is set — the
+//! reverse-proxy remotes (`insteadOf` + a credential helper) so GitHub traffic is
+//! authenticated with a server-minted token the box never holds.
 
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
@@ -21,9 +23,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use aws_config::imds::client::Client;
-use devbox_common::is_valid_unix_username;
+use devbox_common::{env_non_empty, is_valid_unix_username};
+use ini::{EscapePolicy, Ini, WriteOption};
 
 use crate::imds;
+
+/// The control-plane base URL; the claimant's git is pointed at its reverse proxy.
+const SERVER_URL_ENV: &str = "DEVBOX_SERVER_URL";
 
 /// How often to poll IMDS for the owner tag. Kept short so the claimant's account
 /// is provisioned within a couple of seconds of the `devbox:owner` tag becoming
@@ -116,7 +122,7 @@ async fn tick(client: &Client) -> Result<Pass> {
             let email = imds::instance_tag(client, "devbox:owner-email")
                 .await
                 .context("read devbox:owner-email")?;
-            configure_git_identity(&owner, email.as_deref());
+            configure_git(&owner, email.as_deref());
             Ok(Pass::Done)
         }
     }
@@ -173,39 +179,113 @@ fn ensure_user(user: &str) -> Result<()> {
     Ok(())
 }
 
-/// Set the claimant's git identity from the `devbox:owner-email` tag so their first
-/// commit is attributed correctly. Best-effort: a missing email, unknown home, or
-/// `git` failure is logged, not fatal — the account is already usable.
-///
-/// Writes the user's own `~/.gitconfig` with `git config --file` (run as root, so no
-/// `$HOME` ambiguity) and hands the file to the claimant. `user.name` is the login;
-/// a real display name would need a separate tag.
-fn configure_git_identity(user: &str, email: Option<&str>) {
-    let Some(email) = email.map(str::trim).filter(|e| !e.is_empty()) else {
+/// A single git-config entry: section, optional subsection, value name, and value.
+struct GitEntry {
+    section: &'static str,
+    subsection: Option<String>,
+    name: &'static str,
+    value: String,
+}
+
+/// Write the claimant's `~/.gitconfig` — git identity (from the `devbox:owner-email`
+/// tag) and the reverse-proxy remotes (from `DEVBOX_SERVER_URL`) — then hand the file
+/// to the claimant. Best-effort: an absent home or write failure is logged, not fatal
+/// (the account is already usable; git just talks to GitHub directly).
+fn configure_git(user: &str, email: Option<&str>) {
+    let entries = git_config_entries(user, email, env_non_empty(SERVER_URL_ENV).as_deref());
+    if entries.is_empty() {
         tracing::info!(
             user,
-            "no devbox:owner-email tag; leaving git identity unset"
+            "no git identity or server URL; leaving .gitconfig unset"
         );
         return;
-    };
+    }
     let Some(home) = user_home(user) else {
         tracing::warn!(
             user,
-            "could not resolve home directory; skipping git identity"
+            "could not resolve home directory; skipping .gitconfig"
         );
         return;
     };
     let gitconfig = format!("{home}/.gitconfig");
-    for (key, value) in [("user.email", email), ("user.name", user)] {
-        if let Err(e) = run_cmd("git", &["config", "--file", &gitconfig, key, value]) {
-            tracing::warn!(user, key, error = %e, "failed to set git identity");
+    let rendered = match render_gitconfig(&entries) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(user, error = %format!("{e:#}"), "failed to render .gitconfig");
             return;
         }
+    };
+    if let Err(e) = std::fs::write(&gitconfig, rendered) {
+        tracing::warn!(user, error = %e, "failed to write .gitconfig");
+        return;
     }
     if let Err(e) = run_cmd("chown", &[&format!("{user}:{user}"), &gitconfig]) {
         tracing::warn!(user, error = %e, "failed to hand .gitconfig to claimant");
     }
-    tracing::info!(user, email, "configured git identity");
+    tracing::info!(user, "configured claimant .gitconfig");
+}
+
+/// Build the claimant's git-config entries: identity when an email is known
+/// (`user.name` is the login), and the reverse-proxy remotes when `server_base` is
+/// set — an `insteadOf` rewriting `https://github.com/` to the proxy and a credential
+/// helper that supplies the web-identity token. Either group may be empty.
+fn git_config_entries(user: &str, email: Option<&str>, server_base: Option<&str>) -> Vec<GitEntry> {
+    let mut entries = Vec::new();
+    if let Some(email) = email.map(str::trim).filter(|e| !e.is_empty()) {
+        entries.push(GitEntry {
+            section: "user",
+            subsection: None,
+            name: "email",
+            value: email.to_string(),
+        });
+        entries.push(GitEntry {
+            section: "user",
+            subsection: None,
+            name: "name",
+            value: user.to_string(),
+        });
+    }
+    if let Some(base) = server_base.map(str::trim).filter(|b| !b.is_empty()) {
+        let base = base.trim_end_matches('/');
+        entries.push(GitEntry {
+            section: "url",
+            subsection: Some(format!("{base}/git/")),
+            name: "insteadOf",
+            value: "https://github.com/".to_string(),
+        });
+        entries.push(GitEntry {
+            section: "credential",
+            subsection: Some(base.to_string()),
+            name: "helper",
+            value: "!devbox-agent git-credential".to_string(),
+        });
+    }
+    entries
+}
+
+/// Render `entries` into git-config text with rust-ini. `EscapePolicy::Nothing` is
+/// required so the quoted-subsection headers (`[url "…"]`) and values (URLs, the
+/// `!helper` command) are written verbatim — the default policy would INI-escape
+/// `:`/`"` and corrupt the git config (`https\://…` would break the rewrite).
+fn render_gitconfig(entries: &[GitEntry]) -> Result<String> {
+    let mut ini = Ini::new();
+    for entry in entries {
+        let section = match &entry.subsection {
+            Some(subsection) => format!("{} \"{subsection}\"", entry.section),
+            None => entry.section.to_string(),
+        };
+        ini.with_section(Some(section))
+            .set(entry.name, entry.value.as_str());
+    }
+    let opt = WriteOption {
+        escape_policy: EscapePolicy::Nothing,
+        kv_separator: " = ",
+        ..WriteOption::default()
+    };
+    let mut buf = Vec::new();
+    ini.write_to_opt(&mut buf, opt)
+        .context("serialize .gitconfig")?;
+    String::from_utf8(buf).context(".gitconfig is not valid UTF-8")
 }
 
 /// The home directory of an existing Unix account, read from `getent passwd`.
@@ -260,8 +340,44 @@ fn set_mode(path: &str, mode: u32) -> Result<()> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test code: panic on assertion failure is acceptable"
+)]
 mod tests {
-    use super::{Decision, decide};
+    use super::{Decision, decide, git_config_entries, render_gitconfig};
+
+    #[test]
+    fn no_email_or_server_yields_no_entries() {
+        assert!(git_config_entries("jdoe", None, None).is_empty());
+        // Only the proxy remotes when the server URL is set but no email is known.
+        assert_eq!(
+            git_config_entries("jdoe", None, Some("https://cp.example")).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn renders_git_native_subsections_and_values() {
+        // The point of gix-config over an INI/TOML writer: git's quoted-subsection
+        // headers and unquoted values, which git parses exactly.
+        let entries = git_config_entries(
+            "jdoe",
+            Some("jdoe@example.com"),
+            Some("https://cp.example/"),
+        );
+        let out = render_gitconfig(&entries).unwrap();
+        assert!(out.contains("[url \"https://cp.example/git/\"]"), "{out}");
+        assert!(out.contains("insteadOf = https://github.com/"), "{out}");
+        assert!(out.contains("[credential \"https://cp.example\"]"), "{out}");
+        assert!(
+            out.contains("helper = !devbox-agent git-credential"),
+            "{out}"
+        );
+        assert!(out.contains("[user]"), "{out}");
+        assert!(out.contains("email = jdoe@example.com"), "{out}");
+        assert!(out.contains("name = jdoe"), "{out}");
+    }
 
     #[test]
     fn absent_or_empty_owner_waits() {

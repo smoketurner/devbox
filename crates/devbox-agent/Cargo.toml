@@ -22,6 +22,7 @@ aws-sdk-sts = { workspace = true, features = ["rt-tokio", "default-https-client"
 clap = { workspace = true, features = ["std", "help", "usage", "error-context", "suggestions", "derive"] }
 devbox-common = { path = "../devbox-common" }
 reqwest = { workspace = true, features = ["json", "rustls"] }
+rust-ini = { workspace = true }
 rustls = { workspace = true, features = ["aws_lc_rs", "std", "tls12"] }
 serde = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "net", "time", "io-util", "process"] }

@@ -122,14 +122,38 @@ async fn main() -> Result<()> {
         .context("initialize GitHub token minter")?
         .map(Arc::new);
 
+    // The git reverse proxy is backed by the same App as the minter, so it exists
+    // exactly when minting is configured.
+    let git_proxy = minter
+        .clone()
+        .map(devbox_server::github::GitProxy::new)
+        .transpose()
+        .context("initialize git reverse proxy")?
+        .map(Arc::new);
+
     // Build router. State is shared as a single Arc<AppState>.
     let app = build_router(Arc::new(AppState {
         store: Arc::clone(&store),
         auth: build_authenticator().await?,
         aws_account_id,
         minter,
+        git_proxy,
         compute: Some(ec2_client),
     }));
+
+    // Optional allowlisting HTTPS egress proxy: a second listener in this binary,
+    // stopped by the same cancellation token as the reconciler.
+    if let Some(egress) = devbox_server::egress::EgressConfig::from_env()? {
+        let egress_listener = TcpListener::bind(egress.addr)
+            .await
+            .with_context(|| format!("bind egress proxy on {}", egress.addr))?;
+        tracing::info!(addr = %egress.addr, "egress proxy listening");
+        tokio::spawn(devbox_server::egress::serve(
+            egress_listener,
+            Arc::new(egress.allowlist),
+            cancel.clone(),
+        ));
+    }
 
     // Start server
     let addr = format!("0.0.0.0:{port}");

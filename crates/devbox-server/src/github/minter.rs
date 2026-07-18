@@ -1,12 +1,13 @@
-//! Mint short-lived, **repo-scoped**, read-only GitHub App installation tokens.
+//! Mint short-lived, **repo-scoped** GitHub App installation tokens.
 //!
 //! This is the off-box half of the credential model: the GitHub App private key
 //! (PEM) lives only on the control plane, read from an **SSM SecureString** via
 //! the task role. A devbox host requests a token for a git remote over the agent
 //! API; the server signs a short App JWT, discovers the installation covering the
-//! repo, and exchanges the JWT for a `contents:read`+`metadata:read` token
-//! **scoped to that one repository** (least privilege — a leaked 1h token covers
-//! one repo, not the whole installation). The PEM never leaves the server.
+//! repo, and exchanges the JWT for a `metadata:read` token with `contents:read`
+//! (fetch) or `contents:write` (push) **scoped to that one repository** (least
+//! privilege — a leaked 1h token covers one repo, not the whole installation). The
+//! PEM never leaves the server.
 //!
 //! The installation is **discovered per repository**, not configured: for each
 //! repo the server reads `owner/repo` from the remote and asks GitHub which
@@ -161,7 +162,9 @@ impl Minter {
         let installation_id = self
             .resolve_installation(&jwt, &parsed.owner, &parsed.repo)
             .await?;
-        let token = self.exchange(&jwt, installation_id, &parsed.repo).await?;
+        let token = self
+            .exchange(&jwt, installation_id, &parsed.repo, false)
+            .await?;
         Ok(Some((
             GitHubRepository {
                 owner: parsed.owner,
@@ -169,6 +172,27 @@ impl Minter {
             },
             token,
         )))
+    }
+
+    /// The base URL of the git host this App serves (e.g. `https://github.com`),
+    /// used by the git reverse proxy to build the upstream URL.
+    pub(crate) fn git_base(&self) -> String {
+        format!("https://{}", self.git_host)
+    }
+
+    /// Mint a token scoped to `owner/repo`, discovering the installation per repo.
+    /// `write` requests `contents:write` (push); otherwise `contents:read`. Like
+    /// [`Self::mint_for_remote`] but for an already-split repository (no remote URL
+    /// to parse or host to gate).
+    ///
+    /// # Errors
+    ///
+    /// Propagates JWT signing, installation-lookup, and token-exchange failures
+    /// (including a 404 when the App is not installed on the repo).
+    pub(crate) async fn mint(&self, owner: &str, repo: &str, write: bool) -> Result<String> {
+        let jwt = sign_jwt(&self.issuer, &self.key)?;
+        let installation_id = self.resolve_installation(&jwt, owner, repo).await?;
+        self.exchange(&jwt, installation_id, repo, write).await
     }
 
     /// Resolve the installation id covering `owner/repo` via the App JWT.
@@ -200,9 +224,16 @@ impl Minter {
             .id)
     }
 
-    /// Exchange the App JWT for a `contents:read` token on `installation_id`,
-    /// scoped to the single repository `repo`.
-    async fn exchange(&self, jwt: &str, installation_id: u64, repo: &str) -> Result<String> {
+    /// Exchange the App JWT for an installation token on `installation_id`, scoped to
+    /// the single repository `repo`. `write` grants `contents:write` (push);
+    /// otherwise `contents:read`.
+    async fn exchange(
+        &self,
+        jwt: &str,
+        installation_id: u64,
+        repo: &str,
+        write: bool,
+    ) -> Result<String> {
         let url = format!(
             "{}/app/installations/{installation_id}/access_tokens",
             self.api_base.trim_end_matches('/')
@@ -216,7 +247,7 @@ impl Minter {
             .json(&TokenRequest {
                 repositories: vec![repo.to_string()],
                 permissions: Permissions {
-                    contents: "read",
+                    contents: if write { "write" } else { "read" },
                     metadata: "read",
                 },
             })

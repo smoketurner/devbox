@@ -226,6 +226,40 @@ impl ControlPlaneClient {
     }
 }
 
+/// Mint a fresh AWS web-identity token for `audience` (the control-plane base URL).
+///
+/// A one-shot helper for callers that don't keep the caching
+/// [`ControlPlaneClient`] — the git credential helper mints one token per git
+/// invocation. `audience` must equal the server's `DEVBOX_AGENT_AUDIENCE`.
+///
+/// # Errors
+///
+/// Returns an error when the region can't be read from IMDS or the STS call fails.
+pub(crate) async fn mint_web_identity_token(audience: &str) -> Result<String> {
+    let region = crate::imds::region()
+        .await
+        .context("read region from IMDS for the STS client")?;
+    let config = aws_config::defaults(BehaviorVersion::latest())
+        .region(Region::new(region))
+        .load()
+        .await;
+    let sts = aws_sdk_sts::Client::new(&config);
+    let out = tokio::time::timeout(
+        STS_TIMEOUT,
+        sts.get_web_identity_token()
+            .audience(audience)
+            .signing_algorithm(SIGNING_ALGORITHM)
+            .duration_seconds(WEB_IDENTITY_TTL_SECS)
+            .send(),
+    )
+    .await
+    .context("sts:GetWebIdentityToken timed out")?
+    .context("sts:GetWebIdentityToken")?;
+    out.web_identity_token()
+        .map(str::to_string)
+        .context("GetWebIdentityToken response had no token")
+}
+
 /// The requested TTL as `u64` seconds (for the fallback expiry computation).
 fn default_ttl_secs() -> u64 {
     u64::try_from(WEB_IDENTITY_TTL_SECS).unwrap_or(900)

@@ -124,6 +124,44 @@ pub(crate) async fn mint_git_token(
     }
 }
 
+/// Authorize a git push from a verified devbox host: the box must be claimed.
+///
+/// Fetch is open to any trusted box (warm-up fetches pre-claim), but a push writes
+/// to the repo, so it is restricted to a Claimed box — one with an accountable
+/// claimant whose git identity attributes the commits. Returns the owner for
+/// logging.
+///
+/// # Errors
+///
+/// [`AppError::NotFound`] when no doc exists for the instance; [`AppError::Forbidden`]
+/// when the box is not claimed.
+pub(crate) async fn authorize_git_push(
+    state: &AppState,
+    agent: &AgentIdentity,
+) -> Result<String, AppError> {
+    let doc = state
+        .store
+        .find_one::<DevboxDoc>("instance_id", agent.instance_id.as_str())
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "no devbox record for instance '{}'",
+                agent.instance_id
+            ))
+        })?;
+
+    if doc.data.state != DevboxState::Claimed {
+        return Err(AppError::Forbidden(
+            "git push requires a claimed devbox".into(),
+        ));
+    }
+
+    doc.data
+        .owner
+        .clone()
+        .ok_or_else(|| AppError::Forbidden("claimed devbox has no owner".into()))
+}
+
 // ============================================================================
 // Optimistic-concurrency retry
 // ============================================================================
@@ -587,6 +625,7 @@ mod tests {
             auth: Authenticator::with_test_owner("jdoe"),
             aws_account_id: None,
             minter: None,
+            git_proxy: None,
             compute: None,
         }
     }
@@ -700,6 +739,43 @@ mod tests {
     // -----------------------------------------------------------------------
     // git-token tests
     // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn authorize_git_push_requires_claimed_box() {
+        // A fetch is open to a warming/ready box, but a push must be refused unless
+        // the box is claimed — pool_agent()'s instance matches this ready box.
+        let state = setup_state().await;
+        insert(&state, ready_devbox()).await;
+
+        let err = authorize_git_push(&state, &pool_agent())
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn authorize_git_push_allows_claimed_box_and_returns_owner() {
+        let state = setup_state().await;
+        insert(&state, claimed_devbox_for("jdoe")).await;
+
+        let owner = authorize_git_push(&state, &pool_agent())
+            .await
+            .ok()
+            .unwrap();
+        assert_eq!(owner, "jdoe");
+    }
+
+    #[tokio::test]
+    async fn authorize_git_push_unknown_instance_is_not_found() {
+        let state = setup_state().await;
+
+        let err = authorize_git_push(&state, &pool_agent())
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, AppError::NotFound(_)));
+    }
 
     #[tokio::test]
     async fn mint_git_token_without_minter_is_service_unavailable() {

@@ -14,6 +14,7 @@ mod control_plane;
 mod doctor;
 mod freshen;
 mod git;
+mod git_credential;
 mod imds;
 mod owner_sync;
 mod principals;
@@ -57,6 +58,13 @@ enum Command {
     /// Print a read-only diagnostic of warm-cache delivery (workspace mount,
     /// resolved RUSTUP_HOME/CARGO_HOME, pinned-toolchain and registry presence).
     Doctor,
+    /// Git credential helper (configured by owner-sync): supply the box's
+    /// web-identity token as the password for reverse-proxy git traffic, so the
+    /// GitHub credential is minted server-side and never held by the box.
+    GitCredential {
+        /// The git credential operation (`get`, `store`, or `erase`).
+        operation: String,
+    },
 }
 
 // Current-thread runtime: the agent reads IMDS / calls the AWS SDK (both async)
@@ -103,6 +111,11 @@ async fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             }
+        }
+        Command::GitCredential { operation } => {
+            // git parses stdout: emit only the credential protocol, no tracing.
+            git_credential::run(&operation).await;
+            ExitCode::SUCCESS
         }
     }
 }

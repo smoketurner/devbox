@@ -5,6 +5,7 @@ pub mod compute;
 pub mod convert;
 pub mod db;
 pub mod documents;
+pub mod egress;
 pub mod error;
 pub mod github;
 pub mod naming;
