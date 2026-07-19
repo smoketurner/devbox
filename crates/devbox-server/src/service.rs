@@ -361,12 +361,18 @@ pub(crate) async fn claim_devbox(
             .await
         {
             Ok(claimed) => claimed,
-            // The name is held by another box. If that box is itself a later
-            // candidate we'll reach it and claim it (rewriting its own name
-            // row does not self-conflict); otherwise the loop exhausts and we
-            // report the name as in use.
-            Err(e) if name_override.is_some() && crate::db::pool::is_unique_violation(&e) => {
-                name_in_use = true;
+            // The candidate's name is held by another document, so skip it and
+            // try the next candidate. With an override that means the requested
+            // name is taken — if the holder is itself a later candidate we'll
+            // reach it and claim it (rewriting its own name row does not
+            // self-conflict); otherwise the loop exhausts and we report the
+            // name as in use. Without an override the box's own name collides
+            // (legacy duplicate rows predating deterministic ids), which is no
+            // fault of the claimant — move on rather than erroring.
+            Err(e) if crate::db::pool::is_unique_violation(&e) => {
+                if name_override.is_some() {
+                    name_in_use = true;
+                }
                 continue;
             }
             Err(e) => return Err(e.into()),
