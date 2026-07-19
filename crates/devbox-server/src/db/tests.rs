@@ -10,6 +10,7 @@ mod store_tests {
     use crate::db::pool::{Pool, PoolConfig};
     use crate::db::store::DocumentStore;
     use crate::documents::devbox::DevboxDoc;
+    use crate::documents::name_claim::{NameClaimDoc, claim_doc_id, sync_name_claim};
     use devbox_common::{AmiId, DevboxState, InstanceType, SubnetId};
     use jiff::Timestamp;
 
@@ -168,62 +169,184 @@ mod store_tests {
         assert_eq!(fetched.data.state, DevboxState::Ready);
     }
 
+    /// Insert a devbox doc and acquire its name claim in one transaction —
+    /// the same composition `reconcile/tick.rs` uses at doc creation.
+    async fn insert_with_claim(
+        store: &DocumentStore,
+        id: &str,
+        doc: &DevboxDoc,
+    ) -> anyhow::Result<()> {
+        crate::with_dsql_retry!(async {
+            let mut tx = store.begin().await?;
+            tx.insert_with_id(id, doc).await?;
+            sync_name_claim(&mut tx, id, "", &doc.name).await?;
+            tx.commit().await?;
+            Ok(())
+        })
+    }
+
+    /// Version-guarded update plus name-claim swap in one transaction — the
+    /// same composition the claim/rename/release service paths use.
+    async fn update_with_claim(
+        store: &DocumentStore,
+        id: &str,
+        version: i32,
+        doc: &DevboxDoc,
+        old_name: &str,
+    ) -> anyhow::Result<bool> {
+        crate::with_dsql_retry!(async {
+            let mut tx = store.begin().await?;
+            if !tx.compare_and_update(id, version, doc).await? {
+                return Ok(false);
+            }
+            sync_name_claim(&mut tx, id, old_name, &doc.name).await?;
+            tx.commit().await?;
+            Ok(true)
+        })
+    }
+
     #[tokio::test]
-    async fn test_compare_and_update_duplicate_name_outcomes() {
+    async fn test_name_claim_outcomes() {
         let store = setup_store().await;
 
-        // Box A holds name "taken"; box B holds "free".
+        // Box A claims "taken"; box B claims "free".
         let mut a = sample_devbox();
         a.name = "taken".to_string();
-        let a = store.insert(&a).await.unwrap();
+        insert_with_claim(&store, "doc-a", &a).await.unwrap();
         let mut b = sample_devbox();
         b.instance_id = "i-second".to_string();
         b.name = "free".to_string();
-        let b = store.insert(&b).await.unwrap();
-
-        // Renaming B to A's name fails on the name row's deterministic primary
-        // key — a unique violation the DB raises inside the update's own
-        // transaction, which rolls back without touching B.
-        let mut want_taken = b.data.clone();
-        want_taken.name = "taken".to_string();
-        let err = store
-            .compare_and_update(&b.id, b.version, &want_taken)
-            .await
-            .unwrap_err();
-        assert!(crate::db::pool::is_unique_violation(&err));
-        let fetched = store.get::<DevboxDoc>(&b.id).await.unwrap().unwrap();
-        assert_eq!(fetched.data.name, "free", "B must be untouched");
-        assert_eq!(fetched.version, b.version);
-
-        // A stale version is reported as a mismatch, even for a free name.
-        let mut want_fresh = b.data.clone();
-        want_fresh.name = "fresh".to_string();
-        let updated = store
-            .compare_and_update(&b.id, 99, &want_fresh)
-            .await
-            .unwrap();
-        assert!(!updated);
-
-        // A free name with the correct version succeeds.
-        let updated = store
-            .compare_and_update(&b.id, b.version, &want_fresh)
-            .await
-            .unwrap();
-        assert!(updated);
-        let fetched = store.get::<DevboxDoc>(&b.id).await.unwrap().unwrap();
-        assert_eq!(fetched.data.name, "fresh");
-
-        // A's claim on "taken" is still intact.
+        insert_with_claim(&store, "doc-b", &b).await.unwrap();
         assert_eq!(
             store
-                .get::<DevboxDoc>(&a.id)
+                .get::<NameClaimDoc>(&claim_doc_id("taken"))
                 .await
                 .unwrap()
                 .unwrap()
                 .data
-                .name,
-            "taken"
+                .devbox_id,
+            "doc-a"
         );
+
+        // Renaming B to A's name fails on the claim doc's primary key, and
+        // the whole transaction rolls back — B is untouched.
+        let b_doc = store.get::<DevboxDoc>("doc-b").await.unwrap().unwrap();
+        let mut want_taken = b_doc.data.clone();
+        want_taken.name = "taken".to_string();
+        let err = update_with_claim(&store, "doc-b", b_doc.version, &want_taken, "free")
+            .await
+            .unwrap_err();
+        assert!(crate::db::pool::is_unique_violation(&err));
+        let fetched = store.get::<DevboxDoc>("doc-b").await.unwrap().unwrap();
+        assert_eq!(fetched.data.name, "free", "B must be untouched");
+        assert_eq!(fetched.version, b_doc.version);
+        assert!(
+            store
+                .get::<NameClaimDoc>(&claim_doc_id("free"))
+                .await
+                .unwrap()
+                .is_some(),
+            "B's claim must survive the rollback"
+        );
+
+        // A stale version is a mismatch and writes no claim.
+        let mut want_fresh = b_doc.data.clone();
+        want_fresh.name = "fresh".to_string();
+        let updated = update_with_claim(&store, "doc-b", 99, &want_fresh, "free")
+            .await
+            .unwrap();
+        assert!(!updated);
+        assert!(
+            store
+                .get::<NameClaimDoc>(&claim_doc_id("fresh"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // A free name with the correct version succeeds, swapping the claim.
+        let updated = update_with_claim(&store, "doc-b", b_doc.version, &want_fresh, "free")
+            .await
+            .unwrap();
+        assert!(updated);
+        assert!(
+            store
+                .get::<NameClaimDoc>(&claim_doc_id("free"))
+                .await
+                .unwrap()
+                .is_none(),
+            "old claim must be released"
+        );
+        assert_eq!(
+            store
+                .get::<NameClaimDoc>(&claim_doc_id("fresh"))
+                .await
+                .unwrap()
+                .unwrap()
+                .data
+                .devbox_id,
+            "doc-b"
+        );
+
+        // The released name is reusable: A can rename onto "free" now.
+        let a_doc = store.get::<DevboxDoc>("doc-a").await.unwrap().unwrap();
+        let mut a_wants_free = a_doc.data.clone();
+        a_wants_free.name = "free".to_string();
+        let updated = update_with_claim(&store, "doc-a", a_doc.version, &a_wants_free, "taken")
+            .await
+            .unwrap();
+        assert!(updated);
+    }
+
+    #[tokio::test]
+    async fn test_name_claim_released_on_clear_and_delete() {
+        let store = setup_store().await;
+
+        let mut a = sample_devbox();
+        a.name = "calm-quilt".to_string();
+        insert_with_claim(&store, "doc-a", &a).await.unwrap();
+
+        // Clearing the name (release-shaped update) deletes the claim.
+        let a_doc = store.get::<DevboxDoc>("doc-a").await.unwrap().unwrap();
+        let mut cleared = a_doc.data.clone();
+        cleared.name = String::new();
+        let updated = update_with_claim(&store, "doc-a", a_doc.version, &cleared, "calm-quilt")
+            .await
+            .unwrap();
+        assert!(updated);
+        assert!(
+            store
+                .get::<NameClaimDoc>(&claim_doc_id("calm-quilt"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // A named doc deleted with its claim frees the name for reuse.
+        let mut b = sample_devbox();
+        b.instance_id = "i-second".to_string();
+        b.name = "calm-quilt".to_string();
+        insert_with_claim(&store, "doc-b", &b).await.unwrap();
+        crate::with_dsql_retry!(async {
+            let mut tx = store.begin().await?;
+            tx.delete("doc-b").await?;
+            sync_name_claim(&mut tx, "doc-b", "calm-quilt", "").await?;
+            tx.commit().await?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(store.get::<DevboxDoc>("doc-b").await.unwrap().is_none());
+        assert!(
+            store
+                .get::<NameClaimDoc>(&claim_doc_id("calm-quilt"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut c = sample_devbox();
+        c.instance_id = "i-third".to_string();
+        c.name = "calm-quilt".to_string();
+        insert_with_claim(&store, "doc-c", &c).await.unwrap();
     }
 
     #[tokio::test]

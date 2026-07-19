@@ -20,6 +20,7 @@ use devbox_common::{
 use crate::auth::{AgentIdentity, AgentRole, Principal};
 use crate::db::document_type::Document;
 use crate::documents::devbox::{DevboxDoc, WarmupReport};
+use crate::documents::name_claim::sync_name_claim;
 use crate::error::AppError;
 use crate::routes::AppState;
 
@@ -31,8 +32,9 @@ use crate::routes::AppState;
 ///
 /// A blank or absent value yields `None` (the box keeps its auto name). A
 /// non-blank value must satisfy [`is_valid_devbox_name`] (`400` otherwise).
-/// Uniqueness is *not* checked here — the name index row's deterministic
-/// primary key makes the claim's own transaction reject a duplicate.
+/// Uniqueness is *not* checked here — the name-claim document written in the
+/// claim's own transaction rejects a duplicate
+/// (see [`crate::documents::name_claim`]).
 pub(crate) fn validate_name_override(raw: Option<&str>) -> Result<Option<String>, AppError> {
     let Some(name) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
@@ -302,17 +304,16 @@ async fn update_devbox_by_instance(
 
 /// Claim a Ready box for `owner`, optionally setting its name to `name`.
 ///
-/// Shared by the JSON API and the HTML dashboard. Every claim is a plain
-/// version-guarded [`compare_and_update`](crate::db::DocumentStore::compare_and_update);
-/// when a name override is given, the name index row's deterministic primary
-/// key makes that same transaction reject a duplicate — so two concurrent
-/// claimants of the same name cannot both win (the DB rejects the loser). A
-/// unique violation means some live box already holds the name; the loop
-/// continues, because that box may itself be a later candidate (a box
-/// rewriting its own name row does not self-conflict, so claiming it
-/// succeeds). Only if no candidate can take the name does the claim fail with
-/// a `409`. Without an override the box keeps its reconciler-assigned unique
-/// name.
+/// Shared by the JSON API and the HTML dashboard. Every claim is a
+/// version-guarded update plus [`sync_name_claim`] in one transaction; when a
+/// name override is given, the name-claim document's primary key makes that
+/// transaction reject a duplicate — so two concurrent claimants of the same
+/// name cannot both win (the DB rejects the loser). A unique violation means
+/// some live box already holds the name; the loop continues, because that box
+/// may itself be a later candidate (keeping its own name is a claim no-op, so
+/// claiming it succeeds). Only if no candidate can take the name does the
+/// claim fail with a `409`. Without an override the box keeps its
+/// reconciler-assigned unique name and its existing claim.
 pub(crate) async fn claim_devbox(
     state: &AppState,
     claimant: &Principal,
@@ -355,20 +356,30 @@ pub(crate) async fn claim_devbox(
             updated.name = name.clone();
         }
 
-        let claimed = match state
-            .store
-            .compare_and_update(&candidate.id, candidate.version, &updated)
-            .await
-        {
+        // Version-guarded claim and name-claim upkeep in one transaction; the
+        // claim doc's primary key rejects a duplicate name atomically.
+        let write = crate::with_dsql_retry!(async {
+            let mut tx = state.store.begin().await?;
+            if !tx
+                .compare_and_update(&candidate.id, candidate.version, &updated)
+                .await?
+            {
+                return Ok(false);
+            }
+            sync_name_claim(&mut tx, &candidate.id, &candidate.data.name, &updated.name).await?;
+            tx.commit().await?;
+            Ok(true)
+        });
+
+        let claimed = match write {
             Ok(claimed) => claimed,
-            // The candidate's name is held by another document, so skip it and
-            // try the next candidate. With an override that means the requested
-            // name is taken — if the holder is itself a later candidate we'll
-            // reach it and claim it (rewriting its own name row does not
-            // self-conflict); otherwise the loop exhausts and we report the
-            // name as in use. Without an override the box's own name collides
-            // (legacy duplicate rows predating deterministic ids), which is no
-            // fault of the claimant — move on rather than erroring.
+            // The requested name is claimed by another document, so skip this
+            // candidate and try the next. If the holder is itself a later
+            // candidate we'll reach it and claim it (keeping its own name is a
+            // claim no-op); otherwise the loop exhausts and we report the name
+            // as in use. Without an override there is no claim acquisition, so
+            // a violation here is unexpected — but still no fault of the
+            // claimant, so move on rather than erroring.
             Err(e) if crate::db::pool::is_unique_violation(&e) => {
                 if name_override.is_some() {
                     name_in_use = true;
@@ -447,10 +458,19 @@ pub(crate) async fn release_devbox(
     updated.owner = None;
     updated.name = String::new();
 
-    let success = state
-        .store
-        .compare_and_update(&doc.id, doc.version, &updated)
-        .await?;
+    // Release the name claim in the same transaction as the state change.
+    let success = crate::with_dsql_retry!(async {
+        let mut tx = state.store.begin().await?;
+        if !tx
+            .compare_and_update(&doc.id, doc.version, &updated)
+            .await?
+        {
+            return Ok(false);
+        }
+        sync_name_claim(&mut tx, &doc.id, &released_name, "").await?;
+        tx.commit().await?;
+        Ok(true)
+    })?;
     if !success {
         return Err(AppError::Conflict(
             "devbox was modified concurrently".into(),
@@ -475,9 +495,9 @@ pub(crate) async fn release_devbox(
 /// - State must be `Claimed` (409 otherwise).
 /// - Caller must be the box's owner (403 otherwise).
 /// - No-op short-circuit when `new_name` equals the current name (200, unchanged).
-/// - Uniqueness via the name index row's deterministic primary key: the
-///   version-guarded update's own transaction fails with a unique violation
-///   (409) when another box holds the name.
+/// - Uniqueness via the name-claim document swapped by [`sync_name_claim`] in
+///   the version-guarded update's own transaction: a unique violation (409)
+///   when another box holds the name.
 ///
 /// A version mismatch is retried via [`with_occ_retry`]: the reconciler's
 /// `apply_pending_owner_tags` bumps the document version within ~30 s of a claim,
@@ -520,11 +540,22 @@ pub(crate) async fn rename_devbox(
         let mut updated = doc.data.clone();
         updated.name = name.clone();
 
-        match state
-            .store
-            .compare_and_update(&doc.id, doc.version, &updated)
-            .await
-        {
+        // Version-guarded rename and name-claim swap in one transaction; the
+        // claim doc's primary key rejects a duplicate name atomically.
+        let write = crate::with_dsql_retry!(async {
+            let mut tx = state.store.begin().await?;
+            if !tx
+                .compare_and_update(&doc.id, doc.version, &updated)
+                .await?
+            {
+                return Ok(false);
+            }
+            sync_name_claim(&mut tx, &doc.id, &doc.data.name, &updated.name).await?;
+            tx.commit().await?;
+            Ok(true)
+        });
+
+        match write {
             Ok(true) => {
                 let refreshed = state.store.get::<DevboxDoc>(id).await?.ok_or_else(|| {
                     AppError::Internal(anyhow::anyhow!("devbox vanished after rename"))
@@ -720,8 +751,18 @@ mod tests {
         doc
     }
 
+    // Insert a doc with its name claim, as the reconciler does at creation.
     async fn insert(state: &AppState, doc: DevboxDoc) -> String {
-        state.store.insert(&doc).await.unwrap().id
+        let id = uuid::Uuid::now_v7().to_string();
+        crate::with_dsql_retry!(async {
+            let mut tx = state.store.begin().await?;
+            tx.insert_with_id(&id, &doc).await?;
+            sync_name_claim(&mut tx, &id, "", &doc.name).await?;
+            tx.commit().await?;
+            Ok(())
+        })
+        .unwrap();
+        id
     }
 
     fn pool_agent() -> AgentIdentity {

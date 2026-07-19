@@ -15,6 +15,7 @@ use jiff::{SignedDuration, Timestamp};
 use crate::compute::{Compute, InstanceInfo};
 use crate::db::DocumentStore;
 use crate::documents::devbox::DevboxDoc;
+use crate::documents::name_claim::sync_name_claim;
 use devbox_common::{AmiId, DevboxState, InstanceType, SubnetId};
 
 use super::config::ReconcilerConfig;
@@ -184,17 +185,25 @@ async fn sync_docs_with_asg(
         }
     };
 
-    // Delete docs whose instance_id is not in ASG (stale cleanup)
+    // Delete docs whose instance_id is not in ASG (stale cleanup), releasing
+    // any name claim in the same transaction.
     for doc in &docs {
-        if !asg_instance_ids.contains(doc.data.instance_id.as_str())
-            && let Err(e) = store.delete(&doc.id).await
-        {
-            tracing::error!(
-                error = %e,
-                doc_id = %doc.id,
-                instance_id = %doc.data.instance_id,
-                "failed to delete stale doc"
-            );
+        if !asg_instance_ids.contains(doc.data.instance_id.as_str()) {
+            let deleted = crate::with_dsql_retry!(async {
+                let mut tx = store.begin().await?;
+                tx.delete(&doc.id).await?;
+                sync_name_claim(&mut tx, &doc.id, &doc.data.name, "").await?;
+                tx.commit().await?;
+                Ok(())
+            });
+            if let Err(e) = deleted {
+                tracing::error!(
+                    error = %e,
+                    doc_id = %doc.id,
+                    instance_id = %doc.data.instance_id,
+                    "failed to delete stale doc"
+                );
+            }
         }
     }
 
@@ -268,9 +277,18 @@ async fn sync_docs_with_asg(
             warmup_report: None,
         };
 
+        // Insert the doc and acquire its name claim in one transaction; a
+        // lost name race fails the insert and retries next tick.
         let doc_id = uuid::Uuid::now_v7().to_string();
-        match store.insert_with_id(&doc_id, &new_doc).await {
-            Ok(_) => {
+        let inserted = crate::with_dsql_retry!(async {
+            let mut tx = store.begin().await?;
+            tx.insert_with_id(&doc_id, &new_doc).await?;
+            sync_name_claim(&mut tx, &doc_id, "", &new_doc.name).await?;
+            tx.commit().await?;
+            Ok(())
+        });
+        match inserted {
+            Ok(()) => {
                 used_names.insert(name);
             }
             Err(e) => {
@@ -456,10 +474,20 @@ pub(super) async fn reap_unready_instances(
         // Free the name immediately so it can be reused on a fresh claim.
         updated_doc.name = String::new();
 
-        match store
-            .compare_and_update(&doc.id, doc.version, &updated_doc)
-            .await
-        {
+        let reaped = crate::with_dsql_retry!(async {
+            let mut tx = store.begin().await?;
+            if !tx
+                .compare_and_update(&doc.id, doc.version, &updated_doc)
+                .await?
+            {
+                return Ok(false);
+            }
+            sync_name_claim(&mut tx, &doc.id, &doc.data.name, "").await?;
+            tx.commit().await?;
+            Ok(true)
+        });
+
+        match reaped {
             Ok(true) => {
                 tracing::warn!(
                     instance_id = %instance_id,
@@ -523,8 +551,18 @@ async fn handle_terminating_instances(
             continue; // leave Terminating doc; stale-cleanup deletes once instance leaves ASG
         }
 
-        // Terminate succeeded — safe to delete now.
-        if let Err(e) = store.delete(&doc.id).await {
+        // Terminate succeeded — safe to delete now, releasing any name claim
+        // in the same transaction (Terminating docs normally have their name
+        // already cleared; this covers docs that reached Terminating without
+        // the clear).
+        let deleted = crate::with_dsql_retry!(async {
+            let mut tx = store.begin().await?;
+            tx.delete(&doc.id).await?;
+            sync_name_claim(&mut tx, &doc.id, &doc.data.name, "").await?;
+            tx.commit().await?;
+            Ok(())
+        });
+        if let Err(e) = deleted {
             tracing::error!(
                 error = %e,
                 doc_id = %doc.id,
