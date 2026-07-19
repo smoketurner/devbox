@@ -8,10 +8,10 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, RawQuery, Request, State};
-use axum::http::header::AUTHORIZATION;
-use axum::http::{HeaderMap, Method};
+use axum::http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::{Next, from_fn_with_state};
-use axum::response::{Json, Response};
+use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Router};
 
@@ -302,8 +302,15 @@ async fn handle_git_proxy(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    let token = git_proxy::basic_auth_password(&headers)
-        .ok_or_else(|| AppError::Unauthorized("no git proxy credential".to_string()))?;
+    let Some(token) = git_proxy::basic_auth_password(&headers) else {
+        // git only sends basic-auth credentials (and only invokes its credential
+        // helper) after a `WWW-Authenticate: Basic` challenge; a bare 401 stalls it.
+        return Ok((
+            StatusCode::UNAUTHORIZED,
+            [(WWW_AUTHENTICATE, "Basic realm=\"devbox\"")],
+        )
+            .into_response());
+    };
     // Verify the box's web-identity token against the trusted devbox roles, as the
     // agent JSON endpoints do.
     let agent = state.auth.verify_agent_token(&token).await?;
@@ -580,6 +587,27 @@ mod tests {
                 "expected 401 for {method} {uri}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn git_proxy_401_carries_basic_challenge() {
+        // git only sends its basic-auth credential (and only invokes the credential
+        // helper's response) after a `WWW-Authenticate: Basic` challenge, so the
+        // no-credential 401 must carry that header or every fetch stalls.
+        let state = setup_state_no_principal().await;
+        let req = Request::builder()
+            .method("GET")
+            .uri("/git/smoketurner/devbox/info/refs?service=git-upload-pack")
+            .body(Body::empty())
+            .unwrap();
+        let resp = build_router(state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers()
+                .get(WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok()),
+            Some("Basic realm=\"devbox\"")
+        );
     }
 
     #[tokio::test]

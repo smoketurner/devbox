@@ -35,6 +35,10 @@ const READ_CHUNK: usize = 1024;
 /// Bound on reading the CONNECT head, so a slow client can't hold a connection open.
 const HEAD_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Bound on the upstream TCP connect, so an unreachable/black-holed host fails fast
+/// instead of hanging the client indefinitely.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Set of hostnames a devbox may reach through the proxy. An entry matches the host
 /// exactly or as a parent domain (`crates.io` matches `static.crates.io`).
 #[derive(Clone, Debug, Default)]
@@ -145,9 +149,18 @@ async fn handle_connection(mut client: TcpStream, allowlist: &Allowlist) -> Resu
         return refuse(&mut client, "403 Forbidden").await;
     };
 
-    let mut upstream = TcpStream::connect(target)
-        .await
-        .with_context(|| format!("connect upstream {host} ({target})"))?;
+    let mut upstream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target)).await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => {
+            tracing::debug!(host, %target, error = %e, "egress upstream connect failed");
+            return refuse(&mut client, "502 Bad Gateway").await;
+        }
+        Err(_) => {
+            tracing::warn!(host, %target, "egress upstream connect timed out");
+            return refuse(&mut client, "504 Gateway Timeout").await;
+        }
+    };
     client
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;
