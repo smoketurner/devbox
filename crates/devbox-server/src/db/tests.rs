@@ -96,6 +96,7 @@ mod store_tests {
         let doc1 = sample_devbox();
         let mut doc2 = sample_devbox();
         doc2.instance_id = "i-different".to_string();
+        doc2.name = "brave-otter".to_string();
 
         store.insert(&doc1).await.unwrap();
         store.insert(&doc2).await.unwrap();
@@ -254,6 +255,7 @@ mod store_tests {
         let doc1 = sample_devbox();
         let mut doc2 = sample_devbox();
         doc2.instance_id = "i-second".to_string();
+        doc2.name = "brave-otter".to_string();
 
         store.insert(&doc1).await.unwrap();
         store.insert(&doc2).await.unwrap();
@@ -318,6 +320,90 @@ mod store_tests {
             .await
             .unwrap();
         pool.is_healthy().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_name_rejected_by_primary_key() {
+        // The DB itself must reject a duplicate name even through a write path
+        // that performs no application-level uniqueness check: the name index
+        // row's primary key is derived from the value, so the second document
+        // collides.
+        let store = setup_store().await;
+
+        let mut a = sample_devbox();
+        a.name = "taken".to_string();
+        store.insert(&a).await.unwrap();
+
+        let mut b = sample_devbox();
+        b.instance_id = "i-second".to_string();
+        b.name = "free".to_string();
+        let b = store.insert(&b).await.unwrap();
+
+        let mut want_taken = b.data.clone();
+        want_taken.name = "taken".to_string();
+        let err = store
+            .compare_and_update(&b.id, b.version, &want_taken)
+            .await
+            .unwrap_err();
+        assert!(crate::db::pool::is_unique_violation(&err));
+
+        // B is untouched — the transaction rolled back.
+        let fetched = store.get::<DevboxDoc>(&b.id).await.unwrap().unwrap();
+        assert_eq!(fetched.data.name, "free");
+        assert_eq!(fetched.version, b.version);
+    }
+
+    #[tokio::test]
+    async fn test_unique_violation_maps_to_duplicate_value() {
+        use crate::db::store::UpdateOutcome;
+
+        // Exercise the constraint-violation path inside
+        // compare_and_update_unique: pass a unique_value that differs from the
+        // doc's actual name so the fast-path read sees no clash and the name
+        // index INSERT itself collides — the sequential stand-in for the
+        // concurrent-rename race that snapshot isolation lets through.
+        let store = setup_store().await;
+
+        let mut a = sample_devbox();
+        a.name = "taken".to_string();
+        store.insert(&a).await.unwrap();
+
+        let mut b = sample_devbox();
+        b.instance_id = "i-second".to_string();
+        b.name = "free".to_string();
+        let b = store.insert(&b).await.unwrap();
+
+        let mut want_taken = b.data.clone();
+        want_taken.name = "taken".to_string();
+        let outcome = store
+            .compare_and_update_unique(&b.id, b.version, &want_taken, "name", "not-clashing")
+            .await
+            .unwrap();
+        assert_eq!(outcome, UpdateOutcome::DuplicateValue);
+
+        let fetched = store.get::<DevboxDoc>(&b.id).await.unwrap().unwrap();
+        assert_eq!(fetched.data.name, "free", "B must be untouched");
+        assert_eq!(fetched.version, b.version);
+    }
+
+    #[tokio::test]
+    async fn test_update_keeping_own_name_is_not_a_conflict() {
+        // A doc rewriting its own index rows (delete + reinsert in one
+        // transaction) must not collide with itself on the name-derived key.
+        let store = setup_store().await;
+        let doc = sample_devbox();
+        let inserted = store.insert(&doc).await.unwrap();
+
+        let mut updated = inserted.data.clone();
+        updated.state = DevboxState::Claimed;
+        store.update(&inserted.id, &updated).await.unwrap();
+
+        let found = store
+            .find_one::<DevboxDoc>("name", "calm-quilt")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.data.state, DevboxState::Claimed);
     }
 
     #[tokio::test]

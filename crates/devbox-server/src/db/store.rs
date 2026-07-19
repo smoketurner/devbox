@@ -65,8 +65,18 @@ enum DocumentIndexes {
 }
 
 /// Build an INSERT statement for a single document index entry.
+///
+/// Unique entries get a primary key derived from the indexed value instead of
+/// a random UUID, so the table's `id` primary key rejects a second document
+/// writing the same value — enforcement the database guarantees even when two
+/// writers race under snapshot isolation. The `uniq:` prefix keeps derived ids
+/// disjoint from UUID-shaped ids and from other unique fields.
 fn build_index_insert(doc_id: &str, entry: &IndexEntry) -> Result<sea_query::InsertStatement> {
-    let index_id = uuid::Uuid::now_v7().to_string();
+    let index_id = if entry.unique {
+        format!("uniq:{}:{}", entry.field, entry.value)
+    } else {
+        uuid::Uuid::now_v7().to_string()
+    };
     let stmt = Query::insert()
         .into_table(DocumentIndexes::Table)
         .columns([
@@ -424,13 +434,18 @@ impl DocumentStore {
     /// Conditionally update a document, rejecting the write when another
     /// document already holds the index entry `(unique_field, unique_value)`.
     ///
-    /// The uniqueness read and the version-guarded update run in one
-    /// transaction. Under serializable isolation (Aurora DSQL) two concurrent
-    /// writers of the same value conflict; [`with_dsql_retry!`](crate::with_dsql_retry)
-    /// re-runs the loser, which then observes the value and returns
-    /// [`UpdateOutcome::DuplicateValue`]. On single-writer SQLite the
-    /// transaction serializes to the same effect. Callers needing no uniqueness
-    /// use [`compare_and_update`](Self::compare_and_update).
+    /// Aurora DSQL runs REPEATABLE READ (snapshot isolation), so the
+    /// in-transaction uniqueness read alone is *not* race-safe: two concurrent
+    /// writers of the same value can both see it as free. The enforcement of
+    /// record is the index row's deterministic primary key (see
+    /// [`build_index_insert`]): the second writer of a unique value fails at
+    /// the database level, either with a unique violation — mapped here to
+    /// [`UpdateOutcome::DuplicateValue`] — or with a DSQL write-write conflict,
+    /// which [`with_dsql_retry!`](crate::with_dsql_retry) re-runs until the
+    /// read observes the winner and returns `DuplicateValue`. The read remains
+    /// as a fast path that resolves the sequential case without burning a
+    /// write conflict. Callers needing no uniqueness use
+    /// [`compare_and_update`](Self::compare_and_update).
     ///
     /// # Errors
     ///
@@ -455,8 +470,9 @@ impl DocumentStore {
             let mut tx = self.pool.begin().await?;
 
             // Reject if any *other* document already holds the unique value.
-            // Reading it inside the transaction is what lets serializable
-            // isolation detect a concurrent writer of the same value.
+            // Best-effort fast path only: snapshot isolation cannot see an
+            // uncommitted concurrent writer, so the deterministic index-row
+            // primary key below is what actually guarantees uniqueness.
             let clash_stmt = Query::select()
                 .expr_as(Expr::col(DocumentIndexes::DocumentId), Alias::new("id"))
                 .from(DocumentIndexes::Table)
@@ -502,13 +518,27 @@ impl DocumentStore {
                 .to_owned();
             crate::tx_execute!(tx, delete_idx_stmt)?;
 
-            // INSERT new indexes
+            // INSERT new indexes. A unique violation here (or at commit, where
+            // DSQL surfaces same-key conflicts) means another document won the
+            // unique value after the fast-path read — the domain outcome, not
+            // an internal error. Dropping the transaction rolls it back.
             for entry in &indexes {
                 let idx_stmt = build_index_insert(id, entry)?;
-                crate::tx_execute!(tx, idx_stmt)?;
+                if let Err(e) = crate::tx_execute!(tx, idx_stmt) {
+                    let err = anyhow::Error::from(e);
+                    if crate::db::pool::is_unique_violation(&err) {
+                        return Ok(UpdateOutcome::DuplicateValue);
+                    }
+                    return Err(err);
+                }
             }
 
-            tx.commit().await?;
+            if let Err(e) = tx.commit().await {
+                if crate::db::pool::is_unique_violation(&e) {
+                    return Ok(UpdateOutcome::DuplicateValue);
+                }
+                return Err(e);
+            }
             Ok(UpdateOutcome::Updated)
         })
     }

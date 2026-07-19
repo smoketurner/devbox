@@ -17,6 +17,11 @@ pub struct IndexEntry {
     pub field: &'static str,
     /// The plaintext value to index.
     pub value: String,
+    /// Enforce global uniqueness of this `(field, value)` pair across all
+    /// documents. Unique entries get a primary key derived from the value, so
+    /// a second document writing the same value fails with a unique violation
+    /// at the database level.
+    pub unique: bool,
 }
 
 /// Trait implemented by every document type stored in the document store.

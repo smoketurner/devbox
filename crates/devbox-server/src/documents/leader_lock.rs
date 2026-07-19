@@ -24,6 +24,7 @@ impl DocumentType for LeaderLockDoc {
         vec![IndexEntry {
             field: "holder_id",
             value: self.holder_id.clone(),
+            unique: false,
         }]
     }
 

@@ -158,12 +158,14 @@ impl DocumentType for DevboxDoc {
         let mut entries = vec![IndexEntry {
             field: "state",
             value: self.state.to_string(),
+            unique: false,
         }];
 
         if let Some(ref owner) = self.owner {
             entries.push(IndexEntry {
                 field: "owner",
                 value: owner.clone(),
+                unique: false,
             });
         }
 
@@ -171,12 +173,14 @@ impl DocumentType for DevboxDoc {
             entries.push(IndexEntry {
                 field: "name",
                 value: self.name.clone(),
+                unique: true,
             });
         }
 
         entries.push(IndexEntry {
             field: "instance_id",
             value: self.instance_id.clone(),
+            unique: false,
         });
 
         entries
