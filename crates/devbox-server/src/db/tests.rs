@@ -299,6 +299,65 @@ mod store_tests {
     }
 
     #[tokio::test]
+    async fn test_unchanged_name_backfills_missing_claim() {
+        let store = setup_store().await;
+
+        // A legacy doc: named, but inserted without a claim (predates claims).
+        let mut legacy = sample_devbox();
+        legacy.name = "calm-quilt".to_string();
+        let legacy = store.insert(&legacy).await.unwrap();
+        assert!(
+            store
+                .get::<NameClaimDoc>(&claim_doc_id("calm-quilt"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // A name-preserving write (e.g. a plain claim) acquires the claim.
+        let mut claimed = legacy.data.clone();
+        claimed.state = DevboxState::Claimed;
+        let updated = update_with_claim(&store, &legacy.id, legacy.version, &claimed, "calm-quilt")
+            .await
+            .unwrap();
+        assert!(updated);
+        assert_eq!(
+            store
+                .get::<NameClaimDoc>(&claim_doc_id("calm-quilt"))
+                .await
+                .unwrap()
+                .unwrap()
+                .data
+                .devbox_id,
+            legacy.id
+        );
+
+        // A claim already held by another box is left untouched (transitional
+        // legacy duplicate), not an error.
+        let mut dup = sample_devbox();
+        dup.instance_id = "i-second".to_string();
+        dup.name = "calm-quilt".to_string();
+        let dup = store.insert(&dup).await.unwrap();
+        let mut dup_claimed = dup.data.clone();
+        dup_claimed.state = DevboxState::Claimed;
+        let updated = update_with_claim(&store, &dup.id, dup.version, &dup_claimed, "calm-quilt")
+            .await
+            .unwrap();
+        assert!(updated);
+        assert_eq!(
+            store
+                .get::<NameClaimDoc>(&claim_doc_id("calm-quilt"))
+                .await
+                .unwrap()
+                .unwrap()
+                .data
+                .devbox_id,
+            legacy.id,
+            "existing claim must keep its holder"
+        );
+    }
+
+    #[tokio::test]
     async fn test_name_claim_released_on_clear_and_delete() {
         let store = setup_store().await;
 

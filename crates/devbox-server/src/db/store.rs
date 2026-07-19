@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result};
 use jiff::Timestamp;
-use sea_query::{Expr, ExprTrait, Iden, Order, Query};
+use sea_query::{Expr, ExprTrait, Iden, OnConflict, Order, Query};
 
 use super::document_type::{Document, DocumentType, IndexEntry};
 use super::pool::Pool;
@@ -562,6 +562,56 @@ impl StoreTransaction<'_> {
         }
 
         Ok(())
+    }
+
+    /// Insert a document with a specified ID within the transaction, doing
+    /// nothing if a document with that ID already exists.
+    ///
+    /// Returns `true` if the document was inserted, `false` if the ID was
+    /// already taken (no index entries are written in that case).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization or the database write fails.
+    pub async fn insert_with_id_if_absent<T: DocumentType>(
+        &mut self,
+        id: &str,
+        doc: &T,
+    ) -> Result<bool> {
+        let json = serde_json::to_string(doc).context("failed to serialize document")?;
+        let now_str = Timestamp::now().to_string();
+        let expires_str = doc.expires_at().map(|ts| ts.to_string());
+        let expires_ref: Option<&str> = expires_str.as_deref();
+        let indexes = doc.index_entries();
+
+        let stmt = Query::insert()
+            .into_table(Documents::Table)
+            .columns(DOC_COLUMNS)
+            .values([
+                id.into(),
+                T::DOC_TYPE.into(),
+                (T::CURRENT_VERSION.cast_signed()).into(),
+                json.as_str().into(),
+                expires_ref.into(),
+                now_str.as_str().into(),
+                now_str.as_str().into(),
+                1_i32.into(),
+                Option::<&str>::None.into(),
+            ])?
+            .on_conflict(OnConflict::column(Documents::Id).do_nothing().to_owned())
+            .to_owned();
+
+        let result = crate::tx_execute!(self.tx, stmt)?;
+        if result.rows_affected() == 0 {
+            return Ok(false);
+        }
+
+        for entry in &indexes {
+            let idx_stmt = build_index_insert(id, entry)?;
+            crate::tx_execute!(self.tx, idx_stmt)?;
+        }
+
+        Ok(true)
     }
 
     /// Conditionally update a document within the transaction, only if its

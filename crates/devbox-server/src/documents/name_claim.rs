@@ -49,9 +49,16 @@ pub fn claim_doc_id(name: &str) -> String {
 
 /// Reconcile the name-claim document with a devbox name change, inside the
 /// caller's open transaction: release `old_name`'s claim and acquire
-/// `new_name`'s. Either name may be empty (nothing to release / acquire);
-/// equal names are a no-op. Releasing a claim that does not exist is a no-op
-/// too, so documents created before claims existed rename cleanly.
+/// `new_name`'s. Either name may be empty (nothing to release / acquire).
+/// Releasing a claim that does not exist is a no-op, so documents created
+/// before claims existed rename cleanly.
+///
+/// An unchanged non-empty name *ensures* the claim exists rather than
+/// acquiring it: documents that predate claims carry a name with no claim
+/// doc, and this backfills one the next time the doc is written (e.g. a plain
+/// claim), closing the window where another box could take the name. A claim
+/// already held — by this box, or transitionally by a legacy duplicate — is
+/// left untouched.
 ///
 /// # Errors
 ///
@@ -64,20 +71,21 @@ pub async fn sync_name_claim(
     old_name: &str,
     new_name: &str,
 ) -> Result<()> {
+    let claim = NameClaimDoc {
+        devbox_id: devbox_id.to_string(),
+    };
     if old_name == new_name {
+        if !new_name.is_empty() {
+            tx.insert_with_id_if_absent(&claim_doc_id(new_name), &claim)
+                .await?;
+        }
         return Ok(());
     }
     if !old_name.is_empty() {
         tx.delete(&claim_doc_id(old_name)).await?;
     }
     if !new_name.is_empty() {
-        tx.insert_with_id(
-            &claim_doc_id(new_name),
-            &NameClaimDoc {
-                devbox_id: devbox_id.to_string(),
-            },
-        )
-        .await?;
+        tx.insert_with_id(&claim_doc_id(new_name), &claim).await?;
     }
     Ok(())
 }
