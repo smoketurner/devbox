@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result};
 use jiff::Timestamp;
-use sea_query::{Alias, Expr, ExprTrait, Iden, Order, Query};
+use sea_query::{Expr, ExprTrait, Iden, Order, Query};
 
 use super::document_type::{Document, DocumentType, IndexEntry};
 use super::pool::Pool;
@@ -118,17 +118,6 @@ struct RawDocumentRow {
 #[derive(sqlx::FromRow)]
 struct IdRow {
     id: String,
-}
-
-/// Outcome of [`DocumentStore::compare_and_update_unique`].
-#[derive(Debug, PartialEq, Eq)]
-pub enum UpdateOutcome {
-    /// The document was updated.
-    Updated,
-    /// The version guard failed — the document changed concurrently.
-    VersionMismatch,
-    /// Another document already holds the requested unique index value.
-    DuplicateValue,
 }
 
 // ============================================================================
@@ -368,7 +357,17 @@ impl DocumentStore {
     ///
     /// # Errors
     ///
-    /// Returns an error if serialization or the database write fails.
+    /// Returns an error if serialization or the database write fails. When the
+    /// document carries a unique index entry (see [`build_index_insert`])
+    /// whose value another document already holds, the write fails with a
+    /// unique violation — detect it with
+    /// [`is_unique_violation`](crate::db::pool::is_unique_violation). Aurora
+    /// DSQL runs REPEATABLE READ (snapshot isolation), so a read-then-write
+    /// check could not be race-safe; the deterministic primary key makes the
+    /// database reject the second writer no matter how the writes interleave
+    /// (a DSQL same-key write conflict is retried by
+    /// [`with_dsql_retry!`](crate::with_dsql_retry), and the rerun then hits
+    /// the committed winner's row as a unique violation).
     pub async fn compare_and_update<T: DocumentType>(
         &self,
         id: &str,
@@ -428,118 +427,6 @@ impl DocumentStore {
 
             tx.commit().await?;
             Ok(true)
-        })
-    }
-
-    /// Conditionally update a document, rejecting the write when another
-    /// document already holds the index entry `(unique_field, unique_value)`.
-    ///
-    /// Aurora DSQL runs REPEATABLE READ (snapshot isolation), so the
-    /// in-transaction uniqueness read alone is *not* race-safe: two concurrent
-    /// writers of the same value can both see it as free. The enforcement of
-    /// record is the index row's deterministic primary key (see
-    /// [`build_index_insert`]): the second writer of a unique value fails at
-    /// the database level, either with a unique violation — mapped here to
-    /// [`UpdateOutcome::DuplicateValue`] — or with a DSQL write-write conflict,
-    /// which [`with_dsql_retry!`](crate::with_dsql_retry) re-runs until the
-    /// read observes the winner and returns `DuplicateValue`. The read remains
-    /// as a fast path that resolves the sequential case without burning a
-    /// write conflict. Callers needing no uniqueness use
-    /// [`compare_and_update`](Self::compare_and_update).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if serialization or a database operation fails.
-    pub async fn compare_and_update_unique<T: DocumentType>(
-        &self,
-        id: &str,
-        expected_version: i32,
-        doc: &T,
-        unique_field: &str,
-        unique_value: &str,
-    ) -> Result<UpdateOutcome> {
-        crate::with_dsql_retry!(async {
-            let json = serde_json::to_string(doc).context("failed to serialize document")?;
-            let now_str = Timestamp::now().to_string();
-            let expires = doc.expires_at();
-            let indexes = doc.index_entries();
-
-            let expires_str = expires.map(|ts| ts.to_string());
-            let expires_ref: Option<&str> = expires_str.as_deref();
-
-            let mut tx = self.pool.begin().await?;
-
-            // Reject if any *other* document already holds the unique value.
-            // Best-effort fast path only: snapshot isolation cannot see an
-            // uncommitted concurrent writer, so the deterministic index-row
-            // primary key below is what actually guarantees uniqueness.
-            let clash_stmt = Query::select()
-                .expr_as(Expr::col(DocumentIndexes::DocumentId), Alias::new("id"))
-                .from(DocumentIndexes::Table)
-                .and_where(Expr::col(DocumentIndexes::IndexField).eq(unique_field))
-                .and_where(Expr::col(DocumentIndexes::IndexValue).eq(unique_value))
-                .and_where(Expr::col(DocumentIndexes::DocumentId).ne(id))
-                .limit(1)
-                .to_owned();
-            let clash: Option<IdRow> = crate::tx_fetch_optional!(tx, clash_stmt, IdRow)?;
-            if clash.is_some() {
-                return Ok(UpdateOutcome::DuplicateValue);
-            }
-
-            // UPDATE with version guard (optimistic concurrency)
-            let update_stmt = {
-                let mut q = Query::update();
-                q.table(Documents::Table)
-                    .value(Documents::Data, Expr::val(json.as_str()))
-                    .value(Documents::ExpiresAt, Expr::val(expires_ref))
-                    .value(
-                        Documents::SchemaVersion,
-                        Expr::val(T::CURRENT_VERSION.cast_signed()),
-                    )
-                    .value(Documents::UpdatedAt, Expr::val(now_str.as_str()))
-                    .value(
-                        Documents::Version,
-                        Expr::val(expected_version.saturating_add(1)),
-                    )
-                    .and_where(Expr::col(Documents::Id).eq(id))
-                    .and_where(Expr::col(Documents::Version).eq(expected_version));
-                q.to_owned()
-            };
-
-            let result = crate::tx_execute!(tx, update_stmt)?;
-            if result.rows_affected() == 0 {
-                return Ok(UpdateOutcome::VersionMismatch);
-            }
-
-            // DELETE old indexes
-            let delete_idx_stmt = Query::delete()
-                .from_table(DocumentIndexes::Table)
-                .and_where(Expr::col(DocumentIndexes::DocumentId).eq(id))
-                .to_owned();
-            crate::tx_execute!(tx, delete_idx_stmt)?;
-
-            // INSERT new indexes. A unique violation here (or at commit, where
-            // DSQL surfaces same-key conflicts) means another document won the
-            // unique value after the fast-path read — the domain outcome, not
-            // an internal error. Dropping the transaction rolls it back.
-            for entry in &indexes {
-                let idx_stmt = build_index_insert(id, entry)?;
-                if let Err(e) = crate::tx_execute!(tx, idx_stmt) {
-                    let err = anyhow::Error::from(e);
-                    if crate::db::pool::is_unique_violation(&err) {
-                        return Ok(UpdateOutcome::DuplicateValue);
-                    }
-                    return Err(err);
-                }
-            }
-
-            if let Err(e) = tx.commit().await {
-                if crate::db::pool::is_unique_violation(&e) {
-                    return Ok(UpdateOutcome::DuplicateValue);
-                }
-                return Err(e);
-            }
-            Ok(UpdateOutcome::Updated)
         })
     }
 

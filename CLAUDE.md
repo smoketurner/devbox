@@ -126,9 +126,11 @@ a unique, memorable `adjective-noun` **name** (e.g. `calm-quilt`) — generated 
 `crates/devbox-server/src/naming.rs` from `aws_lc_rs::rand`. The name is shown in
 the dashboard/CLI and is a global selector: `devbox ssh|release|status|rename <name>`
 resolves a box by name (or id). A claimant may override it via the claim body's
-optional `name` (validated by `is_valid_devbox_name`); uniqueness across
-non-terminated boxes is enforced atomically by
-`DocumentStore::compare_and_update_unique`. There is no backfill — docs written
+optional `name` (validated by `is_valid_devbox_name`); uniqueness is enforced by
+the database — the name index row's primary key is derived from the value
+(`build_index_insert` in `crates/devbox-server/src/db/store.rs`), so a duplicate
+name fails the writer's own transaction with a unique violation even under
+Aurora DSQL's REPEATABLE READ isolation. There is no backfill — docs written
 before the field existed keep an empty name and age out as the pool churns.
 
 > There are no active `.kiro/specs/` left — this file plus the Terraform in

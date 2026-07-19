@@ -169,9 +169,7 @@ mod store_tests {
     }
 
     #[tokio::test]
-    async fn test_compare_and_update_unique_outcomes() {
-        use crate::db::store::UpdateOutcome;
-
+    async fn test_compare_and_update_duplicate_name_outcomes() {
         let store = setup_store().await;
 
         // Box A holds name "taken"; box B holds "free".
@@ -183,14 +181,16 @@ mod store_tests {
         b.name = "free".to_string();
         let b = store.insert(&b).await.unwrap();
 
-        // Renaming B to A's name is rejected without touching B.
+        // Renaming B to A's name fails on the name row's deterministic primary
+        // key — a unique violation the DB raises inside the update's own
+        // transaction, which rolls back without touching B.
         let mut want_taken = b.data.clone();
         want_taken.name = "taken".to_string();
-        let outcome = store
-            .compare_and_update_unique(&b.id, b.version, &want_taken, "name", "taken")
+        let err = store
+            .compare_and_update(&b.id, b.version, &want_taken)
             .await
-            .unwrap();
-        assert_eq!(outcome, UpdateOutcome::DuplicateValue);
+            .unwrap_err();
+        assert!(crate::db::pool::is_unique_violation(&err));
         let fetched = store.get::<DevboxDoc>(&b.id).await.unwrap().unwrap();
         assert_eq!(fetched.data.name, "free", "B must be untouched");
         assert_eq!(fetched.version, b.version);
@@ -198,18 +198,18 @@ mod store_tests {
         // A stale version is reported as a mismatch, even for a free name.
         let mut want_fresh = b.data.clone();
         want_fresh.name = "fresh".to_string();
-        let outcome = store
-            .compare_and_update_unique(&b.id, 99, &want_fresh, "name", "fresh")
+        let updated = store
+            .compare_and_update(&b.id, 99, &want_fresh)
             .await
             .unwrap();
-        assert_eq!(outcome, UpdateOutcome::VersionMismatch);
+        assert!(!updated);
 
         // A free name with the correct version succeeds.
-        let outcome = store
-            .compare_and_update_unique(&b.id, b.version, &want_fresh, "name", "fresh")
+        let updated = store
+            .compare_and_update(&b.id, b.version, &want_fresh)
             .await
             .unwrap();
-        assert_eq!(outcome, UpdateOutcome::Updated);
+        assert!(updated);
         let fetched = store.get::<DevboxDoc>(&b.id).await.unwrap().unwrap();
         assert_eq!(fetched.data.name, "fresh");
 
@@ -320,70 +320,6 @@ mod store_tests {
             .await
             .unwrap();
         pool.is_healthy().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_duplicate_name_rejected_by_primary_key() {
-        // The DB itself must reject a duplicate name even through a write path
-        // that performs no application-level uniqueness check: the name index
-        // row's primary key is derived from the value, so the second document
-        // collides.
-        let store = setup_store().await;
-
-        let mut a = sample_devbox();
-        a.name = "taken".to_string();
-        store.insert(&a).await.unwrap();
-
-        let mut b = sample_devbox();
-        b.instance_id = "i-second".to_string();
-        b.name = "free".to_string();
-        let b = store.insert(&b).await.unwrap();
-
-        let mut want_taken = b.data.clone();
-        want_taken.name = "taken".to_string();
-        let err = store
-            .compare_and_update(&b.id, b.version, &want_taken)
-            .await
-            .unwrap_err();
-        assert!(crate::db::pool::is_unique_violation(&err));
-
-        // B is untouched — the transaction rolled back.
-        let fetched = store.get::<DevboxDoc>(&b.id).await.unwrap().unwrap();
-        assert_eq!(fetched.data.name, "free");
-        assert_eq!(fetched.version, b.version);
-    }
-
-    #[tokio::test]
-    async fn test_unique_violation_maps_to_duplicate_value() {
-        use crate::db::store::UpdateOutcome;
-
-        // Exercise the constraint-violation path inside
-        // compare_and_update_unique: pass a unique_value that differs from the
-        // doc's actual name so the fast-path read sees no clash and the name
-        // index INSERT itself collides — the sequential stand-in for the
-        // concurrent-rename race that snapshot isolation lets through.
-        let store = setup_store().await;
-
-        let mut a = sample_devbox();
-        a.name = "taken".to_string();
-        store.insert(&a).await.unwrap();
-
-        let mut b = sample_devbox();
-        b.instance_id = "i-second".to_string();
-        b.name = "free".to_string();
-        let b = store.insert(&b).await.unwrap();
-
-        let mut want_taken = b.data.clone();
-        want_taken.name = "taken".to_string();
-        let outcome = store
-            .compare_and_update_unique(&b.id, b.version, &want_taken, "name", "not-clashing")
-            .await
-            .unwrap();
-        assert_eq!(outcome, UpdateOutcome::DuplicateValue);
-
-        let fetched = store.get::<DevboxDoc>(&b.id).await.unwrap().unwrap();
-        assert_eq!(fetched.data.name, "free", "B must be untouched");
-        assert_eq!(fetched.version, b.version);
     }
 
     #[tokio::test]

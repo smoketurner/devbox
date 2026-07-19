@@ -18,7 +18,6 @@ use devbox_common::{
 };
 
 use crate::auth::{AgentIdentity, AgentRole, Principal};
-use crate::db::UpdateOutcome;
 use crate::db::document_type::Document;
 use crate::documents::devbox::{DevboxDoc, WarmupReport};
 use crate::error::AppError;
@@ -32,8 +31,8 @@ use crate::routes::AppState;
 ///
 /// A blank or absent value yields `None` (the box keeps its auto name). A
 /// non-blank value must satisfy [`is_valid_devbox_name`] (`400` otherwise).
-/// Uniqueness is *not* checked here — it is enforced atomically at claim time by
-/// [`DocumentStore::compare_and_update_unique`](crate::db::DocumentStore::compare_and_update_unique).
+/// Uniqueness is *not* checked here — the name index row's deterministic
+/// primary key makes the claim's own transaction reject a duplicate.
 pub(crate) fn validate_name_override(raw: Option<&str>) -> Result<Option<String>, AppError> {
     let Some(name) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
@@ -303,16 +302,17 @@ async fn update_devbox_by_instance(
 
 /// Claim a Ready box for `owner`, optionally setting its name to `name`.
 ///
-/// Shared by the JSON API and the HTML dashboard. When a name override is given,
-/// each candidate is claimed via [`compare_and_update_unique`](crate::db::DocumentStore::compare_and_update_unique),
-/// which checks the name and writes the claim in one transaction — so two
-/// concurrent claimants of the same name cannot both win (the DB rejects the
-/// loser). A `DuplicateValue` means some live box already holds the name; the
-/// loop continues, because that box may itself be a later candidate (the
-/// uniqueness check excludes the box being claimed, so claiming it succeeds).
-/// Only if no candidate can take the name does the claim fail with a `409`.
-/// Without an override the box keeps its reconciler-assigned unique name, so a
-/// plain version-guarded claim suffices.
+/// Shared by the JSON API and the HTML dashboard. Every claim is a plain
+/// version-guarded [`compare_and_update`](crate::db::DocumentStore::compare_and_update);
+/// when a name override is given, the name index row's deterministic primary
+/// key makes that same transaction reject a duplicate — so two concurrent
+/// claimants of the same name cannot both win (the DB rejects the loser). A
+/// unique violation means some live box already holds the name; the loop
+/// continues, because that box may itself be a later candidate (a box
+/// rewriting its own name row does not self-conflict, so claiming it
+/// succeeds). Only if no candidate can take the name does the claim fail with
+/// a `409`. Without an override the box keeps its reconciler-assigned unique
+/// name.
 pub(crate) async fn claim_devbox(
     state: &AppState,
     claimant: &Principal,
@@ -351,38 +351,25 @@ pub(crate) async fn claim_devbox(
         updated.claimed_at = Some(jiff::Timestamp::now());
         updated.owner_tag_applied = false;
 
-        let claimed = match name_override {
-            Some(ref name) => {
-                updated.name = name.clone();
-                match state
-                    .store
-                    .compare_and_update_unique(
-                        &candidate.id,
-                        candidate.version,
-                        &updated,
-                        "name",
-                        name,
-                    )
-                    .await?
-                {
-                    UpdateOutcome::Updated => true,
-                    // Another claimer took this box; try the next candidate.
-                    UpdateOutcome::VersionMismatch => continue,
-                    // The name is held by another box. If that box is itself a
-                    // later candidate we'll reach it and claim it; otherwise the
-                    // loop exhausts and we report the name as in use.
-                    UpdateOutcome::DuplicateValue => {
-                        name_in_use = true;
-                        continue;
-                    }
-                }
+        if let Some(ref name) = name_override {
+            updated.name = name.clone();
+        }
+
+        let claimed = match state
+            .store
+            .compare_and_update(&candidate.id, candidate.version, &updated)
+            .await
+        {
+            Ok(claimed) => claimed,
+            // The name is held by another box. If that box is itself a later
+            // candidate we'll reach it and claim it (rewriting its own name
+            // row does not self-conflict); otherwise the loop exhausts and we
+            // report the name as in use.
+            Err(e) if name_override.is_some() && crate::db::pool::is_unique_violation(&e) => {
+                name_in_use = true;
+                continue;
             }
-            None => {
-                state
-                    .store
-                    .compare_and_update(&candidate.id, candidate.version, &updated)
-                    .await?
-            }
+            Err(e) => return Err(e.into()),
         };
 
         if claimed {
@@ -482,9 +469,11 @@ pub(crate) async fn release_devbox(
 /// - State must be `Claimed` (409 otherwise).
 /// - Caller must be the box's owner (403 otherwise).
 /// - No-op short-circuit when `new_name` equals the current name (200, unchanged).
-/// - Uniqueness via [`compare_and_update_unique`](crate::db::DocumentStore::compare_and_update_unique).
+/// - Uniqueness via the name index row's deterministic primary key: the
+///   version-guarded update's own transaction fails with a unique violation
+///   (409) when another box holds the name.
 ///
-/// `VersionMismatch` is retried via [`with_occ_retry`]: the reconciler's
+/// A version mismatch is retried via [`with_occ_retry`]: the reconciler's
 /// `apply_pending_owner_tags` bumps the document version within ~30 s of a claim,
 /// so a rename attempted in that window would otherwise get a spurious 409. A
 /// re-fetch and retry is sufficient — no sleep — because the reconciler is the
@@ -527,10 +516,10 @@ pub(crate) async fn rename_devbox(
 
         match state
             .store
-            .compare_and_update_unique(&doc.id, doc.version, &updated, "name", name)
-            .await?
+            .compare_and_update(&doc.id, doc.version, &updated)
+            .await
         {
-            UpdateOutcome::Updated => {
+            Ok(true) => {
                 let refreshed = state.store.get::<DevboxDoc>(id).await?.ok_or_else(|| {
                     AppError::Internal(anyhow::anyhow!("devbox vanished after rename"))
                 })?;
@@ -538,10 +527,11 @@ pub(crate) async fn rename_devbox(
             }
             // The reconciler just bumped the version (owner-tag sync);
             // re-fetch and retry with the fresh version.
-            UpdateOutcome::VersionMismatch => Ok(OccAttempt::Retry),
-            UpdateOutcome::DuplicateValue => Err(AppError::Conflict(format!(
+            Ok(false) => Ok(OccAttempt::Retry),
+            Err(e) if crate::db::pool::is_unique_violation(&e) => Err(AppError::Conflict(format!(
                 "name '{name}' is already in use"
             ))),
+            Err(e) => Err(e.into()),
         }
     })
     .await
