@@ -564,6 +564,27 @@ impl StoreTransaction<'_> {
         Ok(())
     }
 
+    /// Get a document by ID within the transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query or deserialization fails.
+    pub async fn get<T: DocumentType>(&mut self, id: &str) -> Result<Option<Document<T>>> {
+        let stmt = Query::select()
+            .columns(DOC_COLUMNS)
+            .from(Documents::Table)
+            .and_where(Expr::col(Documents::Id).eq(id))
+            .and_where(Expr::col(Documents::DocType).eq(T::DOC_TYPE))
+            .to_owned();
+
+        let row: Option<RawDocumentRow> = crate::tx_fetch_optional!(self.tx, stmt, RawDocumentRow)?;
+
+        match row {
+            Some(row) => raw_to_document::<T>(row).map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// Insert a document with a specified ID within the transaction, doing
     /// nothing if a document with that ID already exists.
     ///

@@ -358,6 +358,41 @@ mod store_tests {
     }
 
     #[tokio::test]
+    async fn test_release_only_deletes_own_claim() {
+        let store = setup_store().await;
+
+        // Box A holds the claim on the shared name.
+        let mut a = sample_devbox();
+        a.name = "shared".to_string();
+        insert_with_claim(&store, "doc-a", &a).await.unwrap();
+
+        // Box B is a legacy duplicate: same name in its doc, no claim.
+        let mut b = sample_devbox();
+        b.instance_id = "i-second".to_string();
+        b.name = "shared".to_string();
+        let b = store.insert(&b).await.unwrap();
+
+        // B renaming away from the shared name must not delete A's claim.
+        let mut renamed = b.data.clone();
+        renamed.name = "elsewhere".to_string();
+        let updated = update_with_claim(&store, &b.id, b.version, &renamed, "shared")
+            .await
+            .unwrap();
+        assert!(updated);
+        assert_eq!(
+            store
+                .get::<NameClaimDoc>(&claim_doc_id("shared"))
+                .await
+                .unwrap()
+                .unwrap()
+                .data
+                .devbox_id,
+            "doc-a",
+            "A's claim must survive B's rename away from the shared name"
+        );
+    }
+
+    #[tokio::test]
     async fn test_name_claim_released_on_clear_and_delete() {
         let store = setup_store().await;
 

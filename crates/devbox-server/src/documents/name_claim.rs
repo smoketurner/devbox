@@ -58,7 +58,9 @@ pub fn claim_doc_id(name: &str) -> String {
 /// doc, and this backfills one the next time the doc is written (e.g. a plain
 /// claim), closing the window where another box could take the name. A claim
 /// already held — by this box, or transitionally by a legacy duplicate — is
-/// left untouched.
+/// left untouched. Releases are likewise holder-guarded: only a claim whose
+/// `devbox_id` is this box is deleted, so a legacy duplicate renaming away
+/// from a shared name cannot strip the claim-holder's protection.
 ///
 /// # Errors
 ///
@@ -82,7 +84,15 @@ pub async fn sync_name_claim(
         return Ok(());
     }
     if !old_name.is_empty() {
-        tx.delete(&claim_doc_id(old_name)).await?;
+        let old_claim_id = claim_doc_id(old_name);
+        // Release only this box's own claim. With legacy duplicates the claim
+        // for old_name may belong to another box that shares the name, and
+        // deleting it would strip that box's protection.
+        if let Some(existing) = tx.get::<NameClaimDoc>(&old_claim_id).await?
+            && existing.data.devbox_id == devbox_id
+        {
+            tx.delete(&old_claim_id).await?;
+        }
     }
     if !new_name.is_empty() {
         tx.insert_with_id(&claim_doc_id(new_name), &claim).await?;
