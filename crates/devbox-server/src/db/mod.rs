@@ -10,7 +10,7 @@ pub mod pool;
 pub(crate) mod store;
 
 pub use pool::{DatabaseType, Pool, PoolConfig, Transaction};
-pub use store::{DocumentStore, StoreTransaction, UpdateOutcome};
+pub use store::{DocumentStore, StoreTransaction};
 
 #[cfg(test)]
 mod tests;

@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result};
 use jiff::Timestamp;
-use sea_query::{Alias, Expr, ExprTrait, Iden, Order, Query};
+use sea_query::{Expr, ExprTrait, Iden, OnConflict, Order, Query};
 
 use super::document_type::{Document, DocumentType, IndexEntry};
 use super::pool::Pool;
@@ -108,17 +108,6 @@ struct RawDocumentRow {
 #[derive(sqlx::FromRow)]
 struct IdRow {
     id: String,
-}
-
-/// Outcome of [`DocumentStore::compare_and_update_unique`].
-#[derive(Debug, PartialEq, Eq)]
-pub enum UpdateOutcome {
-    /// The document was updated.
-    Updated,
-    /// The version guard failed — the document changed concurrently.
-    VersionMismatch,
-    /// Another document already holds the requested unique index value.
-    DuplicateValue,
 }
 
 // ============================================================================
@@ -366,150 +355,10 @@ impl DocumentStore {
         doc: &T,
     ) -> Result<bool> {
         crate::with_dsql_retry!(async {
-            let json = serde_json::to_string(doc).context("failed to serialize document")?;
-            let now_str = Timestamp::now().to_string();
-            let expires = doc.expires_at();
-            let indexes = doc.index_entries();
-
-            let expires_str = expires.map(|ts| ts.to_string());
-            let expires_ref: Option<&str> = expires_str.as_deref();
-
-            let mut tx = self.pool.begin().await?;
-
-            // UPDATE with version guard (optimistic concurrency)
-            let update_stmt = {
-                let mut q = Query::update();
-                q.table(Documents::Table)
-                    .value(Documents::Data, Expr::val(json.as_str()))
-                    .value(Documents::ExpiresAt, Expr::val(expires_ref))
-                    .value(
-                        Documents::SchemaVersion,
-                        Expr::val(T::CURRENT_VERSION.cast_signed()),
-                    )
-                    .value(Documents::UpdatedAt, Expr::val(now_str.as_str()))
-                    .value(
-                        Documents::Version,
-                        Expr::val(expected_version.saturating_add(1)),
-                    )
-                    .and_where(Expr::col(Documents::Id).eq(id))
-                    .and_where(Expr::col(Documents::Version).eq(expected_version));
-                q.to_owned()
-            };
-
-            let result = crate::tx_execute!(tx, update_stmt)?;
-
-            if result.rows_affected() == 0 {
-                return Ok(false);
-            }
-
-            // DELETE old indexes
-            let delete_idx_stmt = Query::delete()
-                .from_table(DocumentIndexes::Table)
-                .and_where(Expr::col(DocumentIndexes::DocumentId).eq(id))
-                .to_owned();
-
-            crate::tx_execute!(tx, delete_idx_stmt)?;
-
-            // INSERT new indexes
-            for entry in &indexes {
-                let idx_stmt = build_index_insert(id, entry)?;
-                crate::tx_execute!(tx, idx_stmt)?;
-            }
-
+            let mut tx = self.begin().await?;
+            let updated = tx.compare_and_update(id, expected_version, doc).await?;
             tx.commit().await?;
-            Ok(true)
-        })
-    }
-
-    /// Conditionally update a document, rejecting the write when another
-    /// document already holds the index entry `(unique_field, unique_value)`.
-    ///
-    /// The uniqueness read and the version-guarded update run in one
-    /// transaction. Under serializable isolation (Aurora DSQL) two concurrent
-    /// writers of the same value conflict; [`with_dsql_retry!`](crate::with_dsql_retry)
-    /// re-runs the loser, which then observes the value and returns
-    /// [`UpdateOutcome::DuplicateValue`]. On single-writer SQLite the
-    /// transaction serializes to the same effect. Callers needing no uniqueness
-    /// use [`compare_and_update`](Self::compare_and_update).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if serialization or a database operation fails.
-    pub async fn compare_and_update_unique<T: DocumentType>(
-        &self,
-        id: &str,
-        expected_version: i32,
-        doc: &T,
-        unique_field: &str,
-        unique_value: &str,
-    ) -> Result<UpdateOutcome> {
-        crate::with_dsql_retry!(async {
-            let json = serde_json::to_string(doc).context("failed to serialize document")?;
-            let now_str = Timestamp::now().to_string();
-            let expires = doc.expires_at();
-            let indexes = doc.index_entries();
-
-            let expires_str = expires.map(|ts| ts.to_string());
-            let expires_ref: Option<&str> = expires_str.as_deref();
-
-            let mut tx = self.pool.begin().await?;
-
-            // Reject if any *other* document already holds the unique value.
-            // Reading it inside the transaction is what lets serializable
-            // isolation detect a concurrent writer of the same value.
-            let clash_stmt = Query::select()
-                .expr_as(Expr::col(DocumentIndexes::DocumentId), Alias::new("id"))
-                .from(DocumentIndexes::Table)
-                .and_where(Expr::col(DocumentIndexes::IndexField).eq(unique_field))
-                .and_where(Expr::col(DocumentIndexes::IndexValue).eq(unique_value))
-                .and_where(Expr::col(DocumentIndexes::DocumentId).ne(id))
-                .limit(1)
-                .to_owned();
-            let clash: Option<IdRow> = crate::tx_fetch_optional!(tx, clash_stmt, IdRow)?;
-            if clash.is_some() {
-                return Ok(UpdateOutcome::DuplicateValue);
-            }
-
-            // UPDATE with version guard (optimistic concurrency)
-            let update_stmt = {
-                let mut q = Query::update();
-                q.table(Documents::Table)
-                    .value(Documents::Data, Expr::val(json.as_str()))
-                    .value(Documents::ExpiresAt, Expr::val(expires_ref))
-                    .value(
-                        Documents::SchemaVersion,
-                        Expr::val(T::CURRENT_VERSION.cast_signed()),
-                    )
-                    .value(Documents::UpdatedAt, Expr::val(now_str.as_str()))
-                    .value(
-                        Documents::Version,
-                        Expr::val(expected_version.saturating_add(1)),
-                    )
-                    .and_where(Expr::col(Documents::Id).eq(id))
-                    .and_where(Expr::col(Documents::Version).eq(expected_version));
-                q.to_owned()
-            };
-
-            let result = crate::tx_execute!(tx, update_stmt)?;
-            if result.rows_affected() == 0 {
-                return Ok(UpdateOutcome::VersionMismatch);
-            }
-
-            // DELETE old indexes
-            let delete_idx_stmt = Query::delete()
-                .from_table(DocumentIndexes::Table)
-                .and_where(Expr::col(DocumentIndexes::DocumentId).eq(id))
-                .to_owned();
-            crate::tx_execute!(tx, delete_idx_stmt)?;
-
-            // INSERT new indexes
-            for entry in &indexes {
-                let idx_stmt = build_index_insert(id, entry)?;
-                crate::tx_execute!(tx, idx_stmt)?;
-            }
-
-            tx.commit().await?;
-            Ok(UpdateOutcome::Updated)
+            Ok(updated)
         })
     }
 
@@ -524,24 +373,10 @@ impl DocumentStore {
     /// Returns an error if the database write fails.
     pub async fn delete(&self, id: &str) -> Result<bool> {
         crate::with_dsql_retry!(async {
-            let mut tx = self.pool.begin().await?;
-
-            // Delete indexes first
-            let delete_idx_stmt = Query::delete()
-                .from_table(DocumentIndexes::Table)
-                .and_where(Expr::col(DocumentIndexes::DocumentId).eq(id))
-                .to_owned();
-            crate::tx_execute!(tx, delete_idx_stmt)?;
-
-            // Delete document
-            let delete_doc_stmt = Query::delete()
-                .from_table(Documents::Table)
-                .and_where(Expr::col(Documents::Id).eq(id))
-                .to_owned();
-            let result = crate::tx_execute!(tx, delete_doc_stmt)?;
-
+            let mut tx = self.begin().await?;
+            let deleted = tx.delete(id).await?;
             tx.commit().await?;
-            Ok(result.rows_affected() > 0)
+            Ok(deleted)
         })
     }
 
@@ -727,6 +562,162 @@ impl StoreTransaction<'_> {
         }
 
         Ok(())
+    }
+
+    /// Get a document by ID within the transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query or deserialization fails.
+    pub async fn get<T: DocumentType>(&mut self, id: &str) -> Result<Option<Document<T>>> {
+        let stmt = Query::select()
+            .columns(DOC_COLUMNS)
+            .from(Documents::Table)
+            .and_where(Expr::col(Documents::Id).eq(id))
+            .and_where(Expr::col(Documents::DocType).eq(T::DOC_TYPE))
+            .to_owned();
+
+        let row: Option<RawDocumentRow> = crate::tx_fetch_optional!(self.tx, stmt, RawDocumentRow)?;
+
+        match row {
+            Some(row) => raw_to_document::<T>(row).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Insert a document with a specified ID within the transaction, doing
+    /// nothing if a document with that ID already exists.
+    ///
+    /// Returns `true` if the document was inserted, `false` if the ID was
+    /// already taken (no index entries are written in that case).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization or the database write fails.
+    pub async fn insert_with_id_if_absent<T: DocumentType>(
+        &mut self,
+        id: &str,
+        doc: &T,
+    ) -> Result<bool> {
+        let json = serde_json::to_string(doc).context("failed to serialize document")?;
+        let now_str = Timestamp::now().to_string();
+        let expires_str = doc.expires_at().map(|ts| ts.to_string());
+        let expires_ref: Option<&str> = expires_str.as_deref();
+        let indexes = doc.index_entries();
+
+        let stmt = Query::insert()
+            .into_table(Documents::Table)
+            .columns(DOC_COLUMNS)
+            .values([
+                id.into(),
+                T::DOC_TYPE.into(),
+                (T::CURRENT_VERSION.cast_signed()).into(),
+                json.as_str().into(),
+                expires_ref.into(),
+                now_str.as_str().into(),
+                now_str.as_str().into(),
+                1_i32.into(),
+                Option::<&str>::None.into(),
+            ])?
+            .on_conflict(OnConflict::column(Documents::Id).do_nothing().to_owned())
+            .to_owned();
+
+        let result = crate::tx_execute!(self.tx, stmt)?;
+        if result.rows_affected() == 0 {
+            return Ok(false);
+        }
+
+        for entry in &indexes {
+            let idx_stmt = build_index_insert(id, entry)?;
+            crate::tx_execute!(self.tx, idx_stmt)?;
+        }
+
+        Ok(true)
+    }
+
+    /// Conditionally update a document within the transaction, only if its
+    /// version matches.
+    ///
+    /// Returns `true` if the update succeeded, `false` on version mismatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization or the database write fails.
+    pub async fn compare_and_update<T: DocumentType>(
+        &mut self,
+        id: &str,
+        expected_version: i32,
+        doc: &T,
+    ) -> Result<bool> {
+        let json = serde_json::to_string(doc).context("failed to serialize document")?;
+        let now_str = Timestamp::now().to_string();
+        let expires_str = doc.expires_at().map(|ts| ts.to_string());
+        let expires_ref: Option<&str> = expires_str.as_deref();
+        let indexes = doc.index_entries();
+
+        // UPDATE with version guard (optimistic concurrency)
+        let update_stmt = {
+            let mut q = Query::update();
+            q.table(Documents::Table)
+                .value(Documents::Data, Expr::val(json.as_str()))
+                .value(Documents::ExpiresAt, Expr::val(expires_ref))
+                .value(
+                    Documents::SchemaVersion,
+                    Expr::val(T::CURRENT_VERSION.cast_signed()),
+                )
+                .value(Documents::UpdatedAt, Expr::val(now_str.as_str()))
+                .value(
+                    Documents::Version,
+                    Expr::val(expected_version.saturating_add(1)),
+                )
+                .and_where(Expr::col(Documents::Id).eq(id))
+                .and_where(Expr::col(Documents::Version).eq(expected_version));
+            q.to_owned()
+        };
+
+        let result = crate::tx_execute!(self.tx, update_stmt)?;
+        if result.rows_affected() == 0 {
+            return Ok(false);
+        }
+
+        // Rebuild indexes
+        let delete_idx_stmt = Query::delete()
+            .from_table(DocumentIndexes::Table)
+            .and_where(Expr::col(DocumentIndexes::DocumentId).eq(id))
+            .to_owned();
+        crate::tx_execute!(self.tx, delete_idx_stmt)?;
+
+        for entry in &indexes {
+            let idx_stmt = build_index_insert(id, entry)?;
+            crate::tx_execute!(self.tx, idx_stmt)?;
+        }
+
+        Ok(true)
+    }
+
+    /// Delete a document (and its index entries) within the transaction.
+    ///
+    /// Returns `true` if a document row was deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database write fails.
+    pub async fn delete(&mut self, id: &str) -> Result<bool> {
+        // Delete indexes first
+        let delete_idx_stmt = Query::delete()
+            .from_table(DocumentIndexes::Table)
+            .and_where(Expr::col(DocumentIndexes::DocumentId).eq(id))
+            .to_owned();
+        crate::tx_execute!(self.tx, delete_idx_stmt)?;
+
+        // Delete document
+        let delete_doc_stmt = Query::delete()
+            .from_table(Documents::Table)
+            .and_where(Expr::col(Documents::Id).eq(id))
+            .to_owned();
+        let result = crate::tx_execute!(self.tx, delete_doc_stmt)?;
+
+        Ok(result.rows_affected() > 0)
     }
 
     /// Commit the transaction.
