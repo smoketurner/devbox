@@ -312,8 +312,20 @@ async fn handle_git_proxy(
             .into_response());
     };
     // Verify the box's web-identity token against the trusted devbox roles, as the
-    // agent JSON endpoints do.
-    let agent = state.auth.verify_agent_token(&token).await?;
+    // agent JSON endpoints do. A rejected (e.g. expired) credential re-challenges
+    // like the missing-credential path: git only erases it and re-invokes its
+    // helper when the 401 carries a Basic challenge.
+    let agent = match state.auth.verify_agent_token(&token).await {
+        Ok(agent) => agent,
+        Err(err) => {
+            tracing::debug!("git proxy credential rejected: {err}");
+            return Ok((
+                StatusCode::UNAUTHORIZED,
+                [(WWW_AUTHENTICATE, "Basic realm=\"devbox\"")],
+            )
+                .into_response());
+        }
+    };
 
     let target = git_proxy::authorize(&method, &owner, &repo, &rest, query.as_deref()).map_err(
         |reject| match reject {
@@ -598,6 +610,28 @@ mod tests {
         let req = Request::builder()
             .method("GET")
             .uri("/git/smoketurner/devbox/info/refs?service=git-upload-pack")
+            .body(Body::empty())
+            .unwrap();
+        let resp = build_router(state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers()
+                .get(WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok()),
+            Some("Basic realm=\"devbox\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn git_proxy_rejected_credential_carries_basic_challenge() {
+        // A present-but-invalid credential (e.g. a token the system cache helper
+        // served past its TTL) must re-challenge like the no-credential 401, or
+        // git fails the operation instead of erasing it and re-minting.
+        let state = setup_state_no_principal().await;
+        let req = Request::builder()
+            .method("GET")
+            .uri("/git/smoketurner/devbox/info/refs?service=git-upload-pack")
+            .header(AUTHORIZATION, "Basic eC1kZXZib3g6c3RhbGUtdG9rZW4=")
             .body(Body::empty())
             .unwrap();
         let resp = build_router(state).oneshot(req).await.unwrap();
