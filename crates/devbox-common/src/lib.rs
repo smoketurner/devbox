@@ -314,7 +314,7 @@ pub fn is_valid_devbox_name(name: &str) -> bool {
 /// non-UTF-8, or blank after trimming.
 ///
 /// Non-secret configuration is supplied through the environment across the
-/// server, agent, and minter; this is the shared "present and non-blank" read.
+/// server, agent, and GitHub App client; this is the shared "present and non-blank" read.
 #[must_use]
 pub fn env_non_empty(key: &str) -> Option<String> {
     std::env::var(key)
@@ -465,7 +465,7 @@ impl GitHubRepository {
     ///
     /// Returns `None` unless there are exactly two non-empty segments split on a
     /// single `/`. This parses the canonical `owner/repo` form only — git remote
-    /// URLs (`https://…`, scp-like) are parsed server-side by the minter.
+    /// URLs (`https://…`, scp-like) are parsed server-side by the GitHub App client.
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         let (owner, repo) = s.trim().split_once('/')?;

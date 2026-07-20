@@ -114,17 +114,17 @@ async fn main() -> Result<()> {
         .ok()
         .filter(|s| !s.is_empty());
 
-    // Build the GitHub token minter, which reads the App private key from SSM via
+    // Build the GitHub App client, which reads the App private key from SSM via
     // the task role. `None` when unconfigured (local/dev), so the server boots
     // without AWS and the agent git-token endpoint reports minting unavailable.
-    let minter = devbox_server::github::Minter::from_env(&aws_config)
+    let github_app = devbox_server::github::GitHubApp::from_env(&aws_config)
         .await
-        .context("initialize GitHub token minter")?
+        .context("initialize GitHub App client")?
         .map(Arc::new);
 
-    // The git reverse proxy is backed by the same App as the minter, so it exists
+    // The git reverse proxy is backed by the same GitHub App, so it exists
     // exactly when minting is configured.
-    let git_proxy = minter
+    let git_proxy = github_app
         .clone()
         .map(devbox_server::github::GitProxy::new)
         .transpose()
@@ -136,7 +136,7 @@ async fn main() -> Result<()> {
         store: Arc::clone(&store),
         auth: build_authenticator().await?,
         aws_account_id,
-        minter,
+        github_app,
         git_proxy,
         compute: Some(ec2_client),
     }));

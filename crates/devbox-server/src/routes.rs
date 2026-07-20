@@ -50,13 +50,13 @@ pub struct AppState {
     /// 9728 discovery document so `devbox ssh` can auto-select the local AWS
     /// profile for the SSM tunnel. `None` leaves the field out of the document.
     pub aws_account_id: Option<String>,
-    /// GitHub App token minter for the agent path. `None` when the server is not
+    /// GitHub App client for the agent token path. `None` when the server is not
     /// configured for GitHub App auth (`DEVBOX_GITHUB_APP_ID` /
     /// `DEVBOX_GITHUB_KEY_PARAM` unset), in which case `/api/v1/agent/git-token`
     /// reports minting unavailable.
-    pub minter: Option<Arc<crate::github::Minter>>,
+    pub github_app: Option<Arc<crate::github::GitHubApp>>,
     /// Git reverse proxy for the claimant's fetch/push traffic. `None` when the
-    /// minter is unconfigured, in which case `/git/*` returns 503.
+    /// App client is unconfigured, in which case `/git/*` returns 503.
     pub git_proxy: Option<Arc<crate::github::GitProxy>>,
     /// EC2 client used to apply the `devbox:owner` tag inline at claim time, so a
     /// freshly-claimed box becomes loginable without waiting for the next
@@ -394,7 +394,7 @@ mod tests {
             store: Arc::new(test_store().await),
             auth: Authenticator::with_test_owner(owner),
             aws_account_id: None,
-            minter: None,
+            github_app: None,
             git_proxy: None,
             compute: None,
         })
@@ -422,7 +422,7 @@ mod tests {
             store: Arc::new(test_store().await),
             auth,
             aws_account_id: None,
-            minter: None,
+            github_app: None,
             git_proxy: None,
             compute: None,
         })
@@ -501,7 +501,7 @@ mod tests {
             store: Arc::new(test_store().await),
             auth: Authenticator::with_test_owner("jdoe"),
             aws_account_id: Some("123456789012".to_string()),
-            minter: None,
+            github_app: None,
             git_proxy: None,
             compute: None,
         });
