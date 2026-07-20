@@ -190,6 +190,10 @@ impl Minter {
     /// Propagates JWT signing, installation-lookup, and token-exchange failures
     /// (including a 404 when the App is not installed on the repo).
     pub(crate) async fn mint(&self, owner: &str, repo: &str, write: bool) -> Result<String> {
+        // The REST API rejects git's `repo.git` remote spelling, which the git
+        // reverse proxy forwards verbatim (remote-URL callers come pre-stripped
+        // via `parse_remote`).
+        let repo = bare_repo(repo);
         let jwt = sign_jwt(&self.issuer, &self.key)?;
         let installation_id = self.resolve_installation(&jwt, owner, repo).await?;
         self.exchange(&jwt, installation_id, repo, write).await
@@ -325,9 +329,14 @@ fn parse_remote(remote: &str) -> Option<RemoteRef> {
     let host = url.host_str()?.to_lowercase();
     let mut segments = url.path_segments()?.filter(|segment| !segment.is_empty());
     let owner = segments.next()?.to_string();
-    let repo = segments.next()?;
-    let repo = repo.strip_suffix(".git").unwrap_or(repo).to_string();
+    let repo = bare_repo(segments.next()?).to_string();
     Some(RemoteRef { host, owner, repo })
+}
+
+/// The GitHub repository name for a repo path segment: strips the `.git` suffix
+/// git remotes conventionally carry, which the REST API does not accept.
+fn bare_repo(repo: &str) -> &str {
+    repo.strip_suffix(".git").unwrap_or(repo)
 }
 
 /// The git host whose remotes this App serves, derived from the API base: public
@@ -362,7 +371,7 @@ fn parse_git_url(remote: &str) -> Option<Url> {
 
 #[cfg(test)]
 mod tests {
-    use super::{git_host_from_api_base, parse_remote};
+    use super::{bare_repo, git_host_from_api_base, parse_remote};
 
     /// `(host, owner, repo)` for a remote, or `None`.
     fn parsed(remote: &str) -> Option<(String, String, String)> {
@@ -375,6 +384,15 @@ mod tests {
             owner.to_string(),
             repo.to_string(),
         ))
+    }
+
+    #[test]
+    fn bare_repo_strips_git_suffix() {
+        // The git reverse proxy hands `mint` the raw path segment from the
+        // rewritten remote, so both spellings must resolve to the same repo.
+        assert_eq!(bare_repo("devbox.git"), "devbox");
+        assert_eq!(bare_repo("devbox"), "devbox");
+        assert_eq!(bare_repo("devbox.git.git"), "devbox.git");
     }
 
     #[test]
