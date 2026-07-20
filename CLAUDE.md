@@ -261,7 +261,7 @@ preserves them: `git clean -fd`, no `-x`). The read-only fetch credential is
 **server-backed**: the agent authenticates to devbox-server with an AWS
 web-identity token (STS `GetWebIdentityToken` — no static secret on the box) at
 `POST /api/v1/agent/git-token`, and the server mints a short-lived, repo-scoped
-GitHub App installation token (`crates/devbox-server/src/github/minter.rs`,
+GitHub App installation token (`crates/devbox-server/src/github/app.rs`,
 `crates/devbox-agent/src/control_plane.rs`; the App private key lives only on the
 control plane, read from an SSM SecureString). The warmup fetch is time-budgeted
 (`WARMUP_FETCH_TIMEOUT_SECS`, default 120 s) and **degrades, does not reap** — a

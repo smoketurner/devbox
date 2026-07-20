@@ -92,7 +92,7 @@ pub(crate) fn validate_rename_name(raw: &str) -> Result<String, AppError> {
 ///
 /// # Errors
 ///
-/// [`AppError::ServiceUnavailable`] when the server has no minter configured
+/// [`AppError::ServiceUnavailable`] when the server has no GitHub App configured
 /// (`DEVBOX_GITHUB_APP_ID`/`DEVBOX_GITHUB_KEY_PARAM` unset); [`AppError::Internal`]
 /// when a GitHub API call fails (including when the App is not installed on the
 /// requested repo).
@@ -101,11 +101,11 @@ pub(crate) async fn mint_git_token(
     agent: &AgentIdentity,
     remote: &str,
 ) -> Result<GitTokenResponse, AppError> {
-    let minter = state.minter.as_ref().ok_or_else(|| {
+    let github_app = state.github_app.as_ref().ok_or_else(|| {
         AppError::ServiceUnavailable("GitHub token minting is not configured".to_string())
     })?;
 
-    match minter.mint_for_remote(remote).await {
+    match github_app.token_for_remote(remote).await {
         Ok(Some((repository, token))) => {
             tracing::info!(
                 instance_id = %agent.instance_id,
@@ -651,7 +651,7 @@ mod tests {
             store: std::sync::Arc::new(test_store().await),
             auth: Authenticator::with_test_owner("jdoe"),
             aws_account_id: None,
-            minter: None,
+            github_app: None,
             git_proxy: None,
             compute: None,
         }
@@ -815,8 +815,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mint_git_token_without_minter_is_service_unavailable() {
-        // The default test state configures no minter; mint_git_token must report
+    async fn mint_git_token_without_github_app_is_service_unavailable() {
+        // The default test state configures no GitHub App; mint_git_token must report
         // 503 Service Unavailable (not 500), so a box can distinguish "minting not
         // configured" from a genuine server fault.
         let state = setup_state().await;

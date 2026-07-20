@@ -22,8 +22,8 @@
 //! - `DEVBOX_GITHUB_KEY_PARAM` — SSM SecureString parameter holding the RSA PEM.
 //! - `DEVBOX_GITHUB_API_BASE` — optional; defaults to `https://api.github.com`.
 //!
-//! When `DEVBOX_GITHUB_APP_ID` / `DEVBOX_GITHUB_KEY_PARAM` are unset the minter is
-//! absent ([`Minter::from_env`] returns `Ok(None)`), so a local/dev server boots
+//! When `DEVBOX_GITHUB_APP_ID` / `DEVBOX_GITHUB_KEY_PARAM` are unset the App client is
+//! absent ([`GitHubApp::from_env`] returns `Ok(None)`), so a local/dev server boots
 //! without AWS and the git-token endpoint reports that minting is unconfigured.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -82,14 +82,16 @@ struct Installation {
     id: u64,
 }
 
-/// Mints read-only, repo-scoped installation tokens, discovering the installation
-/// per repo so a single App serves every org that installed it. Built once at
-/// startup; the PEM-derived signing key is cached for the process lifetime.
+/// The server-side GitHub App client: mints repo-scoped installation tokens
+/// (`contents:read` for fetch, `contents:write` for push), discovering the
+/// installation per repo so a single App serves every org that installed it.
+/// Built once at startup; the PEM-derived signing key is cached for the process
+/// lifetime.
 ///
 /// Minting is gated on the remote's host matching `git_host` (the App's GitHub
 /// host), so a non-GitHub `origin` never drives a lookup and a GitHub token is
 /// never handed to another host's fetch.
-pub struct Minter {
+pub struct GitHubApp {
     client: reqwest::Client,
     api_base: String,
     issuer: String,
@@ -97,8 +99,8 @@ pub struct Minter {
     key: EncodingKey,
 }
 
-impl Minter {
-    /// Build a minter from the environment, or `Ok(None)` when the server is not
+impl GitHubApp {
+    /// Build the App client from the environment, or `Ok(None)` when the server is not
     /// configured for GitHub App auth (`DEVBOX_GITHUB_APP_ID` /
     /// `DEVBOX_GITHUB_KEY_PARAM` unset) so local/dev servers boot without AWS.
     ///
@@ -148,7 +150,7 @@ impl Minter {
     ///
     /// Propagates GitHub API failures (installation lookup, token exchange) and
     /// JWT signing errors.
-    pub async fn mint_for_remote(
+    pub async fn token_for_remote(
         &self,
         remote: &str,
     ) -> Result<Option<(GitHubRepository, String)>> {
@@ -182,14 +184,14 @@ impl Minter {
 
     /// Mint a token scoped to `owner/repo`, discovering the installation per repo.
     /// `write` requests `contents:write` (push); otherwise `contents:read`. Like
-    /// [`Self::mint_for_remote`] but for an already-split repository (no remote URL
+    /// [`Self::token_for_remote`] but for an already-split repository (no remote URL
     /// to parse or host to gate).
     ///
     /// # Errors
     ///
     /// Propagates JWT signing, installation-lookup, and token-exchange failures
     /// (including a 404 when the App is not installed on the repo).
-    pub(crate) async fn mint(&self, owner: &str, repo: &str, write: bool) -> Result<String> {
+    pub(crate) async fn token_for(&self, owner: &str, repo: &str, write: bool) -> Result<String> {
         // The REST API rejects git's `repo.git` remote spelling, which the git
         // reverse proxy forwards verbatim (remote-URL callers come pre-stripped
         // via `parse_remote`).
@@ -324,7 +326,7 @@ fn parse_remote(remote: &str) -> Option<RemoteRef> {
     // Hostnames are case-insensitive, but the `url` crate only lowercases hosts for
     // special schemes (https), not ssh — so an scp-like remote like
     // `git@GitHub.com:owner/repo` keeps its uppercase host. Lowercase it here so the
-    // comparison against the (already-lowercased) App host in `mint_for_remote`
+    // comparison against the (already-lowercased) App host in `token_for_remote`
     // matches.
     let host = url.host_str()?.to_lowercase();
     let mut segments = url.path_segments()?.filter(|segment| !segment.is_empty());
@@ -449,7 +451,7 @@ mod tests {
     #[test]
     fn captures_non_github_host_so_minting_can_be_gated() {
         // A non-GitHub remote parses, but its host won't match the App's git host,
-        // so `mint_for_remote` returns None rather than minting.
+        // so `token_for_remote` returns None rather than minting.
         assert_eq!(
             parsed("https://gitlab.com/smoketurner/devbox.git"),
             Some((

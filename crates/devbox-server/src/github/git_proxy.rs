@@ -19,7 +19,7 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 
-use crate::github::Minter;
+use crate::github::GitHubApp;
 
 /// Longest owner/repo path segment accepted.
 const MAX_SEGMENT_LEN: usize = 100;
@@ -208,26 +208,26 @@ fn is_forwardable_response_header(name: &HeaderName) -> bool {
 }
 
 /// Reverse proxy for git traffic. Owns its own HTTP client (no total timeout, so
-/// long clones stream) and the [`Minter`] used to inject a repo-scoped token per
+/// long clones stream) and the [`GitHubApp`] used to inject a repo-scoped token per
 /// request.
 pub struct GitProxy {
     client: reqwest::Client,
-    minter: Arc<Minter>,
+    app: Arc<GitHubApp>,
 }
 
 impl GitProxy {
-    /// Build a proxy over `minter`.
+    /// Build a proxy over `app`.
     ///
     /// # Errors
     ///
     /// Returns an error when the HTTP client cannot be constructed.
-    pub fn new(minter: Arc<Minter>) -> Result<Self> {
+    pub fn new(app: Arc<GitHubApp>) -> Result<Self> {
         let client = reqwest::Client::builder()
             .user_agent("devbox-server-git-proxy")
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .context("build git-proxy HTTP client")?;
-        Ok(Self { client, minter })
+        Ok(Self { client, app })
     }
 
     /// Mint a token scoped to `target` (write for push, read otherwise) and forward
@@ -245,12 +245,12 @@ impl GitProxy {
         body: Bytes,
     ) -> Result<reqwest::Response> {
         let token = self
-            .minter
-            .mint(&target.owner, &target.repo, target.is_write())
+            .app
+            .token_for(&target.owner, &target.repo, target.is_write())
             .await
             .context("mint repo-scoped token for git proxy")?;
 
-        let url = target.upstream_url(&self.minter.git_base());
+        let url = target.upstream_url(&self.app.git_base());
         let mut builder = self
             .client
             .request(method.clone(), &url)

@@ -1,4 +1,4 @@
-//! Shared git plumbing: credential-helper runner, clone helper, and token minter factory.
+//! Shared git plumbing: credential-helper runner, clone helper, and repo-token resolution against the control plane.
 //!
 //! Both [`crate::freshen`] and [`crate::checkout`] invoke `git` with an optional
 //! short-lived GitHub App token injected via an inline credential helper, wrapped in
