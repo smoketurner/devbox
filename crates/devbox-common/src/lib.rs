@@ -626,40 +626,6 @@ pub struct PoolMetricsResponse {
 }
 
 // ============================================================================
-// Config Structs
-// ============================================================================
-
-/// Server configuration.
-#[derive(Debug, Clone)]
-pub struct ServerConfig {
-    /// Port to listen on.
-    pub port: u16,
-    /// Database URL.
-    pub database_url: String,
-}
-
-/// Database configuration.
-#[derive(Debug, Clone)]
-pub struct DatabaseConfig {
-    /// Database URL (sqlite: or postgres:).
-    pub url: String,
-    /// Maximum pool connections.
-    pub max_connections: u32,
-    /// Minimum idle connections.
-    pub min_connections: u32,
-}
-
-impl Default for DatabaseConfig {
-    fn default() -> Self {
-        Self {
-            url: "sqlite::memory:".to_string(),
-            max_connections: 25,
-            min_connections: 2,
-        }
-    }
-}
-
-// ============================================================================
 // Tests
 // ============================================================================
 

@@ -14,7 +14,6 @@ library — no I/O.
   `DevboxListResponse`, `HealthResponse`, `PoolMetricsResponse`,
   `ProtectedResourceMetadata`. Release takes no body — the owner is the
   authenticated principal, so there is no `ReleaseRequest`.
-- **Config structs** — `ServerConfig`, `DatabaseConfig`.
 
 All types derive `serde::{Serialize, Deserialize}`; the AWS-id newtypes are
 `#[serde(transparent)]`, so they serialize as plain strings. Dependencies are
