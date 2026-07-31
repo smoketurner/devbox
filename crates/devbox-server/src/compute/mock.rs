@@ -116,18 +116,6 @@ impl MockCompute {
         instance_id
     }
 
-    /// Update the lifecycle state of an existing instance.
-    pub fn set_instance_lifecycle_state(&self, id: &str, state: &str) {
-        let mut asg_state = self
-            .asg_state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        if let Some(instance) = asg_state.instances.get_mut(id) {
-            instance.lifecycle_state = state.to_string();
-        }
-    }
-
     /// Inject an error to be returned on the next call to the specified method.
     pub fn set_error(&self, method: &str, error: String) {
         let mut errors = self
