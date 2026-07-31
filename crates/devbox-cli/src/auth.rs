@@ -460,16 +460,6 @@ async fn device_flow_with_retry(
     }
 }
 
-// Make the scope-fallback logic testable without going through HTTP.
-#[cfg(test)]
-fn scope_for_prm(scopes_supported: &[String]) -> String {
-    if scopes_supported.is_empty() {
-        "openid email".to_string()
-    } else {
-        scopes_supported.join(" ")
-    }
-}
-
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "test code")]
 mod tests {
@@ -763,27 +753,6 @@ mod tests {
                 "Server outcome should contain a description"
             );
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // Test 7: empty scopes_supported → falls back to "openid email"
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn scope_fallback_when_empty() {
-        let result = scope_for_prm(&[]);
-        assert_eq!(result, "openid email");
-    }
-
-    #[test]
-    fn scope_uses_server_list_when_present() {
-        let scopes = [
-            "openid".to_string(),
-            "email".to_string(),
-            "profile".to_string(),
-        ];
-        let result = scope_for_prm(&scopes);
-        assert_eq!(result, "openid email profile");
     }
 
     // -----------------------------------------------------------------------
