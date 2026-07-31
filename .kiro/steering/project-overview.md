@@ -12,7 +12,7 @@ Devbox is a Rust workspace with these crates:
 
 | Crate | Role |
 |-------|------|
-| `devbox-common` | Shared types (DevboxId, DevboxState, API request/response types, config) |
+| `devbox-common` | Shared types (DevboxId, DevboxState, API request/response types) |
 | `devbox-server` | Axum HTTP API, database layer (SQLite/DSQL), pool reconciliation, EC2 orchestration |
 | `devbox-cli` | User-facing CLI for claiming, releasing, listing, and inspecting devboxes |
 | `devbox-agent` | On-host binary baked into the AMI: principals resolver, owner-sync, warmup, checkout, doctor |
