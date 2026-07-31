@@ -221,8 +221,6 @@ impl Compute for MockCompute {
             desired_capacity: asg.desired_capacity,
             min_size: asg.min_size,
             max_size: asg.max_size,
-            launch_template_id: None,
-            launch_template_version: None,
             instances,
         })
     }

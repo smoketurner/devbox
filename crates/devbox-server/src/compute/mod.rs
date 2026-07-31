@@ -49,10 +49,6 @@ pub struct AsgDescription {
     pub min_size: u32,
     /// Configured maximum size.
     pub max_size: u32,
-    /// Launch Template ID currently referenced.
-    pub launch_template_id: Option<String>,
-    /// Launch Template version currently referenced.
-    pub launch_template_version: Option<String>,
     /// Instances in the ASG.
     pub instances: Vec<AsgInstance>,
 }
