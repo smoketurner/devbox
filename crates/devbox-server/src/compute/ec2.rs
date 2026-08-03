@@ -65,14 +65,6 @@ impl Compute for Ec2 {
         let max_raw = group.max_size.context("ASG missing max_size")?;
         let max_size = u32::try_from(max_raw).context("max_size is negative")?;
 
-        let (launch_template_id, launch_template_version) =
-            group.launch_template().map_or((None, None), |lt| {
-                (
-                    lt.launch_template_id().map(String::from),
-                    lt.version().map(String::from),
-                )
-            });
-
         let instances = group
             .instances()
             .iter()
@@ -91,8 +83,6 @@ impl Compute for Ec2 {
             desired_capacity,
             min_size,
             max_size,
-            launch_template_id,
-            launch_template_version,
             instances,
         })
     }

@@ -360,31 +360,6 @@ macro_rules! with_dsql_retry {
     }};
 }
 
-/// Execute a sea-query statement that returns no rows against the pool.
-#[macro_export]
-macro_rules! db_execute {
-    ($pool:expr, $stmt:expr) => {
-        match $pool {
-            $crate::db::Pool::Sqlite(p) => {
-                use sea_query_sqlx::SqlxBinder;
-                let (sql, values) = $stmt.build_sqlx(sea_query::SqliteQueryBuilder);
-                sqlx::query_with(sqlx::AssertSqlSafe(sql), values)
-                    .execute(p)
-                    .await
-                    .map($crate::db::pool::QueryResult::from)
-            }
-            $crate::db::Pool::Postgres(p) => {
-                use sea_query_sqlx::SqlxBinder;
-                let (sql, values) = $stmt.build_sqlx(sea_query::PostgresQueryBuilder);
-                sqlx::query_with(sqlx::AssertSqlSafe(sql), values)
-                    .execute(p)
-                    .await
-                    .map($crate::db::pool::QueryResult::from)
-            }
-        }
-    };
-}
-
 /// Fetch all rows from a sea-query statement against the pool.
 #[macro_export]
 macro_rules! db_fetch_all {
