@@ -383,12 +383,12 @@ before releasing.
 ## Related reading
 
 External systems that inform devbox's roadmap — annotated with what we borrow — in
-[`.kiro/references.md`](.kiro/references.md) (WorkOS Project Horizon, Ramp Inspect,
-Stripe Minions, Joe Magerramov's "Disposable Environments, Durable Sessions").
+[`.kiro/references.md`](.kiro/references.md) (e.g. WorkOS Project Horizon, Ramp
+Inspect, Stripe Minions, exe.dev, AWS AgentCore, and others).
 
 ## Source of truth
 
-`.kiro/steering/*` for conventions; this file plus the `devbox-infra` Terraform are
-the source of truth (no active `.kiro/specs/` remain). The access model lives in
-"Access model" above.
+`.kiro/steering/*` for conventions; `.kiro/product.md` for positioning, scope, and
+roadmap; this file plus the `devbox-infra` Terraform are the source of truth (no
+active `.kiro/specs/` remain). The access model lives in "Access model" above.
 **When a doc disagrees with the code, trust the code and fix the doc.**
