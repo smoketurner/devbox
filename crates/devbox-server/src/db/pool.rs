@@ -454,52 +454,6 @@ macro_rules! tx_execute {
     };
 }
 
-/// Fetch all rows from a sea-query statement against a transaction.
-#[macro_export]
-macro_rules! tx_fetch_all {
-    ($tx:expr, $stmt:expr, $row_type:ty) => {
-        match $tx {
-            $crate::db::Transaction::Sqlite(ref mut t) => {
-                use sea_query_sqlx::SqlxBinder;
-                let (sql, values) = $stmt.build_sqlx(sea_query::SqliteQueryBuilder);
-                sqlx::query_as_with::<_, $row_type, _>(sqlx::AssertSqlSafe(sql), values)
-                    .fetch_all(&mut **t)
-                    .await
-            }
-            $crate::db::Transaction::Postgres(ref mut t) => {
-                use sea_query_sqlx::SqlxBinder;
-                let (sql, values) = $stmt.build_sqlx(sea_query::PostgresQueryBuilder);
-                sqlx::query_as_with::<_, $row_type, _>(sqlx::AssertSqlSafe(sql), values)
-                    .fetch_all(&mut **t)
-                    .await
-            }
-        }
-    };
-}
-
-/// Fetch a single row from a sea-query statement against a transaction.
-#[macro_export]
-macro_rules! tx_fetch_one {
-    ($tx:expr, $stmt:expr, $row_type:ty) => {
-        match $tx {
-            $crate::db::Transaction::Sqlite(ref mut t) => {
-                use sea_query_sqlx::SqlxBinder;
-                let (sql, values) = $stmt.build_sqlx(sea_query::SqliteQueryBuilder);
-                sqlx::query_as_with::<_, $row_type, _>(sqlx::AssertSqlSafe(sql), values)
-                    .fetch_one(&mut **t)
-                    .await
-            }
-            $crate::db::Transaction::Postgres(ref mut t) => {
-                use sea_query_sqlx::SqlxBinder;
-                let (sql, values) = $stmt.build_sqlx(sea_query::PostgresQueryBuilder);
-                sqlx::query_as_with::<_, $row_type, _>(sqlx::AssertSqlSafe(sql), values)
-                    .fetch_one(&mut **t)
-                    .await
-            }
-        }
-    };
-}
-
 /// Fetch an optional row from a sea-query statement against a transaction.
 #[macro_export]
 macro_rules! tx_fetch_optional {
