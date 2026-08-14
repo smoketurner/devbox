@@ -104,12 +104,6 @@ struct RawDocumentRow {
     last_used_at: Option<String>,
 }
 
-/// Raw row with just an id column.
-#[derive(sqlx::FromRow)]
-struct IdRow {
-    id: String,
-}
-
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -378,33 +372,6 @@ impl DocumentStore {
             tx.commit().await?;
             Ok(deleted)
         })
-    }
-
-    /// Delete all expired documents.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the database operation fails.
-    pub async fn delete_expired(&self) -> Result<u64> {
-        let now_str = Timestamp::now().to_string();
-
-        // Find expired document IDs
-        let find_stmt = Query::select()
-            .column(Documents::Id)
-            .from(Documents::Table)
-            .and_where(Expr::col(Documents::ExpiresAt).is_not_null())
-            .and_where(Expr::col(Documents::ExpiresAt).lte(now_str.as_str()))
-            .to_owned();
-
-        let rows: Vec<IdRow> = crate::db_fetch_all!(&self.pool, find_stmt, IdRow)?;
-
-        let mut deleted = 0u64;
-        for row in &rows {
-            if self.delete(&row.id).await? {
-                deleted = deleted.saturating_add(1);
-            }
-        }
-        Ok(deleted)
     }
 
     /// Count all documents of a given type.
