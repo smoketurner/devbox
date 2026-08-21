@@ -14,4 +14,3 @@ anyhow = { workspace = true, features = ["std"] }
 jiff = { workspace = true, features = ["std", "serde"] }
 serde = { workspace = true, features = ["std", "derive"] }
 serde_json = { workspace = true, features = ["std"] }
-uuid = { workspace = true, features = ["v7", "serde", "std"] }

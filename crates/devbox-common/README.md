@@ -6,8 +6,8 @@ library — no I/O.
 
 ## Contents
 
-- **Identifiers** — `DevboxId` (UUIDv7) and strongly-typed newtypes over AWS ids:
-  `InstanceType`, `AmiId`, `SubnetId`, `SecurityGroupId`.
+- **Identifiers** — strongly-typed newtypes over AWS ids:
+  `InstanceType`, `AmiId`, `SubnetId`.
 - **`DevboxState`** — the lifecycle enum: `Launching → Warming → Ready → Claimed
   → Terminating`.
 - **API request/response types** — `ClaimRequest`, `DevboxResponse`,
@@ -17,4 +17,4 @@ library — no I/O.
 
 All types derive `serde::{Serialize, Deserialize}`; the AWS-id newtypes are
 `#[serde(transparent)]`, so they serialize as plain strings. Dependencies are
-`serde` + `uuid` only.
+`serde` + `jiff` only.

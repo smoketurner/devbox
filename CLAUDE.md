@@ -102,7 +102,7 @@ Rust workspace, four crates:
 
 | Crate | Role |
 |-------|------|
-| `devbox-common` | Shared types: `DevboxId`, `DevboxState`, API request/response |
+| `devbox-common` | Shared types: `DevboxState`, API request/response |
 | `devbox-server` | Axum API (`/api/v1/devboxes/*`) + HTML dashboard, document store (SQLite dev / Aurora DSQL prod), ASG-adopting pool reconciler, AWS compute layer |
 | `devbox-cli`    | `claim` / `release` / `rename` / `list` / `status` / `ssh` |
 | `devbox-agent`  | On-host binary baked into the AMI: `principals` (sshd resolver), `owner-sync` (provision the claimant's account), `warmup` (self-tags `devbox:ready=true` once warmed), `checkout` (clone repos into `/workspace`), `doctor` (diagnose warm-cache delivery). musl static; built/released by CI, downloaded into the golden AMI |

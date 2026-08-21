@@ -1117,7 +1117,6 @@ dependencies = [
  "jiff",
  "serde",
  "serde_json",
- "uuid",
 ]
 
 [[package]]
