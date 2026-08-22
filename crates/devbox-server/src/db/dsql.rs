@@ -167,16 +167,6 @@ impl DsqlEndpoint {
         }
     }
 
-    /// The DSQL cluster ID, if this is a VPC endpoint connection.
-    #[must_use]
-    #[allow(dead_code, reason = "used in VPC endpoint scenarios")]
-    pub(crate) fn cluster_id(&self) -> Option<&str> {
-        match self {
-            Self::Direct { .. } => None,
-            Self::VpcEndpoint { cluster_id, .. } => Some(cluster_id),
-        }
-    }
-
     /// Connection options required for DSQL to identify the cluster.
     #[must_use]
     pub(crate) fn pg_options(&self) -> Option<(&str, &str)> {
@@ -265,7 +255,6 @@ mod tests {
         assert_eq!(ep.token_hostname(), "abc123.dsql.us-east-1.on.aws");
         assert_eq!(ep.region(), "us-east-1");
         assert!(matches!(ep.ssl_mode(), PgSslMode::VerifyFull));
-        assert!(ep.cluster_id().is_none());
         assert!(ep.pg_options().is_none());
     }
 
@@ -281,7 +270,6 @@ mod tests {
         assert_eq!(ep.token_hostname(), "mycluster.dsql-fnh4.us-east-1.on.aws");
         assert_eq!(ep.region(), "us-east-1");
         assert!(matches!(ep.ssl_mode(), PgSslMode::Require));
-        assert_eq!(ep.cluster_id(), Some("mycluster"));
     }
 
     #[test]
