@@ -4,40 +4,6 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
-// DevboxId
-// ============================================================================
-
-/// A unique identifier for a devbox instance, wrapping a UUIDv7 string.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct DevboxId(pub String);
-
-impl DevboxId {
-    /// Generate a new DevboxId using UUIDv7.
-    #[must_use]
-    pub fn new() -> Self {
-        Self(uuid::Uuid::now_v7().to_string())
-    }
-
-    /// Get the inner string value.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Default for DevboxId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl std::fmt::Display for DevboxId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-// ============================================================================
 // InstanceType
 // ============================================================================
 
@@ -113,33 +79,6 @@ impl From<String> for SubnetId {
 }
 
 impl AsRef<str> for SubnetId {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-// ============================================================================
-// SecurityGroupId
-// ============================================================================
-
-/// A strongly-typed security group ID (e.g., "sg-0123456789abcdef0").
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct SecurityGroupId(pub String);
-
-impl std::fmt::Display for SecurityGroupId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl From<String> for SecurityGroupId {
-    fn from(s: String) -> Self {
-        Self(s)
-    }
-}
-
-impl AsRef<str> for SecurityGroupId {
     fn as_ref(&self) -> &str {
         &self.0
     }
@@ -638,18 +577,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_devbox_id_new() {
-        let id = DevboxId::new();
-        assert!(!id.0.is_empty());
-    }
-
-    #[test]
-    fn test_devbox_id_display() {
-        let id = DevboxId("test-id-123".to_string());
-        assert_eq!(id.to_string(), "test-id-123");
-    }
-
-    #[test]
     fn test_devbox_state_serde_roundtrip() {
         let states = vec![
             DevboxState::Launching,
@@ -680,14 +607,6 @@ mod tests {
         assert_eq!(DevboxState::Ready.to_string(), "ready");
         assert_eq!(DevboxState::Claimed.to_string(), "claimed");
         assert_eq!(DevboxState::Terminating.to_string(), "terminating");
-    }
-
-    #[test]
-    fn test_devbox_id_serde_roundtrip() {
-        let id = DevboxId("abc-123".to_string());
-        let json = serde_json::to_string(&id).unwrap();
-        let parsed: DevboxId = serde_json::from_str(&json).unwrap();
-        assert_eq!(id, parsed);
     }
 
     #[test]
@@ -763,15 +682,6 @@ mod tests {
         assert_eq!(json, "\"subnet-abcdef\"");
         let parsed: SubnetId = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, subnet);
-    }
-
-    #[test]
-    fn test_security_group_id_serde_transparent() {
-        let sg = SecurityGroupId("sg-abcdef0123456789".to_string());
-        let json = serde_json::to_string(&sg).unwrap();
-        assert_eq!(json, "\"sg-abcdef0123456789\"");
-        let parsed: SecurityGroupId = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, sg);
     }
 
     #[test]
