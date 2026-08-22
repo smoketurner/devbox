@@ -26,11 +26,10 @@ enum Documents {
     CreatedAt,
     UpdatedAt,
     Version,
-    LastUsedAt,
 }
 
 /// All document columns for SELECT statements.
-const DOC_COLUMNS: [Documents; 9] = [
+const DOC_COLUMNS: [Documents; 8] = [
     Documents::Id,
     Documents::DocType,
     Documents::SchemaVersion,
@@ -39,11 +38,10 @@ const DOC_COLUMNS: [Documents; 9] = [
     Documents::CreatedAt,
     Documents::UpdatedAt,
     Documents::Version,
-    Documents::LastUsedAt,
 ];
 
 /// All document columns qualified with the table name, for joins.
-const DOC_TABLE_COLUMNS: [(Documents, Documents); 9] = [
+const DOC_TABLE_COLUMNS: [(Documents, Documents); 8] = [
     (Documents::Table, Documents::Id),
     (Documents::Table, Documents::DocType),
     (Documents::Table, Documents::SchemaVersion),
@@ -52,7 +50,6 @@ const DOC_TABLE_COLUMNS: [(Documents, Documents); 9] = [
     (Documents::Table, Documents::CreatedAt),
     (Documents::Table, Documents::UpdatedAt),
     (Documents::Table, Documents::Version),
-    (Documents::Table, Documents::LastUsedAt),
 ];
 
 #[derive(Iden)]
@@ -101,7 +98,6 @@ struct RawDocumentRow {
     created_at: String,
     updated_at: String,
     version: i32,
-    last_used_at: Option<String>,
 }
 
 // ============================================================================
@@ -142,11 +138,6 @@ fn raw_to_document<T: DocumentType>(row: RawDocumentRow) -> Result<Document<T>> 
         .map(|s| s.parse::<Timestamp>())
         .transpose()
         .context("failed to parse expires_at timestamp")?;
-    let last_used_at = row
-        .last_used_at
-        .map(|s| s.parse::<Timestamp>())
-        .transpose()
-        .context("failed to parse last_used_at timestamp")?;
 
     Ok(Document {
         id: row.id,
@@ -155,7 +146,6 @@ fn raw_to_document<T: DocumentType>(row: RawDocumentRow) -> Result<Document<T>> 
         updated_at,
         expires_at,
         version: row.version,
-        last_used_at,
     })
 }
 
@@ -461,7 +451,6 @@ impl StoreTransaction<'_> {
                 now_str.as_str().into(),
                 now_str.as_str().into(),
                 1_i32.into(),
-                Option::<&str>::None.into(),
             ])?
             .to_owned();
 
@@ -483,7 +472,6 @@ impl StoreTransaction<'_> {
             updated_at: now,
             expires_at: doc.expires_at(),
             version: 1,
-            last_used_at: None,
         })
     }
 
@@ -584,7 +572,6 @@ impl StoreTransaction<'_> {
                 now_str.as_str().into(),
                 now_str.as_str().into(),
                 1_i32.into(),
-                Option::<&str>::None.into(),
             ])?
             .on_conflict(OnConflict::column(Documents::Id).do_nothing().to_owned())
             .to_owned();
@@ -738,7 +725,6 @@ mod tests {
             created_at: "2024-01-01T00:00:00Z".to_string(),
             updated_at: "2024-01-01T00:00:00Z".to_string(),
             version: 1,
-            last_used_at: None,
         }
     }
 

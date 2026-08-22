@@ -75,6 +75,4 @@ pub struct Document<T> {
     pub expires_at: Option<Timestamp>,
     /// Optimistic concurrency version. Incremented on every update.
     pub version: i32,
-    /// Lightweight last-used timestamp.
-    pub last_used_at: Option<Timestamp>,
 }
