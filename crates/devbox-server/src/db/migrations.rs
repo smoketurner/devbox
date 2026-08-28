@@ -7,17 +7,13 @@
 use anyhow::{Context, Result};
 use sqlx::PgPool;
 
-/// Result of running migrations: (newly_applied, total).
-pub(crate) type MigrationResult = (usize, usize);
-
 /// Run PostgreSQL migrations with DSQL compatibility.
 ///
 /// # Errors
 ///
 /// Returns an error if a migration fails to apply.
-pub async fn run_dsql_migrations(pool: &PgPool) -> Result<MigrationResult> {
+pub async fn run_dsql_migrations(pool: &PgPool) -> Result<()> {
     let migrator = sqlx::migrate!("./migrations/postgres");
-    let total = migrator.iter().count();
 
     create_migrations_table(pool).await?;
 
@@ -28,8 +24,6 @@ pub async fn run_dsql_migrations(pool: &PgPool) -> Result<MigrationResult> {
             .context("failed to query applied migrations")?;
 
     let applied_set: std::collections::HashSet<i64> = applied.into_iter().collect();
-
-    let mut newly_applied: usize = 0;
 
     for migration in migrator.iter() {
         let version = migration.version;
@@ -64,11 +58,9 @@ pub async fn run_dsql_migrations(pool: &PgPool) -> Result<MigrationResult> {
         record_migration(pool, migration, elapsed)
             .await
             .with_context(|| format!("failed to record migration {}", version))?;
-
-        newly_applied = newly_applied.saturating_add(1);
     }
 
-    Ok((newly_applied, total))
+    Ok(())
 }
 
 /// Run SQLite migrations using the embedded migrator.
