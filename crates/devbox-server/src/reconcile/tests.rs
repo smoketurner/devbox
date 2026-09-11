@@ -237,7 +237,10 @@ mod reconcile_tests {
         let past = Timestamp::from_second(0).unwrap(); // 1970-01-01 — well past 60s timeout
         let mut aged_data = doc.data.clone();
         aged_data.created_at = past;
-        store.compare_and_update(&doc_id, doc.version, &aged_data).await.unwrap();
+        store
+            .compare_and_update(&doc_id, doc.version, &aged_data)
+            .await
+            .unwrap();
 
         // Tick 2: reaper flips doc to Terminating (no AWS call yet).
         // step 6 uses the pre-reap all_docs snapshot (Warming) → skips terminate.

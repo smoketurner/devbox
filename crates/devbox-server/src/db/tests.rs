@@ -491,7 +491,10 @@ mod store_tests {
         let mut updated = inserted.data.clone();
         updated.state = DevboxState::Claimed;
         updated.owner = Some("user@test.com".to_string());
-        store.compare_and_update(&inserted.id, inserted.version, &updated).await.unwrap();
+        store
+            .compare_and_update(&inserted.id, inserted.version, &updated)
+            .await
+            .unwrap();
 
         // No longer findable by "ready" state
         let found = store.find_one::<DevboxDoc>("state", "ready").await.unwrap();
@@ -530,7 +533,10 @@ mod store_tests {
 
         let mut updated = inserted.data.clone();
         updated.state = DevboxState::Claimed;
-        store.compare_and_update(&inserted.id, inserted.version, &updated).await.unwrap();
+        store
+            .compare_and_update(&inserted.id, inserted.version, &updated)
+            .await
+            .unwrap();
 
         let found = store
             .find_one::<DevboxDoc>("name", "calm-quilt")
