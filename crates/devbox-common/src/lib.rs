@@ -18,12 +18,6 @@ impl std::fmt::Display for InstanceType {
     }
 }
 
-impl From<String> for InstanceType {
-    fn from(s: String) -> Self {
-        Self(s)
-    }
-}
-
 impl AsRef<str> for InstanceType {
     fn as_ref(&self) -> &str {
         &self.0
@@ -45,12 +39,6 @@ impl std::fmt::Display for AmiId {
     }
 }
 
-impl From<String> for AmiId {
-    fn from(s: String) -> Self {
-        Self(s)
-    }
-}
-
 impl AsRef<str> for AmiId {
     fn as_ref(&self) -> &str {
         &self.0
@@ -69,12 +57,6 @@ pub struct SubnetId(pub String);
 impl std::fmt::Display for SubnetId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
-    }
-}
-
-impl From<String> for SubnetId {
-    fn from(s: String) -> Self {
-        Self(s)
     }
 }
 
@@ -121,12 +103,6 @@ impl InstanceId {
 impl std::fmt::Display for InstanceId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
-    }
-}
-
-impl From<String> for InstanceId {
-    fn from(s: String) -> Self {
-        Self(s)
     }
 }
 
