@@ -312,19 +312,6 @@ impl DocumentStore {
     // Update
     // ========================================================================
 
-    /// Update a document's data by ID.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if serialization or the database write fails.
-    pub async fn update<T: DocumentType>(&self, id: &str, doc: &T) -> Result<()> {
-        crate::with_dsql_retry!(async {
-            let mut tx = self.begin().await?;
-            tx.update(id, doc).await?;
-            tx.commit().await
-        })
-    }
-
     /// Conditionally update a document only if its version matches.
     ///
     /// Returns `true` if the update succeeded, `false` on version mismatch.
@@ -473,50 +460,6 @@ impl StoreTransaction<'_> {
             expires_at: doc.expires_at(),
             version: 1,
         })
-    }
-
-    /// Update a document within the transaction.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if serialization or the database write fails.
-    pub async fn update<T: DocumentType>(&mut self, id: &str, doc: &T) -> Result<()> {
-        let json = serde_json::to_string(doc).context("failed to serialize document")?;
-        let now_str = Timestamp::now().to_string();
-        let expires_str = doc.expires_at().map(|ts| ts.to_string());
-        let expires_ref: Option<&str> = expires_str.as_deref();
-        let indexes = doc.index_entries();
-
-        let update_stmt = {
-            let mut q = Query::update();
-            q.table(Documents::Table)
-                .value(Documents::Data, Expr::val(json.as_str()))
-                .value(Documents::ExpiresAt, Expr::val(expires_ref))
-                .value(
-                    Documents::SchemaVersion,
-                    Expr::val(T::CURRENT_VERSION.cast_signed()),
-                )
-                .value(Documents::UpdatedAt, Expr::val(now_str.as_str()))
-                .value(Documents::Version, Expr::col(Documents::Version).add(1))
-                .and_where(Expr::col(Documents::Id).eq(id));
-            q.to_owned()
-        };
-
-        crate::tx_execute!(self.tx, update_stmt)?;
-
-        // Rebuild indexes
-        let delete_idx_stmt = Query::delete()
-            .from_table(DocumentIndexes::Table)
-            .and_where(Expr::col(DocumentIndexes::DocumentId).eq(id))
-            .to_owned();
-        crate::tx_execute!(self.tx, delete_idx_stmt)?;
-
-        for entry in &indexes {
-            let idx_stmt = build_index_insert(id, entry)?;
-            crate::tx_execute!(self.tx, idx_stmt)?;
-        }
-
-        Ok(())
     }
 
     /// Get a document by ID within the transaction.

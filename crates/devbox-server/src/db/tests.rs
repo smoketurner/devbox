@@ -107,25 +107,6 @@ mod store_tests {
     }
 
     #[tokio::test]
-    async fn test_update() {
-        let store = setup_store().await;
-        let doc = sample_devbox();
-
-        let inserted = store.insert(&doc).await.unwrap();
-
-        let mut updated_doc = inserted.data.clone();
-        updated_doc.state = DevboxState::Claimed;
-        updated_doc.owner = Some("user@example.com".to_string());
-
-        store.update(&inserted.id, &updated_doc).await.unwrap();
-
-        let fetched = store.get::<DevboxDoc>(&inserted.id).await.unwrap().unwrap();
-        assert_eq!(fetched.data.state, DevboxState::Claimed);
-        assert_eq!(fetched.data.owner, Some("user@example.com".to_string()));
-        assert_eq!(fetched.version, 2);
-    }
-
-    #[tokio::test]
     async fn test_compare_and_update_success() {
         let store = setup_store().await;
         let doc = sample_devbox();
@@ -510,7 +491,10 @@ mod store_tests {
         let mut updated = inserted.data.clone();
         updated.state = DevboxState::Claimed;
         updated.owner = Some("user@test.com".to_string());
-        store.update(&inserted.id, &updated).await.unwrap();
+        store
+            .compare_and_update(&inserted.id, inserted.version, &updated)
+            .await
+            .unwrap();
 
         // No longer findable by "ready" state
         let found = store.find_one::<DevboxDoc>("state", "ready").await.unwrap();
@@ -549,7 +533,10 @@ mod store_tests {
 
         let mut updated = inserted.data.clone();
         updated.state = DevboxState::Claimed;
-        store.update(&inserted.id, &updated).await.unwrap();
+        store
+            .compare_and_update(&inserted.id, inserted.version, &updated)
+            .await
+            .unwrap();
 
         let found = store
             .find_one::<DevboxDoc>("name", "calm-quilt")
