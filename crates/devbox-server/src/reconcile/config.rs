@@ -58,18 +58,6 @@ impl ReconcilerConfig {
     }
 }
 
-impl Default for ReconcilerConfig {
-    fn default() -> Self {
-        Self {
-            pool_id: "default".to_string(),
-            server_id: uuid::Uuid::now_v7().to_string(),
-            polling_interval: Duration::from_secs(30),
-            lock_ttl: Duration::from_secs(60),
-            ready_timeout: Duration::from_secs(300),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
