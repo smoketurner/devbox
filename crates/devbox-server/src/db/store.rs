@@ -333,24 +333,6 @@ impl DocumentStore {
         })
     }
 
-    // ========================================================================
-    // Delete
-    // ========================================================================
-
-    /// Delete a document by ID.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the database write fails.
-    pub async fn delete(&self, id: &str) -> Result<bool> {
-        crate::with_dsql_retry!(async {
-            let mut tx = self.begin().await?;
-            let deleted = tx.delete(id).await?;
-            tx.commit().await?;
-            Ok(deleted)
-        })
-    }
-
     /// Count all documents of a given type.
     ///
     /// # Errors

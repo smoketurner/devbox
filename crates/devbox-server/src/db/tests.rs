@@ -425,28 +425,6 @@ mod store_tests {
     }
 
     #[tokio::test]
-    async fn test_delete() {
-        let store = setup_store().await;
-        let doc = sample_devbox();
-
-        let inserted = store.insert(&doc).await.unwrap();
-
-        let deleted = store.delete(&inserted.id).await.unwrap();
-        assert!(deleted);
-
-        let fetched = store.get::<DevboxDoc>(&inserted.id).await.unwrap();
-        assert!(fetched.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_delete_nonexistent() {
-        let store = setup_store().await;
-
-        let deleted = store.delete("nonexistent-id").await.unwrap();
-        assert!(!deleted);
-    }
-
-    #[tokio::test]
     async fn test_list_all() {
         let store = setup_store().await;
 
