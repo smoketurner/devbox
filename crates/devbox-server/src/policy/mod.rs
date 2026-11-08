@@ -1,48 +1,75 @@
-//! Egress policy decision point backed by a native, in-crate rule engine.
+//! Egress policy decision point backed by the Dogwood policy language.
 //!
-//! This module implements a small permit/forbid evaluator tailored to the
-//! devbox egress gates. It wraps the rule set behind a devbox-specific API —
-//! [`EgressPolicy`] — that the CONNECT host gate ([`crate::egress`]) and the
-//! method/path-aware reverse proxy ([`crate::egress_proxy`]) consume as a stable
-//! internal interface.
+//! This module adopts the published [`dogwood_language`] crate (Apache-2.0,
+//! from the `dogwood-policy` org) as the egress policy language and evaluation
+//! backend, rather than hand-rolling a permit/forbid evaluator. It wraps
+//! Dogwood behind a small, devbox-specific API — [`EgressPolicy`] — that the
+//! CONNECT host gate ([`crate::egress`]) and the method/path-aware reverse
+//! proxy ([`crate::egress_proxy`]) consume as a stable internal interface.
+//!
+//! # No local engine
+//!
+//! `dogwood-language` 1.1.0 ships its own built-in, engine-free
+//! [`Authorizer`](dogwood_language::Authorizer) assembled from two default
+//! backends: a local `CedarPolicyEngine` that makes the decision and an
+//! in-memory `InMemoryTemporalEngine`. devbox therefore depends only on
+//! `dogwood-language` — there is no `dogwood-local-engine`, no durable/redb
+//! event store, and no persisted temporal history. The previous durable
+//! `DurableTemporalEngine` and the `formerly within <dur>` temporal history it
+//! fed were tested-only and never wired into a production decision path, so
+//! they are dropped.
 //!
 //! # Model
 //!
-//! A policy is an ordered list of [`Rule`]s. Each rule has an [`Effect`]
-//! (`Permit`/`Forbid`), a target [`Action`] (`Connect` or `HttpRequest`), an
-//! exact-match `host`, optional exact-match `method`/`path` (HTTP only), and an
-//! `id` used as the decision reason string. Evaluation is **default-deny** (a
-//! request matching no `permit` is denied) and **forbid overrides permit** (a
-//! single matching `forbid` denies regardless of any permit).
+//! Dogwood is Cedar-derived: a [`SCHEMA`] declares a namespace with `entity`
+//! items (a `Box` principal and a `Gateway` resource) and `action` items
+//! (`Connect` and `HttpRequest`) each carrying a `context` input type. Policies
+//! are `permit`/`forbid` rules; evaluation is default-deny and `forbid`
+//! overrides `permit`. Each decision builds a request [`Event`] and asks a
+//! fresh [`Authorizer`](dogwood_language::Authorizer) for a verdict.
 //!
-//! Matching is exact string equality on `host` (Connect) and on
-//! `host` + `method` + `path` (HttpRequest). Because matching compares plain
-//! Rust strings, a crafted instance id or host cannot "break out" of the matcher
-//! the way a string interpolated into a policy DSL could — there is no DSL to
-//! inject into.
+//! A policy here is assembled as Dogwood `.dw` source: generated
+//! `@id`-annotated `permit`-`Connect` rules (one per allowlist host), an
+//! optional caller-supplied custom `.dw` source, and generated
+//! `@id`-annotated `permit`-`HttpRequest` rules compiled from the inline
+//! `EGRESS_UPSTREAMS` integration scoping ([`PolicyRule`]). The source and a
+//! side list of rule ids (in the SAME order the rules appear in the source)
+//! are retained; each decision re-lowers the source and builds a fresh
+//! `Authorizer`.
+//!
+//! # Fresh authorizer per decision
+//!
+//! [`Authorizer::is_authorized`](dogwood_language::Authorizer::is_authorized)
+//! takes `&mut self` and is stateful (it folds each event into accumulated
+//! temporal history and assumes strictly-increasing timestamps). Since devbox
+//! keeps no temporal history, each `decide_*` call builds a FRESH `Authorizer`
+//! from the retained lowered policy set, feeds it exactly one `request` event
+//! at timestamp `0`, and drops it. This removes all cross-request temporal
+//! bleed and any monotonic-timestamp bookkeeping, and keeps the decision
+//! methods synchronous and lock-free (nothing is ever held across an `.await`).
 //!
 //! # Fail-closed
 //!
-//! Every non-matching request, and every request for an action the policy does
-//! not cover, is a **deny**. The embedding proxy enforces the verdict; this
-//! decision point never fails open.
+//! Every lowering/validation error, every evaluation error, and every
+//! non-decision outcome is treated as a **deny**. The embedding proxy enforces
+//! the verdict; this decision point never fails open.
 //!
 //! # Host normalization and the allowlist bridge
 //!
 //! Every host — whether it comes from `EGRESS_ALLOWLIST`, a request, or a
-//! compiled integration rule ([`normalize_host`]) — is normalized the **same**
-//! way before it is stored or matched: trimmed, dot-stripped, and lowercased
-//! ([`normalize_host`]). Both sides of every comparison are normalized through
-//! that one function, so a host containing uppercase (e.g. `API.Example.com`)
-//! can never silently fail to match its own rule.
+//! compiled integration rule — is normalized the **same** way before it is
+//! rendered into a rule or matched ([`normalize_host`]: trim, strip dots,
+//! lowercase). Both sides of every comparison flow through that one function,
+//! so a host containing uppercase (e.g. `API.Example.com`) can never silently
+//! fail to match its own rule.
 //!
-//! Hosts are matched by exact equality, so the dynamic host allowlist (legacy
-//! `EGRESS_ALLOWLIST`) is bridged two ways working together: the configured
-//! hosts are rendered into generated `permit`-`Connect` rules (one per host),
-//! and the egress dot-boundary subdomain semantics are applied by
-//! [`normalize_to_allowed_host`] *before* matching, so a subdomain of a
-//! permitted host is decided against its parent exactly as today's
-//! [`crate::egress`] `Allowlist` does.
+//! Dogwood matches `context.input.host` by exact string equality, so the
+//! dynamic host allowlist (legacy `EGRESS_ALLOWLIST`) is bridged two ways
+//! working together: the configured hosts are rendered into generated
+//! `permit`-`Connect` rules (one per host), and the egress dot-boundary
+//! subdomain semantics are applied by [`normalize_to_allowed_host`] *before*
+//! the policy call, so a subdomain of a permitted host is decided against its
+//! parent exactly as today's [`crate::egress`] `Allowlist` does.
 //!
 //! ## Allowlist folding never rewrites a host that has its own rule
 //!
@@ -53,46 +80,44 @@
 //! `example.com`, integration host `api.example.com`) would be folded onto
 //! `example.com` before matching and would never match its own
 //! `permit`-`HttpRequest` rule. So folding is applied only when the normalized
-//! request host does not already equal some rule's (normalized) host: an
-//! integration's configured host is always matched as-is, and only genuinely
-//! uncovered subdomains are folded onto an allowlist parent. This keeps the
-//! policy's view of a host and the transport's forward target guaranteed
-//! identical.
-//!
-//! # Custom policy source (`EGRESS_POLICY_PATH`)
-//!
-//! The custom-policy escape hatch loads a **JSON** document (replacing the
-//! removed Dogwood/Cedar `.dw` syntax). The document is a JSON array of rule
-//! objects:
-//!
-//! ```json
-//! [
-//!   { "effect": "permit", "action": "connect", "host": "crates.io", "id": "allow_crates" },
-//!   {
-//!     "effect": "permit",
-//!     "action": "http_request",
-//!     "host": "api.anthropic.com",
-//!     "method": "POST",
-//!     "path": "/v1/messages",
-//!     "id": "allow_messages"
-//!   },
-//!   { "effect": "forbid", "action": "connect", "host": "blocked.example.com" }
-//! ]
-//! ```
-//!
-//! Field reference:
-//! - `effect`: `"permit"` or `"forbid"` (required).
-//! - `action`: `"connect"` or `"http_request"` (required).
-//! - `host`: exact host to match (required).
-//! - `method`, `path`: optional exact matches; only meaningful for
-//!   `http_request` rules. When omitted, any method/path matches.
-//! - `id`: optional annotation surfaced in the decision reason. Defaults to the
-//!   rule's effect name when omitted.
-//!
-//! This is a deliberate, documented behaviour change from the previous
-//! Dogwood-based `.dw` source. The temporal `formerly within <dur>` clause the
-//! old engine supported is **not** reimplemented: it was tested-only and never
-//! wired into any production decision path, so it is dropped.
+//! request host does not already equal some rule's host: an integration's
+//! configured host is always matched as-is, and only genuinely uncovered
+//! subdomains are folded onto an allowlist parent.
+
+use dogwood_language::{
+    Authorizer, Decision, Event, LoweredPolicySet, PolicySchema, ServiceSchema, Value,
+};
+
+/// The egress gateway schema (Cedar `.cedarschema` fed to
+/// [`PolicySchema::from_cedarschema_str`]).
+///
+/// Field names here are the stable contract the decision builders build events
+/// against: `Connect` carries `context.input.host`; `HttpRequest` carries
+/// `context.input.host`, `context.input.method`, and `context.input.path`.
+pub const SCHEMA: &str = r#"
+namespace Egress {
+  entity Box = { instance_id: String };
+  entity Gateway;
+  action "Connect" appliesTo {
+    principal: [Box],
+    resource: [Gateway],
+    context: { input: { host: String } }
+  };
+  action "HttpRequest" appliesTo {
+    principal: [Box],
+    resource: [Gateway],
+    context: { input: { host: String, method: String, path: String } }
+  };
+}
+"#;
+
+/// The action-type path for this schema's actions (the `Action` component
+/// included), used with [`Event::builder_for`] so hosts/methods/paths that
+/// contain `:` never get mangled by the combined-string parser.
+const ACTION_NAMESPACE: &[&str] = &["Egress", "Action"];
+
+/// The `Gateway` resource every egress event acts on.
+const GATEWAY_UID: &str = "Egress::Gateway::\"egress\"";
 
 /// The decision returned by the egress policy: an allow/deny plus a human
 /// reason suitable for a decision record or a debug log line.
@@ -122,71 +147,31 @@ impl EgressDecision {
     }
 }
 
-/// A rule effect: whether a matching rule permits or forbids the request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum Effect {
-    /// Allow a matching request (unless a `Forbid` also matches).
-    Permit,
-    /// Deny a matching request; overrides any `Permit`.
-    Forbid,
-}
-
-/// The egress action a rule targets.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum Action {
-    /// A CONNECT tunnel to a host (host-only matching).
-    Connect,
-    /// A reverse-proxied HTTP request (host + optional method/path matching).
-    HttpRequest,
-}
-
-/// A single egress policy rule.
-///
-/// `method`/`path` are only consulted for [`Action::HttpRequest`] rules; when
-/// `None` they match any method/path. The `id` is surfaced as the decision
-/// reason so [`crate::egress::DecisionRecord`] reasons stay meaningful.
-#[derive(Clone, Debug, serde::Deserialize)]
-struct Rule {
-    /// Permit or forbid.
-    effect: Effect,
-    /// The action this rule applies to.
-    action: Action,
-    /// The exact host this rule matches.
-    host: String,
-    /// Optional exact method match (HTTP only).
-    #[serde(default)]
-    method: Option<String>,
-    /// Optional exact path match (HTTP only).
-    #[serde(default)]
-    path: Option<String>,
-    /// Optional annotation surfaced in the decision reason.
-    #[serde(default)]
-    id: Option<String>,
-}
-
 /// A policy rule constructed programmatically by another module (rather than
-/// parsed from a JSON source), used to compile per-integration method/path
+/// parsed from a Dogwood source), used to compile per-integration method/path
 /// scoping into the shared policy (see [`EgressPolicy::extend_rules`]).
 ///
-/// This is the public, constructable mirror of the private [`Rule`]: callers
-/// outside this module cannot name `Rule`/`Effect`/`Action` directly, so they
-/// build a `PolicyRule` through [`PolicyRule::permit_http`] and the policy
-/// converts it internally.
+/// It is compiled into a generated `@id`-annotated `permit`-`HttpRequest`
+/// Dogwood rule appended to the policy source. The `host` is normalized through
+/// [`normalize_host`] — the **same** normalization applied to request hosts
+/// before matching — so a configured integration host containing uppercase
+/// still matches the lowercased request host.
 #[derive(Clone, Debug)]
 pub struct PolicyRule {
-    rule: Rule,
+    /// The exact (normalized) host this rule permits.
+    host: String,
+    /// The exact HTTP method this rule permits.
+    method: String,
+    /// Optional exact path; `None` permits any path on the host for the method.
+    path: Option<String>,
+    /// The annotation surfaced in the decision reason.
+    id: String,
 }
 
 impl PolicyRule {
-    /// A `permit` rule for an HTTP request to `host` scoped to `method` and, when
-    /// `path` is `Some`, that exact `path` (a `None` path permits any path on the
-    /// host for that method). `id` is surfaced in the decision reason.
-    /// The `host` is normalized through [`normalize_host`] (trim, strip dots,
-    /// lowercase) — the **same** normalization applied to request hosts before
-    /// matching — so a configured integration host containing uppercase still
-    /// matches the lowercased request host.
+    /// A `permit` rule for an HTTP request to `host` scoped to `method` and,
+    /// when `path` is `Some`, that exact `path` (a `None` path permits any path
+    /// on the host for that method). `id` is surfaced in the decision reason.
     pub fn permit_http(
         host: impl Into<String>,
         method: impl Into<String>,
@@ -194,61 +179,57 @@ impl PolicyRule {
         id: impl Into<String>,
     ) -> Self {
         Self {
-            rule: Rule {
-                effect: Effect::Permit,
-                action: Action::HttpRequest,
-                host: normalize_host(&host.into()),
-                method: Some(method.into()),
-                path,
-                id: Some(id.into()),
-            },
+            host: normalize_host(&host.into()),
+            method: method.into(),
+            path,
+            id: id.into(),
         }
     }
 
-    /// Consume into the private internal [`Rule`].
-    fn into_rule(self) -> Rule {
-        self.rule
-    }
-}
-
-impl Rule {
-    /// Whether this rule matches a `Connect` request to `host`.
-    fn matches_connect(&self, host: &str) -> bool {
-        matches!(self.action, Action::Connect) && self.host == host
-    }
-
-    /// Whether this rule matches an `HttpRequest` to `host`/`method`/`path`.
-    /// An absent `method`/`path` on the rule is a wildcard for that field.
-    fn matches_http(&self, host: &str, method: &str, path: &str) -> bool {
-        matches!(self.action, Action::HttpRequest)
-            && self.host == host
-            && self.method.as_deref().is_none_or(|m| m == method)
-            && self.path.as_deref().is_none_or(|p| p == path)
-    }
-
-    /// The reason string for a decision attributed to this rule.
-    fn reason(&self) -> String {
-        match &self.id {
-            Some(id) => id.clone(),
-            None => match self.effect {
-                Effect::Permit => "permit".to_string(),
-                Effect::Forbid => "forbid".to_string(),
-            },
+    /// Render this rule as an `@id`-annotated `permit`-`HttpRequest` Dogwood
+    /// rule. Host/method/path are interpolated as escaped Cedar string literals.
+    fn to_dw(&self) -> String {
+        let mut conditions = format!(
+            "context.input.host == \"{}\" &&\n  context.input.method == \"{}\"",
+            escape_cedar_str(&self.host),
+            escape_cedar_str(&self.method),
+        );
+        if let Some(path) = &self.path {
+            conditions.push_str(&format!(
+                " &&\n  context.input.path == \"{}\"",
+                escape_cedar_str(path),
+            ));
         }
+        format!(
+            "@id(\"{}\")\n\
+             permit (principal, action == Egress::Action::\"HttpRequest\", resource)\n\
+             when {{\n  {conditions}\n}};\n\n",
+            escape_cedar_str(&self.id),
+        )
     }
 }
 
-/// The egress policy decision point: an ordered rule set plus the normalized
-/// host allowlist used to map subdomains onto their permitted parent before
-/// matching.
+/// The egress policy decision point: a lowered Dogwood policy set plus the
+/// normalized host allowlist used to map subdomains onto their permitted parent
+/// before the policy call.
 ///
-/// The decision methods are synchronous and lock-free: evaluation only reads the
-/// immutable rule set, so decisions are cheap and never held across an `.await`.
+/// A fresh [`Authorizer`](dogwood_language::Authorizer) is built from the
+/// retained `(policy_src, rule_ids)` for each decision, so the methods are
+/// synchronous and lock-free and there is no temporal state to leak between
+/// unrelated decisions.
 pub struct EgressPolicy {
-    rules: Vec<Rule>,
+    /// The full Dogwood `.dw` policy source (generated + custom rules).
+    policy_src: String,
+    /// Rule ids in the SAME order the rules appear in `policy_src`, keyed by a
+    /// [`DogwoodRuleRef`](dogwood_language::DogwoodRuleRef)'s `rule_index`, used
+    /// to recover the `@id` reason (the rule ref carries no annotation).
+    rule_ids: Vec<String>,
     /// Normalized allowlist entries, used only to fold a subdomain onto its
-    /// permitted parent host before matching.
+    /// permitted parent host before the policy call.
     allow_hosts: Vec<String>,
+    /// Hosts that are the subject of an explicit rule, used to ensure allowlist
+    /// folding never rewrites a host out from under its own rule.
+    rule_hosts: Vec<String>,
 }
 
 impl EgressPolicy {
@@ -258,86 +239,168 @@ impl EgressPolicy {
     ///
     /// # Errors
     ///
-    /// This constructor is infallible today, but returns `Result` to keep the
-    /// call sites stable and allow future validation; it never returns `Err`.
+    /// Returns an error when the generated policy source fails to lower against
+    /// [`SCHEMA`]. Infallible in practice for allowlist input.
     pub fn from_allowlist_csv(raw: &str) -> anyhow::Result<Self> {
         let hosts = parse_hosts(raw);
-        let rules = default_rules_from_hosts(&hosts);
-        Ok(Self {
-            rules,
-            allow_hosts: hosts,
-        })
+        let (policy_src, rule_ids) = default_policy_from_hosts(&hosts);
+        let rule_hosts = hosts.clone();
+        Self::build(policy_src, rule_ids, hosts, rule_hosts)
     }
 
-    /// Build an egress policy from an explicit native policy source (JSON; see
-    /// the module docs), for the richer custom-configuration path. The caller
-    /// supplies the full policy document; `allow_hosts` are the normalized hosts
-    /// used for subdomain folding before matching (pass an empty vec to disable
+    /// Build an egress policy from an explicit Dogwood policy source (`.dw`
+    /// text), for the richer custom-configuration path. The caller supplies the
+    /// full policy document; `allow_hosts` are the normalized hosts used for
+    /// subdomain folding before the policy call (pass an empty vec to disable
     /// folding).
     ///
     /// # Errors
     ///
-    /// Returns an error when `policy_source` is not valid JSON or does not match
-    /// the documented rule-array schema.
+    /// Returns an error when `policy_source` is not valid Dogwood `.dw` source
+    /// or does not lower against [`SCHEMA`].
     pub fn from_policy_source(
         policy_source: &str,
         allow_hosts: Vec<String>,
     ) -> anyhow::Result<Self> {
-        let rules: Vec<Rule> = serde_json::from_str(policy_source)
-            .map_err(|e| anyhow::anyhow!("parse egress policy source: {e}"))?;
-        Ok(Self { rules, allow_hosts })
+        let rule_ids = scan_rule_ids(policy_source);
+        Self::build(policy_source.to_string(), rule_ids, allow_hosts, Vec::new())
     }
 
-    /// Append pre-parsed [`PolicyRule`]s to this policy's rule set.
+    /// Lower `policy_src` against [`SCHEMA`] once to validate it, then retain
+    /// the source + id list for per-decision re-lowering.
+    fn build(
+        policy_src: String,
+        rule_ids: Vec<String>,
+        allow_hosts: Vec<String>,
+        rule_hosts: Vec<String>,
+    ) -> anyhow::Result<Self> {
+        // Lower once up front so a malformed source is rejected at construction
+        // (fail closed at load), not silently at first decision.
+        lower(&policy_src).map_err(|e| anyhow::anyhow!("lower egress policy: {e}"))?;
+        Ok(Self {
+            policy_src,
+            rule_ids,
+            allow_hosts,
+            rule_hosts,
+        })
+    }
+
+    /// Append pre-built [`PolicyRule`]s to this policy's rule set.
     ///
-    /// Used to **compile per-integration method/path scoping** (defined inline in
-    /// `EGRESS_UPSTREAMS`, see [`crate::egress_proxy`]) into the single shared
-    /// policy at startup, so the reverse proxy's `decide_http` authorization flows
-    /// through the same rule set as the CONNECT gate — one authorization path, no
-    /// parallel ad-hoc check. Rules are appended, so a pre-existing `forbid` still
-    /// overrides a later integration `permit` for the same target (forbid-override
-    /// is order-independent).
+    /// Used to **compile per-integration method/path scoping** (defined inline
+    /// in `EGRESS_UPSTREAMS`, see [`crate::egress_proxy`]) into the single
+    /// shared policy at startup, so the reverse proxy's `decide_http`
+    /// authorization flows through the same rule set as the CONNECT gate — one
+    /// authorization path, no parallel ad-hoc check. Rules are appended, so a
+    /// pre-existing `forbid` still overrides a later integration `permit` for
+    /// the same target (forbid-override is order-independent).
     pub fn extend_rules(&mut self, rules: impl IntoIterator<Item = PolicyRule>) {
-        self.rules
-            .extend(rules.into_iter().map(PolicyRule::into_rule));
+        for rule in rules {
+            self.policy_src.push_str(&rule.to_dw());
+            self.rule_ids.push(rule.id.clone());
+            self.rule_hosts.push(rule.host);
+        }
     }
 
     /// Decide whether `subject` (a box instance id) may `Connect` to `host`.
     ///
     /// Fails closed: a subdomain is first folded onto its permitted parent, then
-    /// the rule set is evaluated (forbid overrides permit, default-deny).
+    /// a fresh Dogwood [`Authorizer`](dogwood_language::Authorizer) decides. Any
+    /// lowering/evaluation error or non-decision outcome yields a deny.
     ///
     /// `subject` does not participate in matching today (the CONNECT hop uses a
     /// coarse constant subject); it is accepted for API stability and future
     /// per-subject rules.
-    pub fn decide_connect(&self, _subject: &str, host: &str) -> EgressDecision {
+    pub fn decide_connect(&self, subject: &str, host: &str) -> EgressDecision {
         let host = self.match_host(host);
-        self.evaluate(|rule| rule.matches_connect(&host))
+        let event = Event::builder_for(ACTION_NAMESPACE, "Connect", "request")
+            .principal(&box_uid(subject))
+            .resource(GATEWAY_UID)
+            .field("input", "host", Value::String(host.clone()))
+            .request_context("input", "host", Value::String(host))
+            .build();
+        self.decide(&event, "Connect")
     }
 
     /// Decide whether `subject` may issue an `HttpRequest` with `method` and
     /// `path` to `host`.
     ///
-    /// Fails closed, with the same subdomain folding and forbid-override /
-    /// default-deny semantics as [`Self::decide_connect`].
+    /// Fails closed, with the same subdomain folding and error handling as
+    /// [`Self::decide_connect`].
     pub fn decide_http(
         &self,
-        _subject: &str,
+        subject: &str,
         host: &str,
         method: &str,
         path: &str,
     ) -> EgressDecision {
         let host = self.match_host(host);
-        self.evaluate(|rule| rule.matches_http(&host, method, path))
+        let event = Event::builder_for(ACTION_NAMESPACE, "HttpRequest", "request")
+            .principal(&box_uid(subject))
+            .resource(GATEWAY_UID)
+            .field("input", "host", Value::String(host.clone()))
+            .field("input", "method", Value::String(method.to_string()))
+            .field("input", "path", Value::String(path.to_string()))
+            .request_context("input", "host", Value::String(host))
+            .request_context("input", "method", Value::String(method.to_string()))
+            .request_context("input", "path", Value::String(path.to_string()))
+            .build();
+        self.decide(&event, "HttpRequest")
     }
 
     /// Record a response event.
     ///
-    /// Retained as a no-op for API stability. The previous Dogwood engine kept a
-    /// temporal event history that `formerly within <dur>` clauses read; that
-    /// feature was tested-only and never wired into a production decision path,
-    /// so it is dropped. Callers may still invoke this without effect.
+    /// Retained as a no-op for API stability. The previous Dogwood durable
+    /// engine kept a temporal event history that `formerly within <dur>` clauses
+    /// read; that feature was tested-only and never wired into a production
+    /// decision path, so it is dropped. Callers may still invoke this without
+    /// effect.
     pub fn record_response(&self, _subject: &str, _action: &str, _fields: &[(&str, &str)]) {}
+
+    /// Build a fresh [`Authorizer`](dogwood_language::Authorizer) from the
+    /// retained source and decide `event`, failing closed on any lowering /
+    /// evaluation error or non-decision outcome.
+    fn decide(&self, event: &Event, action: &str) -> EgressDecision {
+        let policies = match lower(&self.policy_src) {
+            Ok(policies) => policies,
+            Err(e) => {
+                tracing::warn!(action, error = %e, "egress policy lowering failed; deny");
+                return EgressDecision::deny(format!("lowering error: {e}"));
+            }
+        };
+        // A fresh authorizer, fed exactly one request event at ts 0: no temporal
+        // bleed, no timestamp bookkeeping, nothing held across an await.
+        let mut authorizer = Authorizer::new(policies);
+        match authorizer.is_authorized(event) {
+            Some(response) => {
+                if response.decision() == Decision::Allow {
+                    EgressDecision::allow(self.decision_reason(&response, "permit"))
+                } else {
+                    EgressDecision::deny(self.decision_reason(&response, "default-deny"))
+                }
+            }
+            // A `request`-kind event is always a decision kind; `None` means the
+            // event did not decide, which must fail closed.
+            None => {
+                tracing::error!(action, "egress request did not produce a decision; deny");
+                EgressDecision::deny("request event was not decided")
+            }
+        }
+    }
+
+    /// Recover the `@id` reason of the first determining Dogwood rule by mapping
+    /// its `rule_index` back to [`Self::rule_ids`]; `fallback` when no rule
+    /// determined the decision (an implicit deny).
+    fn decision_reason(&self, response: &dogwood_language::Response, fallback: &str) -> String {
+        match response.diagnostics().reason().next() {
+            Some(rule_ref) => self
+                .rule_ids
+                .get(rule_ref.rule_index)
+                .cloned()
+                .unwrap_or_else(|| fallback.to_string()),
+            None => fallback.to_string(),
+        }
+    }
 
     /// Normalize a request host for matching, folding it onto an allowlist
     /// parent **only when it is not already the subject of an explicit rule**.
@@ -345,43 +408,39 @@ impl EgressPolicy {
     /// The host is first normalized ([`normalize_host`]: trim, strip dots,
     /// lowercase) exactly as every rule host is. If that normalized host equals
     /// some rule's host (e.g. a configured integration host), it is returned
-    /// as-is so it matches its own rule — allowlist folding never rewrites a host
-    /// out from under its own rule. Otherwise the dot-boundary subdomain folding
-    /// of [`normalize_to_allowed_host`] maps a subdomain of an allowlisted entry
-    /// onto that parent.
+    /// as-is so it matches its own rule — allowlist folding never rewrites a
+    /// host out from under its own rule. Otherwise the dot-boundary subdomain
+    /// folding of [`normalize_to_allowed_host`] maps a subdomain of an
+    /// allowlisted entry onto that parent.
     fn match_host(&self, host: &str) -> String {
         let host = normalize_host(host);
-        if self.rules.iter().any(|rule| rule.host == host) {
+        if self.rule_hosts.contains(&host) {
             return host;
         }
         normalize_to_allowed_host(&host, &self.allow_hosts)
     }
+}
 
-    /// Evaluate the rule set against a matcher: a matching `forbid` denies, else
-    /// a matching `permit` allows, else default-deny.
-    fn evaluate(&self, matches: impl Fn(&Rule) -> bool) -> EgressDecision {
-        let mut permit: Option<&Rule> = None;
-        for rule in &self.rules {
-            if !matches(rule) {
-                continue;
-            }
-            match rule.effect {
-                // A forbid short-circuits: it overrides any permit.
-                Effect::Forbid => return EgressDecision::deny(rule.reason()),
-                // Remember the first matching permit, but keep scanning for a
-                // later forbid that would override it.
-                Effect::Permit => {
-                    if permit.is_none() {
-                        permit = Some(rule);
-                    }
-                }
-            }
-        }
-        match permit {
-            Some(rule) => EgressDecision::allow(rule.reason()),
-            None => EgressDecision::deny("default-deny"),
-        }
-    }
+/// Lower a Dogwood `.dw` policy source against [`SCHEMA`] into a
+/// [`LoweredPolicySet`](dogwood_language::LoweredPolicySet).
+fn lower(policy_src: &str) -> Result<LoweredPolicySet, dogwood_language::Error> {
+    let service = ServiceSchema::defaults();
+    let policy_schema = PolicySchema::from_cedarschema_str(SCHEMA)?;
+    LoweredPolicySet::from_str(policy_src, &service, &policy_schema)
+}
+
+/// The `Box` principal entity UID for a box instance id.
+fn box_uid(instance_id: &str) -> String {
+    // Escape embedded quotes/backslashes so a crafted instance id cannot break
+    // out of the entity-id string literal.
+    format!("Egress::Box::\"{}\"", escape_cedar_str(instance_id))
+}
+
+/// Escape a string for interpolation into a Cedar/Dogwood string literal:
+/// backslash first, then double-quote, so a crafted host/id/subject cannot
+/// break out of the literal.
+fn escape_cedar_str(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Normalize a single host to its canonical matching form: trimmed of
@@ -407,9 +466,9 @@ fn parse_hosts(raw: &str) -> Vec<String> {
 }
 
 /// Fold `host` onto a permitted parent when it is a subdomain of an allowlist
-/// entry, reproducing the existing egress dot-boundary semantics. A host that is
-/// exactly an entry, or not covered at all, is returned normalized but unchanged
-/// (an uncovered host stays itself and is denied by default).
+/// entry, reproducing the existing egress dot-boundary semantics. A host that
+/// is exactly an entry, or not covered at all, is returned normalized but
+/// unchanged (an uncovered host stays itself and is denied by default).
 ///
 /// `host` is expected to already be normalized ([`normalize_host`]); callers in
 /// this module normalize before calling.
@@ -423,26 +482,84 @@ fn normalize_to_allowed_host(host: &str, allow_hosts: &[String]) -> String {
     host
 }
 
-/// Render a default-deny rule set that permits `Connect` to each configured
-/// host.
+/// Render a default-deny policy that permits `Connect` to each configured host,
+/// returning the `.dw` source plus the rule ids in source order.
 ///
-/// Default-deny is implicit (a request with no matching `permit` is denied);
-/// this emits one annotated `permit`-`Connect` rule per host. Hosts are matched
-/// by exact equality — subdomains are folded onto their parent by
-/// [`normalize_to_allowed_host`] before matching.
-fn default_rules_from_hosts(hosts: &[String]) -> Vec<Rule> {
-    hosts
-        .iter()
-        .enumerate()
-        .map(|(i, host)| Rule {
-            effect: Effect::Permit,
-            action: Action::Connect,
-            host: host.clone(),
-            method: None,
-            path: None,
-            id: Some(format!("allow_connect_{i}")),
-        })
-        .collect()
+/// Default-deny is implicit in Dogwood (a request with no matching `permit` is
+/// denied); this emits one `@id`-annotated `permit` per host. Hosts are matched
+/// by exact equality on `context.input.host` — subdomains are folded onto their
+/// parent by [`normalize_to_allowed_host`] before the policy call.
+fn default_policy_from_hosts(hosts: &[String]) -> (String, Vec<String>) {
+    let mut policy = String::new();
+    let mut ids = Vec::with_capacity(hosts.len());
+    for (i, host) in hosts.iter().enumerate() {
+        let id = format!("allow_connect_{i}");
+        policy.push_str(&format!(
+            "@id(\"{}\")\n\
+             permit (principal, action == Egress::Action::\"Connect\", resource)\n\
+             when {{ context.input.host == \"{}\" }};\n\n",
+            escape_cedar_str(&id),
+            escape_cedar_str(host),
+        ));
+        ids.push(id);
+    }
+    (policy, ids)
+}
+
+/// Scan a Dogwood `.dw` source for rule ids in rule order, so a
+/// [`DogwoodRuleRef`](dogwood_language::DogwoodRuleRef)'s `rule_index` can be
+/// mapped back to the originating `@id`.
+///
+/// Rules are `permit`/`forbid` statements; each is preceded by at most one
+/// `@id("...")` annotation. We walk the source line-wise: an `@id("...")` line
+/// records the pending id, and the next `permit`/`forbid` statement consumes it
+/// (or an empty string when the rule carried no `@id`). This yields one id per
+/// rule in the same order the lowering assigns `rule_index`.
+fn scan_rule_ids(source: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut pending: Option<String> = None;
+    for line in source.lines() {
+        let line = line.trim();
+        if let Some(id) = parse_id_annotation(line) {
+            pending = Some(id);
+        } else if line.starts_with("permit") || line.starts_with("forbid") {
+            ids.push(pending.take().unwrap_or_default());
+        }
+    }
+    ids
+}
+
+/// Parse an `@id("...")` annotation line, returning the (unescaped) id. Returns
+/// `None` for any line that is not an `@id` annotation.
+fn parse_id_annotation(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("@id")?.trim_start();
+    let inner = rest.strip_prefix('(')?.trim_start();
+    let inner = inner.strip_prefix('"')?;
+    let end = inner.find('"')?;
+    Some(unescape_cedar_str(inner.get(..end)?))
+}
+
+/// Inverse of [`escape_cedar_str`] for the `@id` interior (unescape `\"` and
+/// `\\`). Only the two escapes this module emits are handled.
+fn unescape_cedar_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -487,7 +604,7 @@ mod tests {
 
     #[test]
     fn allowlist_outcome_parity_with_egress_allowlist() {
-        // Representative host set decided through the native policy must match
+        // Representative host set decided through the Dogwood policy must match
         // the legacy egress Allowlist's allow/deny outcome for each host.
         let csv = "crates.io, static.crates.io, github.com";
         let policy = policy_from_csv(csv);
@@ -517,17 +634,14 @@ mod tests {
     fn http_request_discriminates_method_and_path() {
         // Permit only GET /v1/data to api.example.com; everything else denied.
         let policy = r#"
-            [
-              {
-                "effect": "permit",
-                "action": "http_request",
-                "host": "api.example.com",
-                "method": "GET",
-                "path": "/v1/data",
-                "id": "allow_get_data"
-              }
-            ]
-        "#;
+@id("allow_get_data")
+permit (principal, action == Egress::Action::"HttpRequest", resource)
+when {
+  context.input.host == "api.example.com" &&
+  context.input.method == "GET" &&
+  context.input.path == "/v1/data"
+};
+"#;
         let engine =
             EgressPolicy::from_policy_source(policy, vec!["api.example.com".to_string()]).unwrap();
         let allow = engine.decide_http("i-1", "api.example.com", "GET", "/v1/data");
@@ -550,31 +664,35 @@ mod tests {
     #[test]
     fn forbid_overrides_permit() {
         let policy = r#"
-            [
-              { "effect": "permit", "action": "connect", "host": "ok.example.com", "id": "allow_ok" },
-              { "effect": "permit", "action": "connect", "host": "blocked.example.com", "id": "allow_blocked" },
-              { "effect": "forbid", "action": "connect", "host": "blocked.example.com", "id": "forbid_quarantined" }
-            ]
-        "#;
+@id("allow_all_connect")
+permit (principal, action == Egress::Action::"Connect", resource);
+
+@id("forbid_quarantined")
+forbid (principal, action == Egress::Action::"Connect", resource)
+when { context.input.host == "blocked.example.com" };
+"#;
         let engine = EgressPolicy::from_policy_source(policy, Vec::new()).unwrap();
         // A host the permit would allow is still denied by the forbid.
         let deny = engine.decide_connect("i-1", "blocked.example.com");
         assert!(!deny.allowed);
         assert_eq!(deny.reason, "forbid_quarantined");
-        // Another host is allowed by its permit.
+        // Another host is allowed by the blanket permit.
         assert!(engine.decide_connect("i-1", "ok.example.com").allowed);
     }
 
     #[test]
     fn forbid_overrides_permit_regardless_of_order() {
-        // A permit appearing AFTER a forbid for the same host must still be
+        // A permit appearing BEFORE a forbid for the same host must still be
         // overridden by the forbid — forbid-override is order-independent.
         let policy = r#"
-            [
-              { "effect": "forbid", "action": "connect", "host": "blocked.example.com", "id": "forbid_first" },
-              { "effect": "permit", "action": "connect", "host": "blocked.example.com", "id": "allow_second" }
-            ]
-        "#;
+@id("forbid_first")
+forbid (principal, action == Egress::Action::"Connect", resource)
+when { context.input.host == "blocked.example.com" };
+
+@id("allow_second")
+permit (principal, action == Egress::Action::"Connect", resource)
+when { context.input.host == "blocked.example.com" };
+"#;
         let engine = EgressPolicy::from_policy_source(policy, Vec::new()).unwrap();
         assert!(!engine.decide_connect("i-1", "blocked.example.com").allowed);
     }
@@ -584,17 +702,14 @@ mod tests {
         // Temporal history was dropped; record_response is retained as a no-op
         // for API stability and must not change any later decision.
         let policy = r#"
-            [
-              {
-                "effect": "permit",
-                "action": "http_request",
-                "host": "api.example.com",
-                "method": "GET",
-                "path": "/",
-                "id": "allow_root"
-              }
-            ]
-        "#;
+@id("allow_root")
+permit (principal, action == Egress::Action::"HttpRequest", resource)
+when {
+  context.input.host == "api.example.com" &&
+  context.input.method == "GET" &&
+  context.input.path == "/"
+};
+"#;
         let engine =
             EgressPolicy::from_policy_source(policy, vec!["api.example.com".to_string()]).unwrap();
         // Before any recorded response.
@@ -611,13 +726,13 @@ mod tests {
     }
 
     #[test]
-    fn unknown_action_fails_closed() {
-        // A policy source with an unrecognized action value fails to parse,
-        // which the caller must treat as a hard error (fail closed) rather than
-        // silently loading an empty/permissive policy.
-        let bad = r#"[{ "effect": "permit", "action": "telepathy", "host": "x" }]"#;
+    fn invalid_policy_source_fails_closed() {
+        // A policy source that is not valid Dogwood `.dw` must be rejected at
+        // construction (fail closed at load) rather than silently loading an
+        // empty/permissive policy.
+        let bad = "this is not a valid dogwood policy @@@";
         let err = EgressPolicy::from_policy_source(bad, Vec::new());
-        assert!(err.is_err(), "unknown action must not parse");
+        assert!(err.is_err(), "invalid policy source must not lower");
     }
 
     #[test]
@@ -633,11 +748,11 @@ mod tests {
 
     #[test]
     fn crafted_host_or_subject_cannot_break_matching() {
-        // The old Dogwood adapter had to escape quotes/backslashes when
-        // interpolating the instance id into a Cedar entity-id literal. The
-        // native matcher compares plain Rust strings, so there is no DSL to
-        // inject into: a host or subject full of quotes/backslashes/policy
-        // syntax simply does not equal any configured host and is denied.
+        // The Dogwood adapter escapes quotes/backslashes when interpolating the
+        // instance id and hosts into Cedar string/entity-id literals, so a host
+        // or subject full of quotes/backslashes/policy syntax cannot break out
+        // of the literal: it simply does not equal any configured host and is
+        // denied.
         let policy = policy_from_csv("crates.io");
         let nasty_subject = "i-\"); permit(principal, action, resource); //";
         let nasty_host = "crates.io\" || true || \"";

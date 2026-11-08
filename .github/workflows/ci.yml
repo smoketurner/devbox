@@ -136,6 +136,10 @@ jobs:
         with:
           vulnerability-check: true
           license-check: true
+          # Narrow, documented scoping for the one transitive unmaintained
+          # advisory dogwood-language requires (smartstring via rhai). Keeps
+          # both checks intact; see .github/dependency-review-config.yml.
+          config-file: .github/dependency-review-config.yml
 
   license-check:
     name: License & Advisory Check

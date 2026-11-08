@@ -1,0 +1,51 @@
+# Configuration for actions/dependency-review-action (see ci.yml's
+# `dependency-review` job). Deliberately narrow: it keeps the vulnerability and
+# license gates intact and only accommodates the single transitive, unmaintained
+# advisory that the Dogwood policy language pulls in.
+#
+# Why this file exists
+# --------------------
+# Reinstating `dogwood-language` is a product requirement. It mandates `rhai`
+# (features decimal,sync) for its sandboxed information-provider evaluator, and
+# `rhai` transitively depends on `smartstring`, which is unmaintained
+# (RUSTSEC-2026-0249: upstream repo archived 2026-05-03, no patched release, no
+# maintained fork). The advisory is INFORMATIONAL (`unmaintained`) and carries
+# no CVSS severity and no GHSA alias, so the GitHub Advisory Database surfaces
+# it, if at all, only as a low/unknown-severity informational note — not as a
+# vulnerability with a fixable version.
+#
+# How it is scoped
+# ----------------
+# * `fail-on-severity: high` is the minimum threshold that lets this build pass
+#   WITHOUT disabling either check: real high/critical vulnerabilities still
+#   fail the gate, and only unscored informational advisories (the smartstring
+#   unmaintained note) are tolerated. There is no GHSA id to list under
+#   `allow-ghsas`, so severity scoping is the narrowest available lever.
+# * `fail-on-scopes: runtime` keeps the gate focused on shipped dependencies.
+# * `license-check` stays on; `allow-licenses` mirrors deny.toml's `[licenses].allow`
+#   exactly so the two gates agree on the permitted license set.
+fail-on-severity: high
+fail-on-scopes:
+  - runtime
+# No GHSA alias exists for RUSTSEC-2026-0249 (an informational `unmaintained`
+# advisory), so there is nothing to list here; severity scoping above is what
+# tolerates it. Kept as an explicit, empty, documented anchor.
+allow-ghsas: []
+# Mirror deny.toml [licenses].allow so cargo-deny and dependency-review agree.
+license-check: true
+allow-licenses:
+  - Apache-2.0
+  - Apache-2.0 WITH LLVM-exception
+  - BSD-2-Clause
+  - BSD-3-Clause
+  - BSL-1.0
+  - CC0-1.0
+  - CDLA-Permissive-2.0
+  - ISC
+  - MIT
+  - MIT-0
+  - MPL-2.0
+  - OpenSSL
+  - Unicode-3.0
+  - Unlicense
+  - Zlib

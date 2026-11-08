@@ -1,7 +1,7 @@
 //! Policy-driven HTTPS CONNECT forward proxy.
 //!
 //! A devbox sets `HTTPS_PROXY` at this listener; for each `CONNECT host:443` the
-//! proxy asks the native [`EgressPolicy`] (default-deny) whether the host is
+//! proxy asks the dogwood-language-backed [`EgressPolicy`] (default-deny) whether the host is
 //! permitted, resolves it, refuses any non-public IP (SSRF / IMDS / RFC1918
 //! protection), then relays the encrypted TLS bytes. It runs as a second listener
 //! in the server binary, independent of the API router.
@@ -35,7 +35,7 @@ use crate::policy::{EgressDecision, EgressPolicy};
 
 const PROXY_ADDR_ENV: &str = "EGRESS_PROXY_ADDR";
 const ALLOWLIST_ENV: &str = "EGRESS_ALLOWLIST";
-/// Optional path to a native egress policy source file (JSON; see
+/// Optional path to a Dogwood egress policy source file (`.dw`; see
 /// [`crate::policy`]). When set, it replaces the allowlist-derived default
 /// policy; `EGRESS_ALLOWLIST` is still read and its hosts are used for subdomain
 /// folding before the policy call.
@@ -205,10 +205,10 @@ impl DecisionSink {
     }
 }
 
-/// The shared native egress policy engine plus decision sink.
+/// The shared dogwood-language-backed egress policy plus decision sink.
 ///
 /// This is intentionally independent of the CONNECT listener address: the same
-/// `EgressPolicy` (one native rule set) and the same
+/// `EgressPolicy` (one rule set) and the same
 /// [`DecisionSink`] back BOTH the CONNECT proxy ([`serve`]) and the
 /// credential-injecting reverse proxy ([`crate::egress_proxy`] via
 /// [`crate::policy::EgressPolicy::decide_http`]). Building it here — rather than
@@ -225,8 +225,8 @@ impl EgressShared {
     /// Build the shared policy + sink from the environment.
     ///
     /// `EGRESS_ALLOWLIST` drives the default-deny policy (each listed host, and
-    /// its subdomains, permits `Connect`). A richer native policy can be supplied
-    /// via `EGRESS_POLICY_PATH` (a JSON rule document; see [`crate::policy`]).
+    /// its subdomains, permits `Connect`). A richer policy can be supplied
+    /// via `EGRESS_POLICY_PATH` (a Dogwood `.dw` source; see [`crate::policy`]).
     /// Records are emitted via `tracing` and, when `EGRESS_DECISION_LOG` is set,
     /// appended to that file.
     ///
@@ -278,7 +278,7 @@ impl EgressShared {
 /// Configuration for the CONNECT egress proxy listener, or `None` when
 /// `EGRESS_PROXY_ADDR` is unset (the CONNECT listener is disabled). The policy and
 /// sink are the shared ones from [`EgressShared`], so the CONNECT listener and the
-/// reverse proxy share one native policy engine and one audit sink.
+/// reverse proxy share one policy and one audit sink.
 pub struct EgressConfig {
     pub addr: SocketAddr,
     pub policy: Arc<EgressPolicy>,

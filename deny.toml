@@ -14,6 +14,16 @@ targets = [
 
 [advisories]
 ignore = [
+    # smartstring (RUSTSEC-2026-0249): unmaintained (repo archived upstream
+    # 2026-05-03), with no patched version and no maintained fork to migrate to.
+    # It is transitive, never named by devbox code: dogwood-language mandates
+    # rhai (features decimal,sync) for its sandboxed information-provider
+    # evaluator, and rhai pulls smartstring. There is no safe upgrade or dedupe
+    # (1.0.1 is the affected line and all versions are affected), so the fix must
+    # come from rhai dropping smartstring upstream. Reinstating the Dogwood
+    # policy LANGUAGE is a deliberate product requirement, so this transitive
+    # unmaintained advisory is ignored rather than dropping dogwood-language.
+    "RUSTSEC-2026-0249",
     # pin-utils (RUSTSEC-2026-0441): unmaintained. Pre-existing and transitive —
     # it is pulled in only via the AWS SDK (aws-smithy-http -> aws-config / the
     # aws-sdk-* crates), not by any devbox code. 0.1.0 is the only published

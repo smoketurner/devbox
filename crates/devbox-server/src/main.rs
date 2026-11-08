@@ -147,7 +147,7 @@ async fn main() -> Result<()> {
     let egress_proxy = egress_integrations.map(|cfg| cfg.proxy);
 
     // Build the shared egress policy + decision sink ONCE, independently of the
-    // CONNECT listener address. The SAME EgressPolicy (one native rule set) and
+    // CONNECT listener address. The SAME EgressPolicy (one rule set) and
     // the same decision sink back BOTH the CONNECT listener and the reverse
     // proxy's decide_http, so both gates share one policy and one audit sink.
     //

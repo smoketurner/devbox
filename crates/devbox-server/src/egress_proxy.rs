@@ -11,7 +11,7 @@
 //!
 //! 1. resolves the named integration to its single configured upstream host
 //!    (unknown name => 404);
-//! 2. applies the shared native [`crate::policy::EgressPolicy`] on that host +
+//! 2. applies the shared [`crate::policy::EgressPolicy`] on that host +
 //!    the request `method` + `path` ([`crate::policy::EgressPolicy::decide_http`])
 //!    — default-deny, the **same policy instance** as the CONNECT proxy
 //!    ([`crate::egress`]), so there is exactly one authorization path (policy
@@ -27,7 +27,7 @@
 //! # Separation of concerns
 //!
 //! The proxy owns **transport + credential injection only**. The allow/deny
-//! decision belongs entirely to the native [`crate::policy::EgressPolicy`]. The
+//! decision belongs entirely to the [`crate::policy::EgressPolicy`]. The
 //! per-integration `method`/`path` scoping declared in `EGRESS_UPSTREAMS` is
 //! **compiled into that shared policy at startup** (see
 //! [`crate::policy::EgressPolicy::extend_rules`] and [`EgressConfig::policy_rules`]),
