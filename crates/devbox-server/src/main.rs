@@ -150,7 +150,8 @@ async fn main() -> Result<()> {
         tracing::info!(addr = %egress.addr, "egress proxy listening");
         tokio::spawn(devbox_server::egress::serve(
             egress_listener,
-            Arc::new(egress.allowlist),
+            egress.policy,
+            egress.sink,
             cancel.clone(),
         ));
     }

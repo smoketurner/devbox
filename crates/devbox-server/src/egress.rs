@@ -1,16 +1,28 @@
-//! Allowlisting HTTPS CONNECT forward proxy.
+//! Policy-driven HTTPS CONNECT forward proxy.
 //!
 //! A devbox sets `HTTPS_PROXY` at this listener; for each `CONNECT host:443` the
-//! proxy checks `host` against an allowlist, resolves it, refuses any non-public IP
-//! (SSRF / IMDS / RFC1918 protection), then relays the encrypted TLS bytes. It runs
-//! as a second listener in the server binary, independent of the API router.
+//! proxy asks the Dogwood [`EgressPolicy`] (default-deny) whether the host is
+//! permitted, resolves it, refuses any non-public IP (SSRF / IMDS / RFC1918
+//! protection), then relays the encrypted TLS bytes. It runs as a second listener
+//! in the server binary, independent of the API router.
 //!
 //! The proxy tunnels ciphertext — it never sees inside TLS, so it cannot inject
 //! credentials. That is the reverse proxy's job ([`crate::github::git_proxy`]); this
-//! is the host-allowlist gate for everything else.
+//! is the policy-driven host gate for everything else.
+//!
+//! # Subject identity
+//!
+//! The CONNECT path does NOT authenticate the box per-connection (the tunnel is
+//! opaque TLS and there is no per-box credential on this hop today), so every
+//! decision is made against the coarse constant subject [`CONNECT_SUBJECT`]
+//! (`"pool"`). This is a known limitation: real per-box identity
+//! ([`crate::auth::agent_identity`]) is available on the authenticated reverse
+//! proxy, not here. The policy is therefore a fleet-wide host gate on this path.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -20,8 +32,26 @@ use tokio_util::sync::CancellationToken;
 
 use devbox_common::env_non_empty;
 
+use crate::policy::{EgressDecision, EgressPolicy};
+
 const PROXY_ADDR_ENV: &str = "EGRESS_PROXY_ADDR";
 const ALLOWLIST_ENV: &str = "EGRESS_ALLOWLIST";
+/// Optional path to a Dogwood policy source file (`.dw`). When set, it replaces
+/// the allowlist-derived default policy; `EGRESS_ALLOWLIST` is still read and its
+/// hosts are used for subdomain folding before the policy call.
+const POLICY_PATH_ENV: &str = "EGRESS_POLICY_PATH";
+/// Optional override for the redb-backed Dogwood store path. Defaults to a file
+/// under the system temp dir; the ephemeral path is fine on ECS/Fargate.
+const POLICY_STORE_ENV: &str = "EGRESS_POLICY_STORE";
+/// Optional path to append JSONL decision records to, in addition to the default
+/// `tracing` sink.
+const DECISION_LOG_ENV: &str = "EGRESS_DECISION_LOG";
+
+/// The coarse subject used for every CONNECT decision (see the module docs).
+const CONNECT_SUBJECT: &str = "pool";
+
+/// The operation recorded in a CONNECT decision record.
+const CONNECT_OPERATION: &str = "connect";
 
 /// Only HTTPS is proxied; a CONNECT to any other port is refused.
 const ALLOWED_PORT: u16 = 443;
@@ -39,50 +69,150 @@ const HEAD_TIMEOUT: Duration = Duration::from_secs(15);
 /// instead of hanging the client indefinitely.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Set of hostnames a devbox may reach through the proxy. An entry matches the host
-/// exactly or as a parent domain (`crates.io` matches `static.crates.io`).
-#[derive(Clone, Debug, Default)]
-pub struct Allowlist {
-    entries: Vec<String>,
+/// A structured egress authorization decision record, emitted for every allow and
+/// every deny so a fleet's egress is auditable (mirrors Box's `records.jsonl`).
+///
+/// Serialized as one JSON object per line (JSONL). The exact shape is:
+///
+/// ```json
+/// {"subject":"pool","operation":"connect","host":"crates.io","decision":"allow","reason":"allow_connect_0","timestamp":"2026-11-08T03:42:57.123456789Z"}
+/// ```
+///
+/// Fields:
+/// - `subject`: the coarse box subject (see [`CONNECT_SUBJECT`]).
+/// - `operation`: always `"connect"` on this path.
+/// - `host`: the requested CONNECT host (as sent by the client).
+/// - `decision`: `"allow"` or `"deny"`.
+/// - `reason`: the policy attribution / reason string from the engine.
+/// - `timestamp`: RFC3339 (UTC) wall-clock time the decision was made, via jiff.
+#[derive(Debug, serde::Serialize)]
+pub struct DecisionRecord {
+    /// The subject the decision was made for.
+    pub subject: String,
+    /// The egress operation (`"connect"` on the CONNECT path).
+    pub operation: String,
+    /// The requested host.
+    pub host: String,
+    /// `"allow"` or `"deny"`.
+    pub decision: String,
+    /// The policy attribution / reason for the decision.
+    pub reason: String,
+    /// RFC3339 timestamp the decision was made.
+    pub timestamp: String,
 }
 
-impl Allowlist {
-    /// Parse a comma-separated allowlist, lowercasing and trimming each entry.
-    fn from_csv(raw: &str) -> Self {
-        let entries = raw
-            .split(',')
-            .map(|e| e.trim().trim_matches('.').to_ascii_lowercase())
-            .filter(|e| !e.is_empty())
-            .collect();
-        Self { entries }
+impl DecisionRecord {
+    /// Build a CONNECT decision record from a policy decision for `host`.
+    fn connect(subject: &str, host: &str, decision: &EgressDecision) -> Self {
+        Self {
+            subject: subject.to_string(),
+            operation: CONNECT_OPERATION.to_string(),
+            host: host.to_string(),
+            decision: if decision.allowed { "allow" } else { "deny" }.to_string(),
+            reason: decision.reason.clone(),
+            timestamp: jiff::Timestamp::now().to_string(),
+        }
+    }
+}
+
+/// Where decision records are emitted. The default `tracing` event is always
+/// produced; an optional append-only file sink mirrors the records to disk.
+///
+/// Both sinks are best-effort and non-blocking on the proxy hot path: a file
+/// write error is logged and swallowed, never propagated to the tunnel.
+#[derive(Clone, Default)]
+pub struct DecisionSink {
+    /// An optional append file; shared across tasks behind a mutex (held only for
+    /// the synchronous write, never across an `.await`).
+    file: Option<Arc<Mutex<std::fs::File>>>,
+}
+
+impl DecisionSink {
+    /// Build a sink from the environment: a `tracing`-only sink by default, plus
+    /// an append file when `EGRESS_DECISION_LOG` is set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `EGRESS_DECISION_LOG` is set but the file cannot be
+    /// opened for appending — a misconfigured audit sink is a hard startup error
+    /// rather than silently losing records.
+    fn from_env() -> Result<Self> {
+        let Some(path) = env_non_empty(DECISION_LOG_ENV) else {
+            return Ok(Self::default());
+        };
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("open {DECISION_LOG_ENV} at {path}"))?;
+        Ok(Self {
+            file: Some(Arc::new(Mutex::new(file))),
+        })
     }
 
-    /// Whether `host` is allowed: equal to an entry or a subdomain of one.
-    fn allows(&self, host: &str) -> bool {
-        let host = host.trim_matches('.').to_ascii_lowercase();
-        self.entries
-            .iter()
-            .any(|entry| host == *entry || host.ends_with(&format!(".{entry}")))
+    /// Emit a decision record: always a structured `tracing` event, plus a JSONL
+    /// line to the file sink when configured. Best-effort: serialization or write
+    /// failures are logged and swallowed so the hot path is never blocked.
+    fn emit(&self, record: &DecisionRecord) {
+        tracing::info!(
+            subject = %record.subject,
+            operation = %record.operation,
+            host = %record.host,
+            decision = %record.decision,
+            reason = %record.reason,
+            timestamp = %record.timestamp,
+            "egress decision"
+        );
+        let Some(file) = &self.file else {
+            return;
+        };
+        let mut line = match serde_json::to_string(record) {
+            Ok(json) => json,
+            Err(e) => {
+                tracing::warn!(error = %e, "egress decision record serialize failed");
+                return;
+            }
+        };
+        line.push('\n');
+        // Hold the mutex only for the synchronous write; no await inside.
+        let Ok(mut guard) = file.lock() else {
+            tracing::error!("egress decision log mutex poisoned; record dropped");
+            return;
+        };
+        if let Err(e) = std::io::Write::write_all(&mut *guard, line.as_bytes()) {
+            tracing::warn!(error = %e, "egress decision record write failed");
+        }
     }
+}
 
-    fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
+/// Default redb store filename used when `EGRESS_POLICY_STORE` is unset.
+fn default_store_path() -> PathBuf {
+    std::env::temp_dir().join("devbox-egress-policy.redb")
 }
 
 /// Configuration for the egress proxy, or `None` when `EGRESS_PROXY_ADDR` is unset
 /// (the proxy is disabled).
 pub struct EgressConfig {
     pub addr: SocketAddr,
-    pub allowlist: Allowlist,
+    pub policy: Arc<EgressPolicy>,
+    pub sink: DecisionSink,
 }
 
 impl EgressConfig {
     /// Read the proxy config from the environment. `Ok(None)` disables the proxy.
     ///
+    /// Backward compatible: `EGRESS_PROXY_ADDR` enables the listener and
+    /// `EGRESS_ALLOWLIST` still drives the default-deny policy (each listed host,
+    /// and its subdomains, permits `Connect`). A richer Dogwood policy can be
+    /// supplied via `EGRESS_POLICY_PATH`; the redb store path defaults under the
+    /// system temp dir but is overridable via `EGRESS_POLICY_STORE`.
+    ///
     /// # Errors
     ///
-    /// Returns an error when `EGRESS_PROXY_ADDR` is set but not a valid socket address.
+    /// Returns an error when `EGRESS_PROXY_ADDR` is not a valid socket address,
+    /// when `EGRESS_POLICY_PATH` is set but unreadable, when the Dogwood store
+    /// cannot be opened or the policy fails to install (the proxy must not boot
+    /// fail-open), or when `EGRESS_DECISION_LOG` cannot be opened.
     pub fn from_env() -> Result<Option<Self>> {
         let Some(addr_raw) = env_non_empty(PROXY_ADDR_ENV) else {
             return Ok(None);
@@ -90,17 +220,55 @@ impl EgressConfig {
         let addr: SocketAddr = addr_raw
             .parse()
             .with_context(|| format!("invalid {PROXY_ADDR_ENV}: {addr_raw}"))?;
-        let allowlist = Allowlist::from_csv(&env_non_empty(ALLOWLIST_ENV).unwrap_or_default());
-        if allowlist.is_empty() {
-            tracing::warn!("egress proxy enabled with an empty allowlist; all egress is denied");
-        }
-        Ok(Some(Self { addr, allowlist }))
+
+        let allowlist_raw = env_non_empty(ALLOWLIST_ENV).unwrap_or_default();
+        let store_path =
+            env_non_empty(POLICY_STORE_ENV).map_or_else(default_store_path, PathBuf::from);
+
+        let policy = if let Some(policy_path) = env_non_empty(POLICY_PATH_ENV) {
+            let source = std::fs::read_to_string(&policy_path)
+                .with_context(|| format!("read {POLICY_PATH_ENV} at {policy_path}"))?;
+            // Hosts from EGRESS_ALLOWLIST still drive subdomain folding so a
+            // custom policy keeps the dot-boundary semantics for its hosts.
+            let allow_hosts = parse_allow_hosts(&allowlist_raw);
+            EgressPolicy::from_policy_source(&source, &store_path, allow_hosts)
+                .context("build egress policy from EGRESS_POLICY_PATH")?
+        } else {
+            if allowlist_raw.is_empty() {
+                tracing::warn!(
+                    "egress proxy enabled with an empty allowlist; all egress is denied"
+                );
+            }
+            EgressPolicy::from_allowlist_csv(&allowlist_raw, &store_path)
+                .context("build egress policy from EGRESS_ALLOWLIST")?
+        };
+
+        Ok(Some(Self {
+            addr,
+            policy: Arc::new(policy),
+            sink: DecisionSink::from_env()?,
+        }))
     }
+}
+
+/// Parse a comma-separated allowlist into normalized host entries (lowercase,
+/// trimmed, dots stripped, empties dropped). Used only for subdomain folding when
+/// a custom `EGRESS_POLICY_PATH` is supplied.
+fn parse_allow_hosts(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|e| e.trim().trim_matches('.').to_ascii_lowercase())
+        .filter(|e| !e.is_empty())
+        .collect()
 }
 
 /// Accept CONNECT tunnels until `cancel` fires. Each connection is handled on its
 /// own task; a failed connection is logged and dropped.
-pub async fn serve(listener: TcpListener, allowlist: Arc<Allowlist>, cancel: CancellationToken) {
+pub async fn serve(
+    listener: TcpListener,
+    policy: Arc<EgressPolicy>,
+    sink: DecisionSink,
+    cancel: CancellationToken,
+) {
     loop {
         tokio::select! {
             () = cancel.cancelled() => {
@@ -109,9 +277,10 @@ pub async fn serve(listener: TcpListener, allowlist: Arc<Allowlist>, cancel: Can
             }
             accepted = listener.accept() => match accepted {
                 Ok((stream, peer)) => {
-                    let allowlist = Arc::clone(&allowlist);
+                    let policy = Arc::clone(&policy);
+                    let sink = sink.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream, &allowlist).await {
+                        if let Err(e) = handle_connection(stream, &policy, &sink).await {
                             tracing::debug!(%peer, error = %format!("{e:#}"), "egress connection failed");
                         }
                     });
@@ -122,8 +291,12 @@ pub async fn serve(listener: TcpListener, allowlist: Arc<Allowlist>, cancel: Can
     }
 }
 
-/// Handle one client connection: parse CONNECT, authorize, then tunnel.
-async fn handle_connection(mut client: TcpStream, allowlist: &Allowlist) -> Result<()> {
+/// Handle one client connection: parse CONNECT, authorize via policy, then tunnel.
+async fn handle_connection(
+    mut client: TcpStream,
+    policy: &EgressPolicy,
+    sink: &DecisionSink,
+) -> Result<()> {
     let (host, port, leftover) =
         match tokio::time::timeout(HEAD_TIMEOUT, read_connect_head(&mut client)).await {
             Ok(Ok(Some(head))) => head,
@@ -132,12 +305,18 @@ async fn handle_connection(mut client: TcpStream, allowlist: &Allowlist) -> Resu
             Err(_) => return refuse(&mut client, "408 Request Timeout").await,
         };
 
+    // Port refusal happens before any policy call (preserved exactly).
     if port != ALLOWED_PORT {
         tracing::info!(host, port, "egress denied (port not allowed)");
         return refuse(&mut client, "403 Forbidden").await;
     }
-    if !allowlist.allows(&host) {
-        tracing::info!(host, "egress denied (host not in allowlist)");
+
+    // The engine mutex lives inside decide_connect and is dropped before this
+    // returns, so nothing is held across the connect/tunnel awaits below.
+    let decision = policy.decide_connect(CONNECT_SUBJECT, &host);
+    sink.emit(&DecisionRecord::connect(CONNECT_SUBJECT, &host, &decision));
+    if !decision.allowed {
+        tracing::info!(host, reason = %decision.reason, "egress denied (policy)");
         return refuse(&mut client, "403 Forbidden").await;
     }
 
@@ -342,24 +521,87 @@ mod tests {
         is_forbidden_ip(ip.parse().unwrap())
     }
 
-    #[test]
-    fn allowlist_matches_exact_and_subdomains() {
-        let list = Allowlist::from_csv("crates.io, static.crates.io , github.com");
-        assert!(list.allows("crates.io"));
-        assert!(list.allows("static.crates.io"));
-        assert!(list.allows("index.crates.io")); // subdomain of crates.io
-        assert!(list.allows("GitHub.com")); // case-insensitive
-        assert!(list.allows("codeload.github.com"));
+    /// A fresh engine store under a unique temp path per test.
+    fn store_path(name: &str) -> std::path::PathBuf {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("devbox-egress-{name}-{pid}-{nanos}.redb"))
+    }
+
+    fn policy_from_csv(name: &str, csv: &str) -> EgressPolicy {
+        EgressPolicy::from_allowlist_csv(csv, &store_path(name)).unwrap()
     }
 
     #[test]
-    fn allowlist_rejects_non_members_and_lookalikes() {
-        let list = Allowlist::from_csv("crates.io");
-        assert!(!list.allows("evil.com"));
+    fn policy_gate_allows_permitted_host() {
+        // A permitted host (and its subdomains, dot-boundary) passes the gate,
+        // reproducing the old Allowlist semantics now that the policy is the
+        // authorization path on the CONNECT hop.
+        let policy = policy_from_csv("gate-allow", "crates.io, github.com");
+        assert!(policy.decide_connect(CONNECT_SUBJECT, "crates.io").allowed);
+        assert!(
+            policy
+                .decide_connect(CONNECT_SUBJECT, "static.crates.io")
+                .allowed
+        );
+        assert!(
+            policy
+                .decide_connect(CONNECT_SUBJECT, "codeload.github.com")
+                .allowed
+        );
+    }
+
+    #[test]
+    fn policy_gate_denies_non_members_and_lookalikes() {
+        let policy = policy_from_csv("gate-deny", "crates.io");
+        assert!(!policy.decide_connect(CONNECT_SUBJECT, "evil.com").allowed);
         // A suffix match must be on a dot boundary, not a substring.
-        assert!(!list.allows("notcrates.io"));
-        assert!(!list.allows("crates.io.evil.com"));
-        assert!(!Allowlist::from_csv("").allows("crates.io"));
+        assert!(
+            !policy
+                .decide_connect(CONNECT_SUBJECT, "notcrates.io")
+                .allowed
+        );
+        assert!(
+            !policy
+                .decide_connect(CONNECT_SUBJECT, "crates.io.evil.com")
+                .allowed
+        );
+        // An empty allowlist denies all (backward compatible with the warning).
+        let empty = policy_from_csv("gate-empty", "");
+        assert!(!empty.decide_connect(CONNECT_SUBJECT, "crates.io").allowed);
+    }
+
+    #[test]
+    fn decision_record_captures_documented_fields() {
+        let policy = policy_from_csv("record", "crates.io");
+        // Allow record.
+        let allow = policy.decide_connect(CONNECT_SUBJECT, "crates.io");
+        let allow_rec = DecisionRecord::connect(CONNECT_SUBJECT, "crates.io", &allow);
+        assert_eq!(allow_rec.subject, CONNECT_SUBJECT);
+        assert_eq!(allow_rec.operation, "connect");
+        assert_eq!(allow_rec.host, "crates.io");
+        assert_eq!(allow_rec.decision, "allow");
+        assert!(!allow_rec.reason.is_empty());
+        assert!(!allow_rec.timestamp.is_empty());
+        // The record serializes to a single JSON line with every field.
+        let json: serde_json::Value = serde_json::to_value(&allow_rec).unwrap();
+        for key in [
+            "subject",
+            "operation",
+            "host",
+            "decision",
+            "reason",
+            "timestamp",
+        ] {
+            assert!(json.get(key).is_some(), "record missing {key}");
+        }
+        // Deny record.
+        let deny = policy.decide_connect(CONNECT_SUBJECT, "evil.com");
+        let deny_rec = DecisionRecord::connect(CONNECT_SUBJECT, "evil.com", &deny);
+        assert_eq!(deny_rec.decision, "deny");
     }
 
     #[test]
