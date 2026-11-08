@@ -156,8 +156,11 @@ Bundles **compose with** the operator egress config rather than replacing it:
   folding). This holds whether the policy is seeded from the allowlist CSV or
   from a custom `EGRESS_POLICY_PATH` source (the bundle hosts are added as
   generated `permit`-`Connect` rules there too).
-- `EGRESS_UPSTREAMS` method/path rules compile into that same policy, and are
-  what make an API template live (see below).
+- `EGRESS_UPSTREAMS` method/path rules compile into that same policy. A catalog
+  API template documents a supported integration (its host and method/path
+  scaffold) but does not auto-wire anything; the operator makes an integration
+  live by configuring an `EGRESS_UPSTREAMS` entry themselves, supplying that host,
+  the allow scaffold, and a credential (see below).
 - **forbid-overrides-permit** still holds: an operator `forbid` rule in
   `EGRESS_POLICY_PATH` (or disabling a bundle via `EGRESS_DEFAULT_BUNDLES`) wins
   over any bundled `permit`. Disabling or forbidding is always decisive.
@@ -179,12 +182,16 @@ pattern) and method/path scaffolding and carries **no** credential:
 | `openai` | `api.openai.com` | `POST /v1/chat/completions`, `POST /v1/responses` |
 | `aws-bedrock` | `bedrock-runtime.{region}.amazonaws.com` | `POST` any path (the model id is part of the path) |
 
-A default-on template contributes host + method/path scaffolding to the catalog
-**by name only**. It contributes **no** `permit`-`HttpRequest` rule and **no**
-live reverse-proxy upstream until the operator supplies a credential for it, by
-**naming the template in `EGRESS_UPSTREAMS` with its credential** (the
-`static_header` or `aws_sigv4` mechanism documented below). Until then the
-template is inert: no Connect host is emitted for it, no `permit`-`HttpRequest`
+A catalog template documents and names a supported integration (its host and
+method/path scaffold) **by name only**; the catalog does not consult it at
+request time and does not auto-wire a credential. It contributes **no**
+`permit`-`HttpRequest` rule and **no** live reverse-proxy upstream on its own. To
+make an integration live the operator configures an `EGRESS_UPSTREAMS` entry
+themselves, supplying the host, the allow scaffold (which may be copied from the
+template above), and a credential (the `static_header` or `aws_sigv4` mechanism
+documented below). The reverse proxy reads only that `EGRESS_UPSTREAMS` entry; it
+never looks the template up by name. Until the operator adds such an entry the
+integration is inert: no Connect host is emitted for it, no `permit`-`HttpRequest`
 rule exists, and `decide_http` default-denies it.
 
 For `aws-bedrock` the template declares only the `{region}` host **pattern** and
@@ -294,7 +301,7 @@ Egress env vars:
 | `EGRESS_DEFAULT_BUNDLES` | Selects the built-in default-on bundle catalog: unset => all on; comma-separated list => only those; `none`/empty => all off. Unknown names warned and ignored. |
 | `EGRESS_ALLOWLIST` | Comma-separated CONNECT host allowlist, merged with the active bundle hosts into the shared policy (dot-boundary subdomain folding). |
 | `EGRESS_POLICY_PATH` | Path to a Dogwood `.dw` policy source that replaces the allowlist-derived default policy; bundle hosts are still merged in and operator `forbid` rules still win. |
-| `EGRESS_UPSTREAMS` | JSON registry of credential-injecting reverse-proxy integrations; naming an API template here with a credential makes it live. |
+| `EGRESS_UPSTREAMS` | JSON registry of credential-injecting reverse-proxy integrations; the operator makes an integration live by adding an entry here (host, allow scaffold, and a credential), optionally using a catalog API template's host/scaffold as the reference. |
 | `EGRESS_DECISION_LOG` | Optional path to append JSONL egress decision records to, in addition to the `tracing` sink. |
 
 The JWKS URI and the dashboard

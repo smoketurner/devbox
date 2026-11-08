@@ -44,23 +44,27 @@
 //!
 //! # API templates are fail-closed until an operator supplies a credential
 //!
-//! A default-on API template contributes host + method/path *scaffolding* to the
-//! catalog **by name only**. It contributes **no** `permit`-`HttpRequest` rule
-//! and **no** live reverse-proxy upstream until the operator supplies a
-//! credential for it. The credential mechanism reuses the existing
-//! `EGRESS_UPSTREAMS` seam: when the operator names a template (e.g. `anthropic`)
-//! in `EGRESS_UPSTREAMS` and supplies the deployment credential, the existing
-//! [`crate::egress_proxy`] path compiles that integration's host/method/path into
-//! the shared policy. A template that is NOT named in `EGRESS_UPSTREAMS` is inert:
-//! [`template_connect_hosts`] does not emit a Connect host for it and no
-//! `permit`-`HttpRequest` rule exists, so `decide_http` default-denies it. This
+//! A default-on API template *documents and names* a supported integration: its
+//! host (or host *pattern*) and the method/path *scaffold* the integration uses.
+//! It contributes **no** `permit`-`HttpRequest` rule and **no** live
+//! reverse-proxy upstream on its own, and the catalog is never consulted by name
+//! at request time. The reverse proxy ([`crate::egress_proxy`]) does not look a
+//! template up by name; to make an integration live the operator configures an
+//! `EGRESS_UPSTREAMS` entry themselves, supplying the host, the allow scaffold
+//! (which may be copied from the template), and a credential. Only that operator
+//! `EGRESS_UPSTREAMS` entry compiles the integration's host/method/path into the
+//! shared policy. The catalog does not auto-wire the credential: an integration
+//! that the operator has not configured in `EGRESS_UPSTREAMS` is inert, so
+//! [`connect_hosts`] does not emit a Connect host for its template and no
+//! `permit`-`HttpRequest` rule exists, and `decide_http` default-denies it. This
 //! keeps the credential on the control plane (it never reaches the box) and keeps
-//! an unconfigured template fully denied (no silent credential-less or wide-open
-//! upstream).
+//! an unconfigured integration fully denied (no silent credential-less or
+//! wide-open upstream).
 //!
-//! The templates exist in the catalog so the catalog can *document and name* the
+//! The templates exist in the catalog so the catalog can document and name the
 //! supported integrations (and, for AWS Bedrock, declare the host *pattern* and
-//! the SigV4 method/path scaffold), not to grant any access on their own.
+//! the SigV4 method/path scaffold), not to grant any access or wire any
+//! credential on their own.
 //!
 //! # Selection knob: `EGRESS_DEFAULT_BUNDLES`
 //!
@@ -101,14 +105,17 @@ pub struct ApiAllow {
 }
 
 /// An API integration template: host (or host *pattern*) plus method/path
-/// scaffolding, and **no** credential. A template is inert until the operator
-/// supplies a credential by naming it in `EGRESS_UPSTREAMS` (see the module
-/// docs); it exists in the catalog to name/document the supported integration
-/// and, for region-parameterized services, to declare the host pattern and
-/// SigV4 method/path scaffold.
+/// scaffolding, and **no** credential. A template only documents and names a
+/// supported integration; it grants no access on its own. An integration stays
+/// inert until the operator configures an `EGRESS_UPSTREAMS` entry for it,
+/// supplying the host, the allow scaffold, and a credential (see the module
+/// docs). The template exists in the catalog to name/document the supported
+/// integration and, for region-parameterized services, to declare the host
+/// pattern and SigV4 method/path scaffold.
 #[derive(Clone, Copy, Debug)]
 pub struct ApiTemplate {
-    /// The template name (also the `EGRESS_UPSTREAMS` key that activates it).
+    /// The template name (the integration this template documents; the operator
+    /// reuses it as the `EGRESS_UPSTREAMS` key when configuring the integration).
     pub name: &'static str,
     /// The single upstream host, or a `{region}`-parameterized host *pattern*
     /// for region-scoped services (e.g. AWS Bedrock). The concrete host for a

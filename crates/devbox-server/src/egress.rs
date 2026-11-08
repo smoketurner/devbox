@@ -292,24 +292,12 @@ impl EgressShared {
         let mut policy = if let Some(policy_path) = env_non_empty(POLICY_PATH_ENV) {
             let source = std::fs::read_to_string(&policy_path)
                 .with_context(|| format!("read {POLICY_PATH_ENV} at {policy_path}"))?;
-            // Hosts from EGRESS_ALLOWLIST (and the active bundles) still drive
-            // subdomain folding so a custom policy keeps the dot-boundary
-            // semantics for those hosts.
-            let mut allow_hosts = parse_allow_hosts(&allowlist_raw);
-            for host in &bundle_hosts {
-                if !allow_hosts.contains(host) {
-                    allow_hosts.push(host.clone());
-                }
-            }
-            let mut policy = EgressPolicy::from_policy_source(&source, allow_hosts)
-                .context("build egress policy from EGRESS_POLICY_PATH")?;
-            // A custom policy bypasses the allowlist seed, so the bundle hosts are
-            // merged as generated permit-Connect rules (one authorization path).
-            // A custom `forbid` still overrides these (forbid-override holds).
-            policy.extend_rules(bundle_hosts.iter().enumerate().map(|(i, host)| {
-                crate::policy::PolicyRule::permit_connect(host, format!("bundle_connect_{i}"))
-            }));
-            policy
+            // Build the custom-policy-path policy with the active bundle hosts
+            // merged in. Factored into a pure helper (no process env) so the
+            // bundle merge on this branch is covered deterministically by a unit
+            // test that drives the real merge code.
+            build_custom_policy(&source, &allowlist_raw, &bundle_hosts)
+                .context("build egress policy from EGRESS_POLICY_PATH")?
         } else {
             if allowlist_raw.is_empty() && integration_rules.is_empty() && bundle_hosts.is_empty() {
                 // Only deny-all now: bundles OFF (=none or all-unknown) AND no
@@ -431,6 +419,49 @@ fn parse_allow_hosts(raw: &str) -> Vec<String> {
         .map(|e| e.trim().trim_matches('.').to_ascii_lowercase())
         .filter(|e| !e.is_empty())
         .collect()
+}
+
+/// Build the shared [`EgressPolicy`] for the custom `EGRESS_POLICY_PATH` branch,
+/// merging the active default-bundle Connect hosts into the operator-supplied
+/// Dogwood source.
+///
+/// This is the pure core of the `EGRESS_POLICY_PATH` arm of
+/// [`EgressShared::from_env`], split out so the bundle merge on this branch is
+/// exercised deterministically by a unit test without mutating process env (the
+/// caller resolves `source`, `allowlist_raw`, and `bundle_hosts` from the
+/// environment and passes them in). The behavior is identical to the inlined
+/// version it replaced:
+///
+/// 1. Hosts from `EGRESS_ALLOWLIST` (`allowlist_raw`) and the active bundles seed
+///    subdomain folding, so a custom policy keeps dot-boundary semantics for
+///    those hosts.
+/// 2. A custom policy bypasses the allowlist `permit`-`Connect` seed, so each
+///    bundle host is merged as a generated `permit`-`Connect` rule
+///    (`bundle_connect_<i>`) via [`EgressPolicy::extend_rules`], keeping one
+///    authorization path.
+/// 3. A custom `forbid` in the source still overrides these bundle permits
+///    (forbid-overrides-permit holds, order-independently).
+///
+/// # Errors
+///
+/// Returns an error when the Dogwood source fails to parse (egress must not boot
+/// fail-open).
+fn build_custom_policy(
+    source: &str,
+    allowlist_raw: &str,
+    bundle_hosts: &[String],
+) -> Result<EgressPolicy> {
+    let mut allow_hosts = parse_allow_hosts(allowlist_raw);
+    for host in bundle_hosts {
+        if !allow_hosts.contains(host) {
+            allow_hosts.push(host.clone());
+        }
+    }
+    let mut policy = EgressPolicy::from_policy_source(source, allow_hosts)?;
+    policy.extend_rules(bundle_hosts.iter().enumerate().map(|(i, host)| {
+        crate::policy::PolicyRule::permit_connect(host, format!("bundle_connect_{i}"))
+    }));
+    Ok(policy)
 }
 
 /// Accept CONNECT tunnels until `cancel` fires. Each connection is handled on its
@@ -922,5 +953,55 @@ mod tests {
         assert!(forbidden("::ffff:127.0.0.1"));
         assert!(forbidden("::ffff:169.254.169.254"));
         assert!(forbidden("::7f00:1")); // ::127.0.0.1 (compatible form)
+    }
+
+    #[test]
+    fn custom_policy_path_merges_bundles_and_forbid_overrides_permit() {
+        // Drive the REAL custom-EGRESS_POLICY_PATH merge path
+        // (`build_custom_policy`, the pure core of `EgressShared::from_env`'s
+        // `EGRESS_POLICY_PATH` arm) with default bundles ON, proving the
+        // `permit_connect` + `extend_rules` wiring end-to-end without mutating
+        // process env. Previously this branch was only covered by a hand-built
+        // Dogwood source in `egress_bundles::tests::forbid_overrides_a_bundled_host`.
+        use crate::egress_bundles::{BundleSelection, connect_hosts};
+
+        // A minimal operator custom source that only forbids a bundled host
+        // (crates.io). It intentionally permits nothing itself, so any host that
+        // is reachable comes from the merged bundle `permit`-`Connect` rules.
+        let source = "@id(\"forbid_crates\")\n\
+             forbid (principal, action == Egress::Action::\"Connect\", resource)\n\
+             when { context.input.host == \"crates.io\" };\n";
+
+        // Default bundles on; no operator EGRESS_ALLOWLIST hosts.
+        let bundle_hosts = connect_hosts(&BundleSelection::All);
+        // Sanity: the bundled hosts we assert on are actually in the selection.
+        assert!(bundle_hosts.iter().any(|h| h == "pypi.org"));
+        assert!(bundle_hosts.iter().any(|h| h == "crates.io"));
+
+        let policy = build_custom_policy(source, "", &bundle_hosts).unwrap();
+
+        // (a) A bundled Connect host with no operator forbid is permitted through
+        // the merged policy (the generated bundle `permit`-`Connect` rule).
+        assert!(
+            policy.decide_connect(CONNECT_SUBJECT, "pypi.org").allowed,
+            "bundled host must be permitted via the merged custom policy"
+        );
+        // Dot-boundary folding still applies to a bundled host on this path.
+        assert!(
+            policy
+                .decide_connect(CONNECT_SUBJECT, "files.pythonhosted.org")
+                .allowed
+        );
+
+        // (b) The operator `forbid` for a bundled host beats the bundle permit
+        // (forbid-overrides-permit), even though the bundle would otherwise
+        // permit crates.io.
+        assert!(
+            !policy.decide_connect(CONNECT_SUBJECT, "crates.io").allowed,
+            "operator forbid must override the bundle permit on the custom path"
+        );
+
+        // A host outside the bundle set and the custom source is still denied.
+        assert!(!policy.decide_connect(CONNECT_SUBJECT, "evil.com").allowed);
     }
 }
