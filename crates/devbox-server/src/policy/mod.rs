@@ -263,7 +263,13 @@ impl EgressPolicy {
         allow_hosts: Vec<String>,
     ) -> anyhow::Result<Self> {
         let rule_ids = scan_rule_ids(policy_source);
-        Self::build(policy_source.to_string(), rule_ids, allow_hosts, Vec::new())
+        // Populate the folding guard from the custom source's own rule hosts
+        // (mirroring how `extend_rules` records each integration rule's host),
+        // so a custom `.dw` rule whose host is a subdomain of an
+        // `EGRESS_ALLOWLIST` entry is matched against its own rule rather than
+        // folded onto the allowlist parent and silently default-denied.
+        let rule_hosts = scan_rule_hosts(policy_source);
+        Self::build(policy_source.to_string(), rule_ids, allow_hosts, rule_hosts)
     }
 
     /// Lower `policy_src` against [`SCHEMA`] once to validate it, then retain
@@ -527,6 +533,55 @@ fn scan_rule_ids(source: &str) -> Vec<String> {
         }
     }
     ids
+}
+
+/// Scan a Dogwood `.dw` source for every `context.input.host == "..."` literal,
+/// in source order, returning the normalized hosts that are the subject of a
+/// rule.
+///
+/// This mirrors [`scan_rule_ids`]: it walks the source line-wise and recovers
+/// each host literal written against `context.input.host`, unescaping it (the
+/// inverse of the escaped Cedar literals this module emits) and normalizing it
+/// through [`normalize_host`] so it is canonicalized identically to a request
+/// host. The result feeds the allowlist-folding guard
+/// ([`EgressPolicy::match_host`]) so folding never rewrites a host out from
+/// under its own rule on the custom `EGRESS_POLICY_PATH` path, exactly as
+/// [`EgressPolicy::extend_rules`] does for compiled integration rules.
+fn scan_rule_hosts(source: &str) -> Vec<String> {
+    let mut hosts = Vec::new();
+    for line in source.lines() {
+        if let Some(host) = parse_host_condition(line.trim()) {
+            hosts.push(normalize_host(&host));
+        }
+    }
+    hosts
+}
+
+/// Parse the host literal from a `context.input.host == "..."` condition line,
+/// returning the (unescaped) host. Returns `None` for any line that is not such
+/// a condition. Only the leading `context.input.host == "<literal>"` fragment is
+/// read, so a compound `when { ... && ... }` line still yields its host.
+fn parse_host_condition(line: &str) -> Option<String> {
+    let idx = line.find("context.input.host")?;
+    let rest = line
+        .get(idx..)?
+        .strip_prefix("context.input.host")?
+        .trim_start();
+    let rest = rest.strip_prefix("==")?.trim_start();
+    let inner = rest.strip_prefix('"')?;
+    // The closing quote is the first unescaped `"`; our emitter only escapes
+    // `\"` and `\\`, so track escaping to find it.
+    let mut escaped = false;
+    for (i, c) in inner.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            return Some(unescape_cedar_str(inner.get(..i)?));
+        }
+    }
+    None
 }
 
 /// Parse an `@id("...")` annotation line, returning the (unescaped) id. Returns
@@ -849,6 +904,70 @@ when {
         // And the allowlisted parent still permits Connect (folding unaffected
         // for hosts without their own rule).
         assert!(policy.decide_connect("i-1", "static.example.com").allowed);
+    }
+
+    #[test]
+    fn custom_source_host_that_is_subdomain_of_allowlist_matches_its_own_rule() {
+        // Regression for the custom `EGRESS_POLICY_PATH` path: a custom `.dw`
+        // HttpRequest permit whose host ("api.example.com") is a subdomain of an
+        // `EGRESS_ALLOWLIST` entry ("example.com") must match its own rule, not
+        // be folded onto the allowlist parent and silently default-denied.
+        // `from_policy_source` derives `rule_hosts` from the source's own host
+        // literals (via scan_rule_hosts), so folding never rewrites a host out
+        // from under its own rule.
+        let policy = r#"
+@id("allow_api_post")
+permit (principal, action == Egress::Action::"HttpRequest", resource)
+when {
+  context.input.host == "api.example.com" &&
+  context.input.method == "POST" &&
+  context.input.path == "/v1/data"
+};
+"#;
+        let engine =
+            EgressPolicy::from_policy_source(policy, vec!["example.com".to_string()]).unwrap();
+        let allow = engine.decide_http("i-1", "api.example.com", "POST", "/v1/data");
+        assert!(
+            allow.allowed,
+            "custom-source subdomain host must match its own rule, not fold: {allow:?}"
+        );
+        assert_eq!(allow.reason, "allow_api_post");
+        // The scoping still default-denies a non-declared method/path on that host.
+        assert!(
+            !engine
+                .decide_http("i-1", "api.example.com", "GET", "/v1/data")
+                .allowed
+        );
+        // A different, uncovered subdomain still default-denies for HTTP (it
+        // folds onto example.com, which carries no HttpRequest permit).
+        assert!(
+            !engine
+                .decide_http("i-1", "other.example.com", "POST", "/v1/data")
+                .allowed
+        );
+    }
+
+    #[test]
+    fn scan_rule_hosts_recovers_normalized_hosts_in_order() {
+        // The scanner mirrors scan_rule_ids: one normalized host per
+        // `context.input.host == "..."` condition, unescaping the Cedar literal
+        // and lowercasing/trimming exactly as request hosts are.
+        let source = r#"
+@id("a")
+permit (principal, action == Egress::Action::"Connect", resource)
+when { context.input.host == "API.Example.com" };
+
+@id("b")
+permit (principal, action == Egress::Action::"HttpRequest", resource)
+when {
+  context.input.host == "two.example.com" &&
+  context.input.method == "GET"
+};
+"#;
+        assert_eq!(
+            scan_rule_hosts(source),
+            vec!["api.example.com".to_string(), "two.example.com".to_string()]
+        );
     }
 
     #[test]
