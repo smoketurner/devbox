@@ -27,7 +27,14 @@
 //! not cover, is a **deny**. The embedding proxy enforces the verdict; this
 //! decision point never fails open.
 //!
-//! # Allowlist bridge
+//! # Host normalization and the allowlist bridge
+//!
+//! Every host — whether it comes from `EGRESS_ALLOWLIST`, a request, or a
+//! compiled integration rule ([`normalize_host`]) — is normalized the **same**
+//! way before it is stored or matched: trimmed, dot-stripped, and lowercased
+//! ([`normalize_host`]). Both sides of every comparison are normalized through
+//! that one function, so a host containing uppercase (e.g. `API.Example.com`)
+//! can never silently fail to match its own rule.
 //!
 //! Hosts are matched by exact equality, so the dynamic host allowlist (legacy
 //! `EGRESS_ALLOWLIST`) is bridged two ways working together: the configured
@@ -36,6 +43,21 @@
 //! [`normalize_to_allowed_host`] *before* matching, so a subdomain of a
 //! permitted host is decided against its parent exactly as today's
 //! [`crate::egress`] `Allowlist` does.
+//!
+//! ## Allowlist folding never rewrites a host that has its own rule
+//!
+//! Subdomain folding exists only to let a subdomain of an `EGRESS_ALLOWLIST`
+//! entry be decided against that parent. It must **not** rewrite a host that is
+//! itself the subject of an explicit rule — otherwise a configured integration
+//! whose host happens to be a subdomain of an allowlisted entry (allowlist
+//! `example.com`, integration host `api.example.com`) would be folded onto
+//! `example.com` before matching and would never match its own
+//! `permit`-`HttpRequest` rule. So folding is applied only when the normalized
+//! request host does not already equal some rule's (normalized) host: an
+//! integration's configured host is always matched as-is, and only genuinely
+//! uncovered subdomains are folded onto an allowlist parent. This keeps the
+//! policy's view of a host and the transport's forward target guaranteed
+//! identical.
 //!
 //! # Custom policy source (`EGRESS_POLICY_PATH`)
 //!
@@ -161,6 +183,10 @@ impl PolicyRule {
     /// A `permit` rule for an HTTP request to `host` scoped to `method` and, when
     /// `path` is `Some`, that exact `path` (a `None` path permits any path on the
     /// host for that method). `id` is surfaced in the decision reason.
+    /// The `host` is normalized through [`normalize_host`] (trim, strip dots,
+    /// lowercase) — the **same** normalization applied to request hosts before
+    /// matching — so a configured integration host containing uppercase still
+    /// matches the lowercased request host.
     pub fn permit_http(
         host: impl Into<String>,
         method: impl Into<String>,
@@ -171,7 +197,7 @@ impl PolicyRule {
             rule: Rule {
                 effect: Effect::Permit,
                 action: Action::HttpRequest,
-                host: host.into(),
+                host: normalize_host(&host.into()),
                 method: Some(method.into()),
                 path,
                 id: Some(id.into()),
@@ -285,7 +311,7 @@ impl EgressPolicy {
     /// coarse constant subject); it is accepted for API stability and future
     /// per-subject rules.
     pub fn decide_connect(&self, _subject: &str, host: &str) -> EgressDecision {
-        let host = normalize_to_allowed_host(host, &self.allow_hosts);
+        let host = self.match_host(host);
         self.evaluate(|rule| rule.matches_connect(&host))
     }
 
@@ -301,7 +327,7 @@ impl EgressPolicy {
         method: &str,
         path: &str,
     ) -> EgressDecision {
-        let host = normalize_to_allowed_host(host, &self.allow_hosts);
+        let host = self.match_host(host);
         self.evaluate(|rule| rule.matches_http(&host, method, path))
     }
 
@@ -312,6 +338,24 @@ impl EgressPolicy {
     /// feature was tested-only and never wired into a production decision path,
     /// so it is dropped. Callers may still invoke this without effect.
     pub fn record_response(&self, _subject: &str, _action: &str, _fields: &[(&str, &str)]) {}
+
+    /// Normalize a request host for matching, folding it onto an allowlist
+    /// parent **only when it is not already the subject of an explicit rule**.
+    ///
+    /// The host is first normalized ([`normalize_host`]: trim, strip dots,
+    /// lowercase) exactly as every rule host is. If that normalized host equals
+    /// some rule's host (e.g. a configured integration host), it is returned
+    /// as-is so it matches its own rule — allowlist folding never rewrites a host
+    /// out from under its own rule. Otherwise the dot-boundary subdomain folding
+    /// of [`normalize_to_allowed_host`] maps a subdomain of an allowlisted entry
+    /// onto that parent.
+    fn match_host(&self, host: &str) -> String {
+        let host = normalize_host(host);
+        if self.rules.iter().any(|rule| rule.host == host) {
+            return host;
+        }
+        normalize_to_allowed_host(&host, &self.allow_hosts)
+    }
 
     /// Evaluate the rule set against a matcher: a matching `forbid` denies, else
     /// a matching `permit` allows, else default-deny.
@@ -340,12 +384,24 @@ impl EgressPolicy {
     }
 }
 
+/// Normalize a single host to its canonical matching form: trimmed of
+/// surrounding whitespace, stripped of leading/trailing dots, and lowercased.
+///
+/// This is the **one** normalization every host flows through — allowlist
+/// entries, request hosts, and compiled integration rule hosts
+/// ([`PolicyRule::permit_http`]) — so the two sides of every comparison are
+/// canonicalized identically and a host's case can never make it fail to match
+/// its own rule.
+pub fn normalize_host(host: &str) -> String {
+    host.trim().trim_matches('.').to_ascii_lowercase()
+}
+
 /// Parse a comma-separated allowlist into normalized host entries, matching the
 /// existing [`crate::egress`] `Allowlist` parsing (lowercase, trim, strip dots,
 /// drop empties).
 fn parse_hosts(raw: &str) -> Vec<String> {
     raw.split(',')
-        .map(|e| e.trim().trim_matches('.').to_ascii_lowercase())
+        .map(normalize_host)
         .filter(|e| !e.is_empty())
         .collect()
 }
@@ -354,8 +410,11 @@ fn parse_hosts(raw: &str) -> Vec<String> {
 /// entry, reproducing the existing egress dot-boundary semantics. A host that is
 /// exactly an entry, or not covered at all, is returned normalized but unchanged
 /// (an uncovered host stays itself and is denied by default).
+///
+/// `host` is expected to already be normalized ([`normalize_host`]); callers in
+/// this module normalize before calling.
 fn normalize_to_allowed_host(host: &str, allow_hosts: &[String]) -> String {
-    let host = host.trim_matches('.').to_ascii_lowercase();
+    let host = normalize_host(host);
     for entry in allow_hosts {
         if host == *entry || host.ends_with(&format!(".{entry}")) {
             return entry.clone();
@@ -591,6 +650,90 @@ mod tests {
             policy.decide_connect(nasty_subject, "crates.io").allowed,
             "subject does not affect host matching"
         );
+    }
+
+    #[test]
+    fn integration_host_with_uppercase_still_matches() {
+        // Regression: a compiled integration rule whose host contains uppercase
+        // must still match the lowercased request host. Both the rule host (via
+        // PolicyRule::permit_http) and the request host (via decide_http) flow
+        // through normalize_host, so the case cannot cause a silent default-deny.
+        let mut policy = policy_from_csv("");
+        policy.extend_rules([PolicyRule::permit_http(
+            "API.Example.com",
+            "POST",
+            Some("/v1/messages".to_string()),
+            "egress_up_0",
+        )]);
+        // Request host arrives lowercased by the HTTP stack; the uppercase rule
+        // host still matches it.
+        let allow = policy.decide_http("i-1", "api.example.com", "POST", "/v1/messages");
+        assert!(
+            allow.allowed,
+            "uppercase-host integration must match: {allow:?}"
+        );
+        assert_eq!(allow.reason, "egress_up_0");
+        // A mixed-case request host also matches (normalized on both sides).
+        assert!(
+            policy
+                .decide_http("i-1", "Api.Example.Com", "POST", "/v1/messages")
+                .allowed
+        );
+        // The declared method/path scoping still holds (default-deny otherwise).
+        assert!(
+            !policy
+                .decide_http("i-1", "api.example.com", "GET", "/v1/messages")
+                .allowed
+        );
+        assert!(
+            !policy
+                .decide_http("i-1", "api.example.com", "POST", "/v1/other")
+                .allowed
+        );
+    }
+
+    #[test]
+    fn integration_host_that_is_subdomain_of_allowlist_matches_its_own_rule() {
+        // Regression: allowlist "example.com" would fold a request to
+        // "api.example.com" onto "example.com" before matching, so an integration
+        // whose host is "api.example.com" would never match its own rule and
+        // every request would 403. Folding must NOT rewrite a host that is itself
+        // the subject of a rule, so the integration host matches as-is.
+        let mut policy = policy_from_csv("example.com");
+        policy.extend_rules([PolicyRule::permit_http(
+            "api.example.com",
+            "POST",
+            Some("/v1/messages".to_string()),
+            "egress_sub_0",
+        )]);
+        let allow = policy.decide_http("i-1", "api.example.com", "POST", "/v1/messages");
+        assert!(
+            allow.allowed,
+            "subdomain-of-allowlist integration host must match its own rule: {allow:?}"
+        );
+        assert_eq!(allow.reason, "egress_sub_0");
+        // The scoping still default-denies a non-declared method/path on that host.
+        assert!(
+            !policy
+                .decide_http("i-1", "api.example.com", "DELETE", "/v1/messages")
+                .allowed
+        );
+        assert!(
+            !policy
+                .decide_http("i-1", "api.example.com", "POST", "/v1/other")
+                .allowed
+        );
+        // A different subdomain of the allowlisted parent (with no integration
+        // rule) still has no HttpRequest permit, so it default-denies for HTTP
+        // (folding onto example.com only yields a Connect permit, not HTTP).
+        assert!(
+            !policy
+                .decide_http("i-1", "other.example.com", "POST", "/v1/messages")
+                .allowed
+        );
+        // And the allowlisted parent still permits Connect (folding unaffected
+        // for hosts without their own rule).
+        assert!(policy.decide_connect("i-1", "static.example.com").allowed);
     }
 
     #[test]

@@ -33,9 +33,18 @@
 //! [`crate::policy::EgressPolicy::extend_rules`] and [`EgressConfig::policy_rules`]),
 //! as `permit`-`HttpRequest` rules for the integration's host. The handler then
 //! authorizes through `decide_http` like any other request — it does not run a
-//! second, parallel method/path check. Because the policy host for an integration
-//! is *derived from the same configured host* the proxy forwards to, the policy's
-//! view and the transport's target cannot drift.
+//! second, parallel method/path check. The policy host for an integration and
+//! the host the proxy forwards to are both derived from the one configured host
+//! by the **same** normalization ([`crate::policy::normalize_host`]: trim, strip
+//! dots, lowercase), so they are guaranteed identical regardless of the host's
+//! case. A configured integration host is matched as-is after that
+//! normalization and is **not** folded onto an `EGRESS_ALLOWLIST` parent even
+//! when it is a subdomain of one — allowlist subdomain folding never rewrites a
+//! host that is itself the subject of a rule (see
+//! [`crate::policy`] "Host normalization and the allowlist bridge"). So an
+//! integration configured as `API.Example.com`, or as `api.example.com` while
+//! `example.com` is allowlisted, still matches its own `permit`-`HttpRequest`
+//! rule.
 //!
 //! # `EGRESS_UPSTREAMS` schema
 //!
@@ -168,7 +177,7 @@ use serde::Deserialize;
 
 use devbox_common::env_non_empty;
 
-use crate::policy::PolicyRule;
+use crate::policy::{PolicyRule, normalize_host};
 // Re-exported so the routes.rs call site `egress_proxy::into_axum_response` keeps
 // resolving while the implementation lives in the shared proxy module.
 pub(crate) use crate::proxy::into_axum_response;
@@ -231,10 +240,11 @@ pub struct EgressProxy {
 /// scoping rules to **compile into the shared policy** at startup.
 ///
 /// Keeping these together at the config seam is what guarantees a single
-/// authorization path: the proxy forwards to an integration's host, and the exact
-/// same host feeds the `permit` rules handed to [`crate::policy::EgressPolicy`],
-/// so the policy and the transport cannot disagree about which host an
-/// integration maps to.
+/// authorization path: the proxy forwards to an integration's host, and that
+/// same host — run through the one [`crate::policy::normalize_host`] both sides
+/// use — feeds the `permit` rules handed to [`crate::policy::EgressPolicy`], so
+/// the policy and the transport cannot disagree about which host an integration
+/// maps to.
 pub struct EgressConfig {
     /// The configured proxy (transport + credential injection).
     pub proxy: Arc<EgressProxy>,
@@ -330,14 +340,18 @@ impl UpstreamSpec {
                  declare at least one permitted method/path (default-deny)"
             );
         }
-        let host = self.host.trim();
+        // Normalize the host the SAME way `decide_http` normalizes the request
+        // host (and the same way the forwarded `Upstream.host` is stored), so the
+        // policy rule host and the transport's forward target are guaranteed
+        // identical and a host containing uppercase cannot silently default-deny.
+        let host = normalize_host(&self.host);
         let rules = self
             .allow
             .iter()
             .enumerate()
             .map(|(i, entry)| {
                 let id = format!("egress_{name}_{i}");
-                PolicyRule::permit_http(host, &entry.method, entry.path.clone(), id)
+                PolicyRule::permit_http(&host, &entry.method, entry.path.clone(), id)
             })
             .collect();
         Ok(rules)
@@ -390,7 +404,10 @@ impl EgressProxy {
             upstreams.insert(
                 name,
                 Upstream {
-                    host: spec.host.trim().to_string(),
+                    // Normalize identically to the compiled policy rule host (see
+                    // `compile_rules`) so the host the proxy forwards to and the
+                    // host `decide_http` authorizes are guaranteed equal.
+                    host: normalize_host(&spec.host),
                     credential,
                 },
             );
@@ -1087,6 +1104,107 @@ mod tests {
         assert!(
             !policy
                 .decide_http("i-1", "evil.example.com", "POST", "/v1/messages")
+                .allowed
+        );
+    }
+
+    #[test]
+    fn compile_rules_normalizes_an_uppercase_host_so_it_is_reachable() {
+        // Regression (host-case asymmetry): an integration configured with an
+        // uppercase host must be reachable. The compiled rule host is normalized
+        // (lowercased) identically to the request host decide_http sees, so the
+        // permitted method/path is allowed and others are denied — rather than
+        // every request silently default-denying with a 403.
+        let spec: UpstreamSpec = serde_json::from_str(
+            r#"{
+                "host": "API.Example.com",
+                "allow": [ { "method": "POST", "path": "/v1/messages" } ],
+                "credential": { "kind": "aws_sigv4", "service": "s", "region": "r" }
+            }"#,
+        )
+        .unwrap();
+        let rules = spec.compile_rules("up").unwrap();
+        let mut policy = crate::policy::EgressPolicy::from_allowlist_csv("").unwrap();
+        policy.extend_rules(rules);
+
+        // The lowercased request host (what the HTTP stack delivers) matches.
+        let allow = policy.decide_http("i-1", "api.example.com", "POST", "/v1/messages");
+        assert!(
+            allow.allowed,
+            "uppercase-host integration must be reachable: {allow:?}"
+        );
+        // Declared scoping still holds.
+        assert!(
+            !policy
+                .decide_http("i-1", "api.example.com", "GET", "/v1/messages")
+                .allowed
+        );
+    }
+
+    #[test]
+    fn compile_rules_host_that_is_subdomain_of_allowlist_matches_its_own_rule() {
+        // Regression (folding asymmetry): with EGRESS_ALLOWLIST "example.com",
+        // an integration whose host is "api.example.com" must still match its own
+        // compiled HttpRequest rule for the permitted method/path (and be denied
+        // for others) — folding must not rewrite the request host onto the
+        // allowlisted parent before matching the child-host rule.
+        let spec: UpstreamSpec = serde_json::from_str(
+            r#"{
+                "host": "api.example.com",
+                "allow": [ { "method": "POST", "path": "/v1/messages" } ],
+                "credential": { "kind": "aws_sigv4", "service": "s", "region": "r" }
+            }"#,
+        )
+        .unwrap();
+        let rules = spec.compile_rules("up").unwrap();
+        // Allowlist contains the PARENT of the integration host.
+        let mut policy = crate::policy::EgressPolicy::from_allowlist_csv("example.com").unwrap();
+        policy.extend_rules(rules);
+
+        let allow = policy.decide_http("i-1", "api.example.com", "POST", "/v1/messages");
+        assert!(
+            allow.allowed,
+            "subdomain-of-allowlist integration host must match its own rule: {allow:?}"
+        );
+        // A non-declared method/path on that host is still denied.
+        assert!(
+            !policy
+                .decide_http("i-1", "api.example.com", "GET", "/v1/messages")
+                .allowed
+        );
+    }
+
+    #[test]
+    fn stored_upstream_host_matches_the_normalized_policy_host() {
+        // The forward target (`Upstream.host`) and the policy rule host must be
+        // byte-for-byte identical so decide_http and forward can never diverge.
+        // Both are produced by `normalize_host`, so an uppercase configured host
+        // is stored (and thus forwarded to) lowercased, exactly as the compiled
+        // rule host.
+        let up = Upstream {
+            host: normalize_host("API.Example.com"),
+            credential: Credential::StaticHeader {
+                header_name: HeaderName::from_static("x-api-key"),
+                value: SecretString::from("k".to_string()),
+            },
+        };
+        assert_eq!(up.host, "api.example.com");
+
+        let spec: UpstreamSpec = serde_json::from_str(
+            r#"{
+                "host": "API.Example.com",
+                "allow": [ { "method": "GET" } ],
+                "credential": { "kind": "aws_sigv4", "service": "s", "region": "r" }
+            }"#,
+        )
+        .unwrap();
+        let rules = spec.compile_rules("up").unwrap();
+        let mut policy = crate::policy::EgressPolicy::from_allowlist_csv("").unwrap();
+        policy.extend_rules(rules);
+        // The forward host (up.host) is exactly the host decide_http allows.
+        assert!(
+            policy
+                .decide_http("i-1", &up.host, "GET", "/anything")
                 .allowed
         );
     }
