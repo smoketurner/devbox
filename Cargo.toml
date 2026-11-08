@@ -125,8 +125,8 @@ aws-sdk-dsql = { version = "=1.63.0", default-features = false }
 aws-sdk-ec2 = { version = "=1.243.0", default-features = false }
 aws-sdk-ssm = { version = "=1.118.0", default-features = false }
 aws-sdk-sts = { version = "=1.110.0", default-features = false }
-aws-sigv4 = { version = "=1.5.1", default-features = false, features = ["sign-http", "http1"] }
-aws-smithy-runtime-api = { version = "=1.14.0", default-features = false, features = ["client"] }
+aws-sigv4 = { version = "=1.5.1", default-features = false }
+aws-smithy-runtime-api = { version = "=1.14.0", default-features = false }
 axum = { version = "=0.8.9", default-features = false }
 base64 = { version = "=0.23.0", default-features = false }
 bytes = { version = "=1.12.1", default-features = false }
