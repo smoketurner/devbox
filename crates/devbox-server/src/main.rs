@@ -131,12 +131,20 @@ async fn main() -> Result<()> {
         .context("initialize git reverse proxy")?
         .map(Arc::new);
 
-    // The credential-injecting reverse proxy registry: upstream hosts + their
-    // server-held credentials (static SSM secrets / SigV4). `None` when
-    // EGRESS_UPSTREAMS is unset so local/dev boots without AWS.
-    let egress_proxy = devbox_server::egress_proxy::EgressProxy::from_env(&aws_config)
+    // The exe.dev-style integrations layer: a registry of operator-configured
+    // upstreams (host + inline method/path scoping + server-held credential, from
+    // EGRESS_UPSTREAMS). `None` when EGRESS_UPSTREAMS is unset so local/dev boots
+    // without AWS. The returned config carries BOTH the transport-owning proxy and
+    // the compiled per-integration policy rules, which are merged into the single
+    // shared EgressPolicy below so authorization flows through one decide_http.
+    let mut egress_integrations = devbox_server::egress_proxy::EgressProxy::from_env(&aws_config)
         .await
-        .context("initialize egress reverse proxy")?;
+        .context("initialize egress integrations layer")?;
+    let integration_rules = egress_integrations
+        .as_mut()
+        .map(devbox_server::egress_proxy::EgressConfig::policy_rules)
+        .unwrap_or_default();
+    let egress_proxy = egress_integrations.map(|cfg| cfg.proxy);
 
     // Build the shared egress policy + decision sink ONCE, independently of the
     // CONNECT listener address. The SAME EgressPolicy (one native rule set) and
@@ -150,7 +158,12 @@ async fn main() -> Result<()> {
     // usable shared policy instead of a None that would deny every request.
     let connect_addr_set = std::env::var_os("EGRESS_PROXY_ADDR").is_some_and(|v| !v.is_empty());
     let egress_shared = if connect_addr_set || egress_proxy.is_some() {
-        Some(devbox_server::egress::EgressShared::from_env()?)
+        // The per-integration method/path scoping compiled from EGRESS_UPSTREAMS is
+        // merged into the shared policy here, so the reverse proxy's decide_http and
+        // the CONNECT gate share exactly one rule set.
+        Some(devbox_server::egress::EgressShared::from_env(
+            integration_rules,
+        )?)
     } else {
         None
     };

@@ -1,22 +1,111 @@
-//! Credential-injecting reverse proxy for arbitrary configured upstreams.
+//! Credential-injecting reverse proxy for server-configured integrations.
 //!
-//! This generalizes the GitHub git reverse proxy ([`crate::github::git_proxy`])
-//! beyond the git case. A box points a specific flow at the control plane
-//! (`/egress/{upstream}/{*rest}`), authenticates with its web-identity token
-//! exactly as the git proxy does (so the server resolves a verified
-//! [`crate::auth::AgentIdentity`]), and the control plane:
+//! This is the **exe.dev-style integrations layer**: an operator-configurable
+//! registry of outbound integrations where the *control plane* holds the
+//! credentials and injects them into upstream requests, so a secret (an API key,
+//! an AWS signature) never reaches the box or the agent running on it. A box
+//! points a specific flow at `/egress/{integration}/{*rest}`, authenticates with
+//! its web-identity token exactly as the git proxy does ([`crate::github::git_proxy`],
+//! so the server resolves a verified [`crate::auth::AgentIdentity`]), and the
+//! control plane:
 //!
-//! 1. applies the shared native [`crate::policy::EgressPolicy`] on `host` +
-//!    `method` + `path` ([`crate::policy::EgressPolicy::decide_http`]) —
-//!    default-deny, the same policy instance as the CONNECT proxy
-//!    ([`crate::egress`]);
-//! 2. on allow, forwards the request upstream with a **server-held** credential
-//!    injected (a static header/bearer or an AWS SigV4 signature), after
-//!    stripping any client-supplied `Authorization`;
-//! 3. streams the upstream response back; and
-//! 4. emits a decision record for every allow and deny (the same JSONL
-//!    record type and sink as the CONNECT proxy, [`crate::egress::DecisionRecord`]
-//!    / [`crate::egress::DecisionSink`]).
+//! 1. resolves the named integration to its single configured upstream host
+//!    (unknown name => 404);
+//! 2. applies the shared native [`crate::policy::EgressPolicy`] on that host +
+//!    the request `method` + `path` ([`crate::policy::EgressPolicy::decide_http`])
+//!    — default-deny, the **same policy instance** as the CONNECT proxy
+//!    ([`crate::egress`]), so there is exactly one authorization path (policy
+//!    deny => 403);
+//! 3. on allow, forwards the request to the configured upstream host over
+//!    `https` with a **server-held** credential injected, after stripping any
+//!    client-supplied `Authorization`;
+//! 4. streams the upstream response back; and
+//! 5. emits a decision record for every allow and deny (the same JSONL record
+//!    type and sink as the CONNECT proxy, [`crate::egress::DecisionRecord`] /
+//!    [`crate::egress::DecisionSink`]).
+//!
+//! # Separation of concerns
+//!
+//! The proxy owns **transport + credential injection only**. The allow/deny
+//! decision belongs entirely to the native [`crate::policy::EgressPolicy`]. The
+//! per-integration `method`/`path` scoping declared in `EGRESS_UPSTREAMS` is
+//! **compiled into that shared policy at startup** (see
+//! [`crate::policy::EgressPolicy::extend_rules`] and [`EgressConfig::policy_rules`]),
+//! as `permit`-`HttpRequest` rules for the integration's host. The handler then
+//! authorizes through `decide_http` like any other request — it does not run a
+//! second, parallel method/path check. Because the policy host for an integration
+//! is *derived from the same configured host* the proxy forwards to, the policy's
+//! view and the transport's target cannot drift.
+//!
+//! # `EGRESS_UPSTREAMS` schema
+//!
+//! `EGRESS_UPSTREAMS` is a JSON object mapping a stable **integration name** (the
+//! `/egress/{name}/` path segment — pick a short, DNS-ish token) to a spec:
+//!
+//! - `host` (string, required): the single upstream host requests are forwarded
+//!   to, e.g. `api.anthropic.com`. The proxy only ever speaks to this host over
+//!   `https`; it is never attacker-controlled. Must be non-empty.
+//! - `allow` (array, required, non-empty): the method/path scoping for this
+//!   integration. Each entry is `{ "method": "POST", "path": "/v1/messages" }`.
+//!   `method` is required; `path` is an optional exact match (omit it to permit
+//!   any path for that method). These compile into the shared policy as
+//!   `permit`-`HttpRequest` rules, so a request whose method/path matches no
+//!   entry is denied (default-deny => 403). An empty `allow` is rejected at
+//!   startup so an integration can never be configured wide-open by omission.
+//! - `credential` (object, required): how the server-held credential is injected
+//!   (`kind: "static_header"` or `kind: "aws_sigv4"`, see below).
+//!
+//! ## Worked example 1 — Anthropic (static header from an SSM SecureString)
+//!
+//! Inject `x-api-key: <secret>` where the secret is read once at startup from an
+//! SSM SecureString, and scope the integration to the Messages API only:
+//!
+//! ```json
+//! {
+//!   "anthropic": {
+//!     "host": "api.anthropic.com",
+//!     "allow": [
+//!       { "method": "POST", "path": "/v1/messages" },
+//!       { "method": "GET",  "path": "/v1/models" }
+//!     ],
+//!     "credential": {
+//!       "kind": "static_header",
+//!       "header": "x-api-key",
+//!       "ssm_param": "/devbox/egress/anthropic-key"
+//!     }
+//!   }
+//! }
+//! ```
+//!
+//! The box calls `POST /egress/anthropic/v1/messages`; the control plane forwards
+//! it to `https://api.anthropic.com/v1/messages` with `x-api-key` injected. A
+//! `Bearer`-style header is expressed with the optional `prefix`, e.g.
+//! `{ "kind": "static_header", "header": "authorization", "prefix": "Bearer ",
+//! "ssm_param": "..." }`.
+//!
+//! ## Worked example 2 — Bedrock (AWS SigV4)
+//!
+//! Sign requests with the control plane task role's own AWS credentials (no
+//! stored secret), scoped to model invocation:
+//!
+//! ```json
+//! {
+//!   "bedrock": {
+//!     "host": "bedrock-runtime.us-east-1.amazonaws.com",
+//!     "allow": [
+//!       { "method": "POST", "path": "/model/anthropic.claude-3-sonnet/invoke" }
+//!     ],
+//!     "credential": {
+//!       "kind": "aws_sigv4",
+//!       "service": "bedrock",
+//!       "region": "us-east-1"
+//!     }
+//!   }
+//! }
+//! ```
+//!
+//! The box calls `POST /egress/bedrock/model/.../invoke`; the control plane signs
+//! the outbound request with SigV4 for `service`/`region` and forwards it.
 //!
 //! # Why a reverse proxy (not MITM)
 //!
@@ -33,23 +122,34 @@
 //! uses its real instance id as the policy subject, so policy can discriminate
 //! per box.
 //!
-//! # Secrets
+//! # The credential-never-reaches-the-box guarantee
 //!
 //! Static-header secrets are read on the control plane from an SSM SecureString
 //! via the task role at startup (mirroring [`crate::github::GitHubApp`]), wrapped
-//! in [`secrecy::SecretString`], and never logged. When SSM/AWS is unconfigured
-//! the whole proxy is absent ([`EgressProxy::from_env`] returns `Ok(None)`), so
-//! local/dev boots without AWS. SigV4 providers sign with the task role's own
-//! credentials; no long-lived secret is stored for them.
+//! in [`secrecy::SecretString`], and never logged (they are not in any `Debug`
+//! output and never serialized). SigV4 providers sign with the task role's own
+//! credentials; no long-lived secret is stored for them. A client-supplied
+//! `Authorization` header is **always** stripped before the server injects its
+//! own credential, so a box can never smuggle or override the credential. When
+//! SSM/AWS is unconfigured the whole proxy is absent ([`EgressProxy::from_env`]
+//! returns `Ok(None)` for the proxy), so local/dev boots without AWS.
+//!
+//! # Validation (fail-closed at startup)
+//!
+//! [`EgressProxy::from_env`] rejects, at startup, before the listener binds: a
+//! malformed `EGRESS_UPSTREAMS` JSON; an integration with an empty `host`; an
+//! empty `allow` list; an invalid HTTP header name; an unknown credential `kind`
+//! (serde rejects it); and a configured-but-unreadable SSM secret (a hard error
+//! rather than a silently broken upstream).
 //!
 //! # Rollout ordering (devbox-infra)
 //!
 //! A box choosing to route a flow through `/egress/*` instead of the CONNECT
 //! tunnel is a **box-facing** change: it is subject to the devbox-infra agent
-//! contract (release the agent -> rebuild the AMI -> land infra). The new server
-//! env (`EGRESS_UPSTREAMS`) and any referenced SSM parameters must be provisioned
-//! in devbox-infra **separately**; this crate only reads them. devbox-infra is
-//! not edited here.
+//! contract (release the agent -> rebuild the AMI -> land infra). The server env
+//! (`EGRESS_UPSTREAMS`) and any referenced SSM parameters must be provisioned in
+//! devbox-infra **separately**; this crate only reads them. devbox-infra is not
+//! edited here.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -68,6 +168,7 @@ use serde::Deserialize;
 
 use devbox_common::env_non_empty;
 
+use crate::policy::PolicyRule;
 // Re-exported so the routes.rs call site `egress_proxy::into_axum_response` keeps
 // resolving while the implementation lives in the shared proxy module.
 pub(crate) use crate::proxy::into_axum_response;
@@ -125,16 +226,44 @@ pub struct EgressProxy {
     upstreams: HashMap<String, Upstream>,
 }
 
+/// The result of configuring the integrations layer from the environment: the
+/// transport-owning [`EgressProxy`] plus the per-integration `method`/`path`
+/// scoping rules to **compile into the shared policy** at startup.
+///
+/// Keeping these together at the config seam is what guarantees a single
+/// authorization path: the proxy forwards to an integration's host, and the exact
+/// same host feeds the `permit` rules handed to [`crate::policy::EgressPolicy`],
+/// so the policy and the transport cannot disagree about which host an
+/// integration maps to.
+pub struct EgressConfig {
+    /// The configured proxy (transport + credential injection).
+    pub proxy: Arc<EgressProxy>,
+    /// `permit`-`HttpRequest` rules, one per `(integration host, allow entry)`,
+    /// to merge into the shared [`crate::policy::EgressPolicy`].
+    policy_rules: Vec<PolicyRule>,
+}
+
+impl EgressConfig {
+    /// Take ownership of the compiled policy rules for merging into the shared
+    /// policy (see [`crate::policy::EgressPolicy::extend_rules`]).
+    pub fn policy_rules(&mut self) -> Vec<PolicyRule> {
+        std::mem::take(&mut self.policy_rules)
+    }
+}
+
 /// JSON shape of one entry in `EGRESS_UPSTREAMS` (a JSON object mapping an
-/// upstream name to this spec).
+/// integration name to this spec). See the module docs for the full schema and
+/// two worked examples.
 ///
 /// ```json
 /// {
 ///   "anthropic": { "host": "api.anthropic.com",
+///                  "allow": [ { "method": "POST", "path": "/v1/messages" } ],
 ///                  "credential": { "kind": "static_header",
 ///                                  "header": "x-api-key",
 ///                                  "ssm_param": "/devbox/egress/anthropic-key" } },
 ///   "bedrock":   { "host": "bedrock-runtime.us-east-1.amazonaws.com",
+///                  "allow": [ { "method": "POST", "path": "/model/x/invoke" } ],
 ///                  "credential": { "kind": "aws_sigv4",
 ///                                  "service": "bedrock", "region": "us-east-1" } }
 /// }
@@ -143,11 +272,27 @@ pub struct EgressProxy {
 struct UpstreamSpec {
     /// The allowed upstream host.
     host: String,
+    /// The method/path scoping for this integration, compiled into the shared
+    /// policy as `permit`-`HttpRequest` rules. Must be non-empty.
+    allow: Vec<RouteRuleSpec>,
     /// How to inject the credential.
     credential: CredentialSpec,
 }
 
-/// JSON shape of an upstream's credential config. Tagged by `kind`.
+/// JSON shape of one `allow` entry: the method and optional exact path an
+/// integration permits. `method` is required; a `None` `path` permits any path
+/// for that method.
+#[derive(Debug, Deserialize)]
+struct RouteRuleSpec {
+    /// The HTTP method this entry permits (e.g. `"POST"`).
+    method: String,
+    /// The exact request path this entry permits (e.g. `"/v1/messages"`). When
+    /// omitted, any path is permitted for `method`.
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// JSON shape of an integration's credential config. Tagged by `kind`.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum CredentialSpec {
@@ -166,6 +311,39 @@ enum CredentialSpec {
     AwsSigV4 { service: String, region: String },
 }
 
+impl UpstreamSpec {
+    /// Validate the non-credential parts of the spec and compile its `allow`
+    /// entries into `permit`-`HttpRequest` [`PolicyRule`]s for `name`'s host.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `host` is empty/whitespace or when `allow` is empty
+    /// (an integration must be explicitly scoped — it is never wide-open by
+    /// omission).
+    fn compile_rules(&self, name: &str) -> Result<Vec<PolicyRule>> {
+        if self.host.trim().is_empty() {
+            anyhow::bail!("egress integration '{name}' has an empty host");
+        }
+        if self.allow.is_empty() {
+            anyhow::bail!(
+                "egress integration '{name}' has an empty 'allow' list; an integration must \
+                 declare at least one permitted method/path (default-deny)"
+            );
+        }
+        let host = self.host.trim();
+        let rules = self
+            .allow
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                let id = format!("egress_{name}_{i}");
+                PolicyRule::permit_http(host, &entry.method, entry.path.clone(), id)
+            })
+            .collect();
+        Ok(rules)
+    }
+}
+
 impl EgressProxy {
     /// Build the proxy from `EGRESS_UPSTREAMS`, or `Ok(None)` when it is unset so
     /// local/dev boots without AWS.
@@ -178,15 +356,16 @@ impl EgressProxy {
     /// # Errors
     ///
     /// Returns an error when `EGRESS_UPSTREAMS` is set but is not valid JSON, when
-    /// an upstream names an invalid header, or when a static-header SSM read fails
-    /// or times out (a configured-but-unreadable secret is a hard startup error
-    /// rather than a silently broken upstream).
-    pub async fn from_env(aws_config: &SdkConfig) -> Result<Option<Arc<Self>>> {
+    /// an integration has an empty host or an empty `allow` list, when it names an
+    /// invalid header or unknown credential kind, or when a static-header SSM read
+    /// fails or times out (a configured-but-unreadable secret is a hard startup
+    /// error rather than a silently broken upstream).
+    pub async fn from_env(aws_config: &SdkConfig) -> Result<Option<EgressConfig>> {
         let Some(raw) = env_non_empty(UPSTREAMS_ENV) else {
             return Ok(None);
         };
         let specs: HashMap<String, UpstreamSpec> = serde_json::from_str(&raw)
-            .with_context(|| format!("parse {UPSTREAMS_ENV} as a JSON upstream map"))?;
+            .with_context(|| format!("parse {UPSTREAMS_ENV} as a JSON integration map"))?;
         if specs.is_empty() {
             return Ok(None);
         }
@@ -197,14 +376,21 @@ impl EgressProxy {
         };
 
         let mut upstreams = HashMap::new();
+        let mut policy_rules = Vec::new();
         for (name, spec) in specs {
+            // Validate + compile the method/path scoping BEFORE touching AWS, so a
+            // misconfigured integration fails fast without an SSM round-trip.
+            let rules = spec
+                .compile_rules(&name)
+                .with_context(|| format!("configure egress integration '{name}'"))?;
             let credential = build_credential(aws_config, &spec.credential, &credentials)
                 .await
-                .with_context(|| format!("configure egress upstream '{name}'"))?;
+                .with_context(|| format!("configure egress integration '{name}'"))?;
+            policy_rules.extend(rules);
             upstreams.insert(
                 name,
                 Upstream {
-                    host: spec.host,
+                    host: spec.host.trim().to_string(),
                     credential,
                 },
             );
@@ -212,7 +398,10 @@ impl EgressProxy {
 
         let client = proxy::build_client("devbox-server-egress-proxy")?;
 
-        Ok(Some(Arc::new(Self { client, upstreams })))
+        Ok(Some(EgressConfig {
+            proxy: Arc::new(Self { client, upstreams }),
+            policy_rules,
+        }))
     }
 
     /// The host for a configured upstream, or `None` when unknown. Used by the
@@ -763,33 +952,142 @@ mod tests {
     fn upstream_spec_parses_both_credential_kinds() {
         let raw = r#"{
             "anthropic": { "host": "api.anthropic.com",
+                           "allow": [ { "method": "POST", "path": "/v1/messages" },
+                                      { "method": "GET", "path": "/v1/models" } ],
                            "credential": { "kind": "static_header", "header": "x-api-key",
                                            "ssm_param": "/devbox/egress/anthropic" } },
             "bedrock":   { "host": "bedrock-runtime.us-east-1.amazonaws.com",
+                           "allow": [ { "method": "POST", "path": "/model/x/invoke" } ],
                            "credential": { "kind": "aws_sigv4", "service": "bedrock",
                                            "region": "us-east-1" } }
         }"#;
         let specs: HashMap<String, UpstreamSpec> = serde_json::from_str(raw).unwrap();
         assert_eq!(specs.len(), 2);
 
-        let anthropic = specs.get("anthropic").map(|s| &s.credential);
+        let anthropic = specs
+            .iter()
+            .find(|(k, _)| *k == "anthropic")
+            .map(|(_, v)| v)
+            .unwrap();
+        assert_eq!(anthropic.allow.len(), 2);
         assert!(
             matches!(
-                anthropic,
-                Some(CredentialSpec::StaticHeader { header, ssm_param, .. })
+                &anthropic.credential,
+                CredentialSpec::StaticHeader { header, ssm_param, .. }
                     if header == "x-api-key" && ssm_param == "/devbox/egress/anthropic"
             ),
-            "anthropic must parse as a static_header: {anthropic:?}"
+            "anthropic must parse as a static_header: {:?}",
+            anthropic.credential
         );
 
-        let bedrock = specs.get("bedrock").map(|s| &s.credential);
+        let bedrock = specs
+            .iter()
+            .find(|(k, _)| *k == "bedrock")
+            .map(|(_, v)| v)
+            .unwrap();
+        assert_eq!(bedrock.allow.len(), 1);
         assert!(
             matches!(
-                bedrock,
-                Some(CredentialSpec::AwsSigV4 { service, region })
+                &bedrock.credential,
+                CredentialSpec::AwsSigV4 { service, region }
                     if service == "bedrock" && region == "us-east-1"
             ),
-            "bedrock must parse as aws_sigv4: {bedrock:?}"
+            "bedrock must parse as aws_sigv4: {:?}",
+            bedrock.credential
+        );
+    }
+
+    #[test]
+    fn unknown_credential_kind_is_rejected() {
+        // An unknown credential kind must not parse — serde's tagged enum rejects
+        // it, so a typo'd/invalid kind is a hard startup error, not a silently
+        // credential-less upstream.
+        let raw = r#"{
+            "x": { "host": "api.example.com",
+                   "allow": [ { "method": "GET" } ],
+                   "credential": { "kind": "telepathy" } }
+        }"#;
+        let parsed: Result<HashMap<String, UpstreamSpec>, _> = serde_json::from_str(raw);
+        assert!(parsed.is_err(), "unknown credential kind must not parse");
+    }
+
+    #[test]
+    fn compile_rules_rejects_empty_host() {
+        let spec: UpstreamSpec = serde_json::from_str(
+            r#"{ "host": "   ", "allow": [ { "method": "GET" } ],
+                 "credential": { "kind": "aws_sigv4", "service": "s", "region": "r" } }"#,
+        )
+        .unwrap();
+        assert!(
+            spec.compile_rules("bad").is_err(),
+            "an empty host must be rejected at startup"
+        );
+    }
+
+    #[test]
+    fn compile_rules_rejects_empty_allow() {
+        let spec: UpstreamSpec = serde_json::from_str(
+            r#"{ "host": "api.example.com", "allow": [],
+                 "credential": { "kind": "aws_sigv4", "service": "s", "region": "r" } }"#,
+        )
+        .unwrap();
+        assert!(
+            spec.compile_rules("open").is_err(),
+            "an empty allow list must be rejected (never wide-open by omission)"
+        );
+    }
+
+    #[test]
+    fn compile_rules_produces_permit_rules_enforced_by_the_policy() {
+        // The compiled rules, merged into an EgressPolicy, must permit exactly the
+        // declared method+path for the integration's host and default-deny the
+        // rest — proving the inline EGRESS_UPSTREAMS scoping flows through the
+        // single decide_http authorization path.
+        let spec: UpstreamSpec = serde_json::from_str(
+            r#"{
+                "host": "api.anthropic.com",
+                "allow": [ { "method": "POST", "path": "/v1/messages" },
+                           { "method": "GET" } ],
+                "credential": { "kind": "static_header", "header": "x-api-key",
+                                "ssm_param": "/devbox/egress/anthropic" }
+            }"#,
+        )
+        .unwrap();
+        let rules = spec.compile_rules("anthropic").unwrap();
+        assert_eq!(rules.len(), 2);
+
+        let mut policy = crate::policy::EgressPolicy::from_allowlist_csv("").unwrap();
+        policy.extend_rules(rules);
+
+        // Exact declared POST /v1/messages is permitted.
+        assert!(
+            policy
+                .decide_http("i-1", "api.anthropic.com", "POST", "/v1/messages")
+                .allowed
+        );
+        // A path-less GET entry permits any path for GET.
+        assert!(
+            policy
+                .decide_http("i-1", "api.anthropic.com", "GET", "/v1/anything")
+                .allowed
+        );
+        // A method not declared is denied (default-deny).
+        assert!(
+            !policy
+                .decide_http("i-1", "api.anthropic.com", "DELETE", "/v1/messages")
+                .allowed
+        );
+        // The right method but a non-declared exact path is denied.
+        assert!(
+            !policy
+                .decide_http("i-1", "api.anthropic.com", "POST", "/v1/other")
+                .allowed
+        );
+        // A different host is denied even for the declared method/path.
+        assert!(
+            !policy
+                .decide_http("i-1", "evil.example.com", "POST", "/v1/messages")
+                .allowed
         );
     }
 }

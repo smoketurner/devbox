@@ -861,6 +861,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn egress_proxy_disallowed_path_is_403_for_a_known_integration() {
+        // Method/path scoping through the handler: the integration name is known
+        // (so NOT a 404), its policy permits only POST /v1/messages, and a request
+        // to a DIFFERENT path on the same host is default-denied => 403. This pins
+        // that the inline EGRESS_UPSTREAMS scoping is enforced via decide_http at
+        // the handler boundary, not merely at the unit level.
+        let policy_src = r#"
+            [
+              {
+                "effect": "permit",
+                "action": "http_request",
+                "host": "api.anthropic.com",
+                "method": "POST",
+                "path": "/v1/messages",
+                "id": "egress_anthropic_0"
+              }
+            ]
+        "#;
+        let policy = crate::policy::EgressPolicy::from_policy_source(
+            policy_src,
+            vec!["api.anthropic.com".to_string()],
+        )
+        .unwrap();
+        let state = setup_state_with_egress("anthropic", "api.anthropic.com", policy).await;
+
+        // A path the integration does not permit: known upstream, so 403 (deny),
+        // never 404.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/egress/anthropic/v1/other")
+            .header(AUTHORIZATION, "Bearer any-token-resolves-to-test-agent")
+            .body(Body::empty())
+            .unwrap();
+        let status = build_router(state).oneshot(req).await.unwrap().status();
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a known integration with an unmatched path must 403 (default-deny), not 404"
+        );
+    }
+
+    #[tokio::test]
     async fn egress_proxy_unknown_upstream_is_404_even_when_authenticated() {
         // With a valid agent identity but an unconfigured upstream name, the
         // handler 404s via host_for BEFORE the policy call — the single 404 gate.

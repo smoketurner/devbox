@@ -13,7 +13,16 @@ targets = [
 ]
 
 [advisories]
-ignore = []
+ignore = [
+    # pin-utils (RUSTSEC-2026-0441): unmaintained. Pre-existing and transitive —
+    # it is pulled in only via the AWS SDK (aws-smithy-http -> aws-config / the
+    # aws-sdk-* crates), not by any devbox code. 0.1.0 is the only published
+    # version, so there is no safe upgrade or dedupe; the fix must come from the
+    # upstream AWS SDK dropping it. This is the sole remaining advisory after the
+    # dependency bumps (FEAT-001) and the dogwood removal (FEAT-002), both of
+    # which fixed their advisories at the source rather than ignoring them.
+    "RUSTSEC-2026-0441",
+]
 
 [licenses]
 confidence-threshold = 0.8

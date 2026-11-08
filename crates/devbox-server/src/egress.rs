@@ -230,15 +230,21 @@ impl EgressShared {
     /// Records are emitted via `tracing` and, when `EGRESS_DECISION_LOG` is set,
     /// appended to that file.
     ///
+    /// `integration_rules` are the per-integration method/path `permit` rules
+    /// compiled from `EGRESS_UPSTREAMS` (see [`crate::egress_proxy`]); they are
+    /// appended to the policy so the reverse proxy's `decide_http` and the CONNECT
+    /// gate share one rule set (a single authorization path). Pass an empty vec
+    /// when the integrations layer is not configured.
+    ///
     /// # Errors
     ///
     /// Returns an error when `EGRESS_POLICY_PATH` is set but unreadable, when the
     /// policy source fails to parse (egress must not boot fail-open), or when
     /// `EGRESS_DECISION_LOG` cannot be opened.
-    pub fn from_env() -> Result<Self> {
+    pub fn from_env(integration_rules: Vec<crate::policy::PolicyRule>) -> Result<Self> {
         let allowlist_raw = env_non_empty(ALLOWLIST_ENV).unwrap_or_default();
 
-        let policy = if let Some(policy_path) = env_non_empty(POLICY_PATH_ENV) {
+        let mut policy = if let Some(policy_path) = env_non_empty(POLICY_PATH_ENV) {
             let source = std::fs::read_to_string(&policy_path)
                 .with_context(|| format!("read {POLICY_PATH_ENV} at {policy_path}"))?;
             // Hosts from EGRESS_ALLOWLIST still drive subdomain folding so a
@@ -247,15 +253,20 @@ impl EgressShared {
             EgressPolicy::from_policy_source(&source, allow_hosts)
                 .context("build egress policy from EGRESS_POLICY_PATH")?
         } else {
-            if allowlist_raw.is_empty() {
+            if allowlist_raw.is_empty() && integration_rules.is_empty() {
                 tracing::warn!(
-                    "egress enabled with an empty allowlist; all CONNECT egress is denied \
-                     (reverse-proxy upstreams require a matching EGRESS_POLICY_PATH permit)"
+                    "egress enabled with an empty allowlist and no integrations; all egress \
+                     is denied (configure EGRESS_ALLOWLIST, EGRESS_POLICY_PATH, or \
+                     EGRESS_UPSTREAMS)"
                 );
             }
             EgressPolicy::from_allowlist_csv(&allowlist_raw)
                 .context("build egress policy from EGRESS_ALLOWLIST")?
         };
+
+        // Compile the inline EGRESS_UPSTREAMS method/path scoping into the SAME
+        // policy, so there is exactly one authorization path for both gates.
+        policy.extend_rules(integration_rules);
 
         Ok(Self {
             policy: Arc::new(policy),

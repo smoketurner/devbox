@@ -144,6 +144,47 @@ struct Rule {
     id: Option<String>,
 }
 
+/// A policy rule constructed programmatically by another module (rather than
+/// parsed from a JSON source), used to compile per-integration method/path
+/// scoping into the shared policy (see [`EgressPolicy::extend_rules`]).
+///
+/// This is the public, constructable mirror of the private [`Rule`]: callers
+/// outside this module cannot name `Rule`/`Effect`/`Action` directly, so they
+/// build a `PolicyRule` through [`PolicyRule::permit_http`] and the policy
+/// converts it internally.
+#[derive(Clone, Debug)]
+pub struct PolicyRule {
+    rule: Rule,
+}
+
+impl PolicyRule {
+    /// A `permit` rule for an HTTP request to `host` scoped to `method` and, when
+    /// `path` is `Some`, that exact `path` (a `None` path permits any path on the
+    /// host for that method). `id` is surfaced in the decision reason.
+    pub fn permit_http(
+        host: impl Into<String>,
+        method: impl Into<String>,
+        path: Option<String>,
+        id: impl Into<String>,
+    ) -> Self {
+        Self {
+            rule: Rule {
+                effect: Effect::Permit,
+                action: Action::HttpRequest,
+                host: host.into(),
+                method: Some(method.into()),
+                path,
+                id: Some(id.into()),
+            },
+        }
+    }
+
+    /// Consume into the private internal [`Rule`].
+    fn into_rule(self) -> Rule {
+        self.rule
+    }
+}
+
 impl Rule {
     /// Whether this rule matches a `Connect` request to `host`.
     fn matches_connect(&self, host: &str) -> bool {
@@ -219,6 +260,20 @@ impl EgressPolicy {
         let rules: Vec<Rule> = serde_json::from_str(policy_source)
             .map_err(|e| anyhow::anyhow!("parse egress policy source: {e}"))?;
         Ok(Self { rules, allow_hosts })
+    }
+
+    /// Append pre-parsed [`PolicyRule`]s to this policy's rule set.
+    ///
+    /// Used to **compile per-integration method/path scoping** (defined inline in
+    /// `EGRESS_UPSTREAMS`, see [`crate::egress_proxy`]) into the single shared
+    /// policy at startup, so the reverse proxy's `decide_http` authorization flows
+    /// through the same rule set as the CONNECT gate — one authorization path, no
+    /// parallel ad-hoc check. Rules are appended, so a pre-existing `forbid` still
+    /// overrides a later integration `permit` for the same target (forbid-override
+    /// is order-independent).
+    pub fn extend_rules(&mut self, rules: impl IntoIterator<Item = PolicyRule>) {
+        self.rules
+            .extend(rules.into_iter().map(PolicyRule::into_rule));
     }
 
     /// Decide whether `subject` (a box instance id) may `Connect` to `host`.
