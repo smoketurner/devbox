@@ -6,15 +6,15 @@
 //! exactly as the git proxy does (so the server resolves a verified
 //! [`crate::auth::AgentIdentity`]), and the control plane:
 //!
-//! 1. applies the shared Dogwood [`crate::policy::EgressPolicy`] on `host` +
+//! 1. applies the shared native [`crate::policy::EgressPolicy`] on `host` +
 //!    `method` + `path` ([`crate::policy::EgressPolicy::decide_http`]) —
-//!    default-deny, same engine/event-history instance as the CONNECT proxy
+//!    default-deny, the same policy instance as the CONNECT proxy
 //!    ([`crate::egress`]);
 //! 2. on allow, forwards the request upstream with a **server-held** credential
 //!    injected (a static header/bearer or an AWS SigV4 signature), after
 //!    stripping any client-supplied `Authorization`;
 //! 3. streams the upstream response back; and
-//! 4. emits a Dogwood decision record for every allow and deny (the same JSONL
+//! 4. emits a decision record for every allow and deny (the same JSONL
 //!    record type and sink as the CONNECT proxy, [`crate::egress::DecisionRecord`]
 //!    / [`crate::egress::DecisionSink`]).
 //!

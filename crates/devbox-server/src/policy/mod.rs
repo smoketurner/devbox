@@ -1,78 +1,76 @@
-//! Egress policy decision point backed by the Dogwood policy language.
+//! Egress policy decision point backed by a native, in-crate rule engine.
 //!
-//! This module adopts the published Dogwood crates
-//! ([`dogwood_language`] + [`dogwood_local_engine`], both Apache-2.0, from the
-//! `dogwood-policy` org) rather than hand-rolling a permit/forbid evaluator. It
-//! wraps a Dogwood engine behind a small, devbox-specific API — [`EgressPolicy`]
-//! — that FEAT-003 (the CONNECT host gate) and FEAT-004 (the method/path-aware
-//! reverse proxy) consume as a stable internal interface.
+//! This module implements a small permit/forbid evaluator tailored to the
+//! devbox egress gates. It wraps the rule set behind a devbox-specific API —
+//! [`EgressPolicy`] — that the CONNECT host gate ([`crate::egress`]) and the
+//! method/path-aware reverse proxy ([`crate::egress_proxy`]) consume as a stable
+//! internal interface.
 //!
 //! # Model
 //!
-//! Dogwood is Cedar-derived: a [`SCHEMA`] declares a namespace with `entity`
-//! items (a `Box` principal and a `Gateway` resource) and `action` items
-//! (`Connect` and `HttpRequest`) each carrying a `context` input type. Policies
-//! are `permit`/`forbid` rules; evaluation is default-deny and `forbid`
-//! overrides `permit`. A request event yields a decision; a response event is
-//! recorded as history that temporal clauses (`when temporal { formerly ... }`)
-//! can reason over.
+//! A policy is an ordered list of [`Rule`]s. Each rule has an [`Effect`]
+//! (`Permit`/`Forbid`), a target [`Action`] (`Connect` or `HttpRequest`), an
+//! exact-match `host`, optional exact-match `method`/`path` (HTTP only), and an
+//! `id` used as the decision reason string. Evaluation is **default-deny** (a
+//! request matching no `permit` is denied) and **forbid overrides permit** (a
+//! single matching `forbid` denies regardless of any permit).
+//!
+//! Matching is exact string equality on `host` (Connect) and on
+//! `host` + `method` + `path` (HttpRequest). Because matching compares plain
+//! Rust strings, a crafted instance id or host cannot "break out" of the matcher
+//! the way a string interpolated into a policy DSL could — there is no DSL to
+//! inject into.
 //!
 //! # Fail-closed
 //!
-//! Every engine error, every non-decision outcome, and every policy that fails
-//! to install is treated as a **deny**. The embedding proxy enforces the
-//! verdict; this decision point never fails open.
+//! Every non-matching request, and every request for an action the policy does
+//! not cover, is a **deny**. The embedding proxy enforces the verdict; this
+//! decision point never fails open.
 //!
 //! # Allowlist bridge
 //!
-//! Dogwood matches context fields by exact string equality, so the dynamic host
-//! allowlist (legacy `EGRESS_ALLOWLIST`) is bridged two ways working together:
-//! the configured hosts are rendered into generated `permit` rules in the policy
-//! source at load time (one rule per host), and the existing egress dot-boundary
-//! subdomain semantics are applied by [`normalize_to_allowed_host`] *before* the
-//! policy call, so a subdomain of a permitted host is decided against its parent
-//! exactly as today's [`crate::egress`] `Allowlist` does.
-
-use std::sync::Mutex;
-
-use dogwood_language::{Event, EventBuilder, Value};
-use dogwood_local_engine::{DurableTemporalEngine, Outcome};
-
-/// The egress gateway schema (Cedar-derived Dogwood syntax).
-///
-/// Field names here are the stable contract FEAT-003/004 build events against:
-/// `Connect` carries `context.input.host`; `HttpRequest` carries
-/// `context.input.host`, `context.input.method`, and `context.input.path`.
-pub const SCHEMA: &str = r#"
-namespace Egress {
-  type ConnectInput = { host: String };
-  type HttpInput = { host: String, method: String, path: String };
-  entity Box = { instance_id: String } tags String;
-  entity Gateway;
-  action "Connect" appliesTo {
-    principal: [Box],
-    resource: [Gateway],
-    context: { input: ConnectInput }
-  };
-  action "HttpRequest" appliesTo {
-    principal: [Box],
-    resource: [Gateway],
-    context: { input: HttpInput }
-  };
-}
-"#;
-
-/// The action-type path for this schema's actions (the `Action` component
-/// included), used with [`Event::builder_for`] so hosts/methods/paths that
-/// contain `:` never get mangled by the combined-string parser.
-const ACTION_NAMESPACE: &[&str] = &["Egress", "Action"];
-
-/// The `Gateway` resource every egress event acts on.
-const GATEWAY_UID: &str = "Egress::Gateway::\"egress\"";
-
-/// Snapshot cadence for the durable engine: snapshot every N appended events.
-/// Non-zero so the on-disk log stays bounded on a long-lived gateway.
-const SNAPSHOT_INTERVAL: u64 = 1000;
+//! Hosts are matched by exact equality, so the dynamic host allowlist (legacy
+//! `EGRESS_ALLOWLIST`) is bridged two ways working together: the configured
+//! hosts are rendered into generated `permit`-`Connect` rules (one per host),
+//! and the egress dot-boundary subdomain semantics are applied by
+//! [`normalize_to_allowed_host`] *before* matching, so a subdomain of a
+//! permitted host is decided against its parent exactly as today's
+//! [`crate::egress`] `Allowlist` does.
+//!
+//! # Custom policy source (`EGRESS_POLICY_PATH`)
+//!
+//! The custom-policy escape hatch loads a **JSON** document (replacing the
+//! removed Dogwood/Cedar `.dw` syntax). The document is a JSON array of rule
+//! objects:
+//!
+//! ```json
+//! [
+//!   { "effect": "permit", "action": "connect", "host": "crates.io", "id": "allow_crates" },
+//!   {
+//!     "effect": "permit",
+//!     "action": "http_request",
+//!     "host": "api.anthropic.com",
+//!     "method": "POST",
+//!     "path": "/v1/messages",
+//!     "id": "allow_messages"
+//!   },
+//!   { "effect": "forbid", "action": "connect", "host": "blocked.example.com" }
+//! ]
+//! ```
+//!
+//! Field reference:
+//! - `effect`: `"permit"` or `"forbid"` (required).
+//! - `action`: `"connect"` or `"http_request"` (required).
+//! - `host`: exact host to match (required).
+//! - `method`, `path`: optional exact matches; only meaningful for
+//!   `http_request` rules. When omitted, any method/path matches.
+//! - `id`: optional annotation surfaced in the decision reason. Defaults to the
+//!   rule's effect name when omitted.
+//!
+//! This is a deliberate, documented behaviour change from the previous
+//! Dogwood-based `.dw` source. The temporal `formerly within <dur>` clause the
+//! old engine supported is **not** reimplemented: it was tested-only and never
+//! wired into any production decision path, so it is dropped.
 
 /// The decision returned by the egress policy: an allow/deny plus a human
 /// reason suitable for a decision record or a debug log line.
@@ -102,19 +100,87 @@ impl EgressDecision {
     }
 }
 
-/// The egress policy decision point: a Dogwood engine plus the normalized host
-/// allowlist used to map subdomains onto their permitted parent before the
-/// policy call.
+/// A rule effect: whether a matching rule permits or forbids the request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Effect {
+    /// Allow a matching request (unless a `Forbid` also matches).
+    Permit,
+    /// Deny a matching request; overrides any `Permit`.
+    Forbid,
+}
+
+/// The egress action a rule targets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Action {
+    /// A CONNECT tunnel to a host (host-only matching).
+    Connect,
+    /// A reverse-proxied HTTP request (host + optional method/path matching).
+    HttpRequest,
+}
+
+/// A single egress policy rule.
 ///
-/// The engine is held behind a [`Mutex`] because Dogwood's `submit` takes
-/// `&mut self`. The guard is acquired, the event submitted, the verdict copied
-/// out, and the guard dropped synchronously — it is never held across an
-/// `.await` (the `await_holding_lock` lint is denied), so the public methods are
-/// deliberately synchronous.
+/// `method`/`path` are only consulted for [`Action::HttpRequest`] rules; when
+/// `None` they match any method/path. The `id` is surfaced as the decision
+/// reason so [`crate::egress::DecisionRecord`] reasons stay meaningful.
+#[derive(Clone, Debug, serde::Deserialize)]
+struct Rule {
+    /// Permit or forbid.
+    effect: Effect,
+    /// The action this rule applies to.
+    action: Action,
+    /// The exact host this rule matches.
+    host: String,
+    /// Optional exact method match (HTTP only).
+    #[serde(default)]
+    method: Option<String>,
+    /// Optional exact path match (HTTP only).
+    #[serde(default)]
+    path: Option<String>,
+    /// Optional annotation surfaced in the decision reason.
+    #[serde(default)]
+    id: Option<String>,
+}
+
+impl Rule {
+    /// Whether this rule matches a `Connect` request to `host`.
+    fn matches_connect(&self, host: &str) -> bool {
+        matches!(self.action, Action::Connect) && self.host == host
+    }
+
+    /// Whether this rule matches an `HttpRequest` to `host`/`method`/`path`.
+    /// An absent `method`/`path` on the rule is a wildcard for that field.
+    fn matches_http(&self, host: &str, method: &str, path: &str) -> bool {
+        matches!(self.action, Action::HttpRequest)
+            && self.host == host
+            && self.method.as_deref().is_none_or(|m| m == method)
+            && self.path.as_deref().is_none_or(|p| p == path)
+    }
+
+    /// The reason string for a decision attributed to this rule.
+    fn reason(&self) -> String {
+        match &self.id {
+            Some(id) => id.clone(),
+            None => match self.effect {
+                Effect::Permit => "permit".to_string(),
+                Effect::Forbid => "forbid".to_string(),
+            },
+        }
+    }
+}
+
+/// The egress policy decision point: an ordered rule set plus the normalized
+/// host allowlist used to map subdomains onto their permitted parent before
+/// matching.
+///
+/// The decision methods are synchronous and lock-free: evaluation only reads the
+/// immutable rule set, so decisions are cheap and never held across an `.await`.
 pub struct EgressPolicy {
-    engine: Mutex<DurableTemporalEngine>,
+    rules: Vec<Rule>,
     /// Normalized allowlist entries, used only to fold a subdomain onto its
-    /// permitted parent host before handing the host to the engine.
+    /// permitted parent host before matching.
     allow_hosts: Vec<String>,
 }
 
@@ -123,174 +189,100 @@ impl EgressPolicy {
     /// backward compatibility: each listed host (and its subdomains, via the
     /// existing dot-boundary semantics) permits `Connect`.
     ///
-    /// The engine is opened at `store_path`; that redb-backed store holds the
-    /// temporal EVENT HISTORY the engine recovers across restarts (the prior
-    /// Connect/HttpRequest events temporal clauses read). It does not hold the
-    /// policy itself; the policy is the Dogwood source installed here.
-    ///
     /// # Errors
     ///
-    /// Returns an error when the temporal event-history store cannot be opened,
-    /// or when the generated default policy or schema fails to install.
-    pub fn from_allowlist_csv(raw: &str, store_path: &std::path::Path) -> anyhow::Result<Self> {
+    /// This constructor is infallible today, but returns `Result` to keep the
+    /// call sites stable and allow future validation; it never returns `Err`.
+    pub fn from_allowlist_csv(raw: &str) -> anyhow::Result<Self> {
         let hosts = parse_hosts(raw);
-        let policy = default_policy_from_hosts(&hosts);
-        Self::install(&policy, store_path, hosts)
+        let rules = default_rules_from_hosts(&hosts);
+        Ok(Self {
+            rules,
+            allow_hosts: hosts,
+        })
     }
 
-    /// Build an egress policy from an explicit Dogwood policy source, for the
-    /// richer future configuration path. The caller supplies the full policy
-    /// text; `allow_hosts` are the normalized hosts used for subdomain folding
-    /// before the policy call (pass an empty slice to disable folding).
+    /// Build an egress policy from an explicit native policy source (JSON; see
+    /// the module docs), for the richer custom-configuration path. The caller
+    /// supplies the full policy document; `allow_hosts` are the normalized hosts
+    /// used for subdomain folding before matching (pass an empty vec to disable
+    /// folding).
     ///
     /// # Errors
     ///
-    /// Returns an error when the temporal event-history store cannot be opened,
-    /// or when the supplied policy or schema fails to install.
+    /// Returns an error when `policy_source` is not valid JSON or does not match
+    /// the documented rule-array schema.
     pub fn from_policy_source(
         policy_source: &str,
-        store_path: &std::path::Path,
         allow_hosts: Vec<String>,
     ) -> anyhow::Result<Self> {
-        Self::install(policy_source, store_path, allow_hosts)
-    }
-
-    /// Open the durable temporal event-history engine and install `policy_source`
-    /// against [`SCHEMA`].
-    fn install(
-        policy_source: &str,
-        store_path: &std::path::Path,
-        allow_hosts: Vec<String>,
-    ) -> anyhow::Result<Self> {
-        let mut engine = DurableTemporalEngine::open(store_path, SNAPSHOT_INTERVAL)
-            .map_err(|e| anyhow::anyhow!("open dogwood store: {e}"))?;
-        engine
-            .install(policy_source, SCHEMA, None, None)
-            .map_err(|e| anyhow::anyhow!("install egress policy: {e}"))?;
-        Ok(Self {
-            engine: Mutex::new(engine),
-            allow_hosts,
-        })
+        let rules: Vec<Rule> = serde_json::from_str(policy_source)
+            .map_err(|e| anyhow::anyhow!("parse egress policy source: {e}"))?;
+        Ok(Self { rules, allow_hosts })
     }
 
     /// Decide whether `subject` (a box instance id) may `Connect` to `host`.
     ///
     /// Fails closed: a subdomain is first folded onto its permitted parent, then
-    /// the Dogwood engine decides. Any engine error or non-decision outcome
-    /// yields a deny.
-    pub fn decide_connect(&self, subject: &str, host: &str) -> EgressDecision {
+    /// the rule set is evaluated (forbid overrides permit, default-deny).
+    ///
+    /// `subject` does not participate in matching today (the CONNECT hop uses a
+    /// coarse constant subject); it is accepted for API stability and future
+    /// per-subject rules.
+    pub fn decide_connect(&self, _subject: &str, host: &str) -> EgressDecision {
         let host = normalize_to_allowed_host(host, &self.allow_hosts);
-        let event = Event::builder_for(ACTION_NAMESPACE, "Connect", "request")
-            .principal(&box_uid(subject))
-            .resource(GATEWAY_UID)
-            .field("input", "host", Value::String(host.clone()))
-            .request_context("input", "host", Value::String(host));
-        self.decide(event, "Connect")
+        self.evaluate(|rule| rule.matches_connect(&host))
     }
 
     /// Decide whether `subject` may issue an `HttpRequest` with `method` and
     /// `path` to `host`.
     ///
-    /// Fails closed, with the same subdomain folding and error handling as
-    /// [`Self::decide_connect`].
+    /// Fails closed, with the same subdomain folding and forbid-override /
+    /// default-deny semantics as [`Self::decide_connect`].
     pub fn decide_http(
         &self,
-        subject: &str,
+        _subject: &str,
         host: &str,
         method: &str,
         path: &str,
     ) -> EgressDecision {
         let host = normalize_to_allowed_host(host, &self.allow_hosts);
-        let event = Event::builder_for(ACTION_NAMESPACE, "HttpRequest", "request")
-            .principal(&box_uid(subject))
-            .resource(GATEWAY_UID)
-            .field("input", "host", Value::String(host.clone()))
-            .field("input", "method", Value::String(method.to_string()))
-            .field("input", "path", Value::String(path.to_string()))
-            .request_context("input", "host", Value::String(host))
-            .request_context("input", "method", Value::String(method.to_string()))
-            .request_context("input", "path", Value::String(path.to_string()));
-        self.decide(event, "HttpRequest")
+        self.evaluate(|rule| rule.matches_http(&host, method, path))
     }
 
-    /// Record a response event in the engine's history so temporal clauses can
-    /// reason over it. Response events get no verdict; a failure is logged and
-    /// swallowed (it only means a later temporal permit will not fire, which is
-    /// the fail-closed direction).
+    /// Record a response event.
     ///
-    /// `fields` are added to the response event's `input` group.
-    pub fn record_response(&self, subject: &str, action: &str, fields: &[(&str, &str)]) {
-        let mut event = Event::builder_for(ACTION_NAMESPACE, action, "response")
-            .principal(&box_uid(subject))
-            .resource(GATEWAY_UID);
-        for (name, value) in fields {
-            event = event.field("input", name, Value::String((*value).to_string()));
-        }
-        let Ok(mut guard) = self.engine.lock() else {
-            tracing::error!(
-                action,
-                "egress policy engine mutex poisoned; response dropped"
-            );
-            return;
-        };
-        if let Err(e) = guard.submit(event) {
-            tracing::warn!(action, error = %e, "egress policy response record failed");
-        }
-    }
+    /// Retained as a no-op for API stability. The previous Dogwood engine kept a
+    /// temporal event history that `formerly within <dur>` clauses read; that
+    /// feature was tested-only and never wired into a production decision path,
+    /// so it is dropped. Callers may still invoke this without effect.
+    pub fn record_response(&self, _subject: &str, _action: &str, _fields: &[(&str, &str)]) {}
 
-    /// Submit a request `event` and translate the outcome into an
-    /// [`EgressDecision`], failing closed on any error or non-decision outcome.
-    fn decide(&self, event: EventBuilder, action: &str) -> EgressDecision {
-        let outcome = {
-            let Ok(mut guard) = self.engine.lock() else {
-                return EgressDecision::deny("egress policy engine mutex poisoned");
-            };
-            // Submit under the lock, copy the verdict out, drop the guard before
-            // returning — never held across an await.
-            match guard.submit(event) {
-                Ok(submitted) => submitted.outcome,
-                Err(e) => {
-                    tracing::warn!(action, error = %e, "egress policy submit failed; deny");
-                    return EgressDecision::deny(format!("engine error: {e}"));
+    /// Evaluate the rule set against a matcher: a matching `forbid` denies, else
+    /// a matching `permit` allows, else default-deny.
+    fn evaluate(&self, matches: impl Fn(&Rule) -> bool) -> EgressDecision {
+        let mut permit: Option<&Rule> = None;
+        for rule in &self.rules {
+            if !matches(rule) {
+                continue;
+            }
+            match rule.effect {
+                // A forbid short-circuits: it overrides any permit.
+                Effect::Forbid => return EgressDecision::deny(rule.reason()),
+                // Remember the first matching permit, but keep scanning for a
+                // later forbid that would override it.
+                Effect::Permit => {
+                    if permit.is_none() {
+                        permit = Some(rule);
+                    }
                 }
             }
-        };
-        match outcome {
-            Outcome::Decision(response) => {
-                if response.allowed() {
-                    EgressDecision::allow(decision_reason(&response, "permit"))
-                } else {
-                    EgressDecision::deny(decision_reason(&response, "default-deny"))
-                }
-            }
-            Outcome::Recorded => {
-                tracing::error!(action, "egress request unexpectedly recorded; deny");
-                EgressDecision::deny("request event was recorded, not decided")
-            }
+        }
+        match permit {
+            Some(rule) => EgressDecision::allow(rule.reason()),
+            None => EgressDecision::deny("default-deny"),
         }
     }
-}
-
-/// Summarize the determining policies of a decision for a reason string.
-fn decision_reason(response: &dogwood_local_engine::DecisionResponse, fallback: &str) -> String {
-    let ids: Vec<&str> = response
-        .diagnostics()
-        .reason()
-        .filter_map(|p| p.annotation_id())
-        .collect();
-    if ids.is_empty() {
-        fallback.to_string()
-    } else {
-        ids.join(",")
-    }
-}
-
-/// The `Box` principal entity UID for a box instance id.
-fn box_uid(instance_id: &str) -> String {
-    // Escape embedded quotes/backslashes so a crafted instance id cannot break
-    // out of the entity-id string literal.
-    let escaped = instance_id.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("Egress::Box::\"{escaped}\"")
 }
 
 /// Parse a comma-separated allowlist into normalized host entries, matching the
@@ -317,23 +309,26 @@ fn normalize_to_allowed_host(host: &str, allow_hosts: &[String]) -> String {
     host
 }
 
-/// Render a default-deny policy that permits `Connect` to each configured host.
+/// Render a default-deny rule set that permits `Connect` to each configured
+/// host.
 ///
-/// Default-deny is implicit in Dogwood (a request with no matching `permit` is
-/// denied); this emits one annotated `permit` per host. Hosts are matched by
-/// exact equality on `context.input.host` — subdomains are folded onto their
-/// parent by [`normalize_to_allowed_host`] before the policy call.
-fn default_policy_from_hosts(hosts: &[String]) -> String {
-    let mut policy = String::new();
-    for (i, host) in hosts.iter().enumerate() {
-        let escaped = host.replace('\\', "\\\\").replace('"', "\\\"");
-        policy.push_str(&format!(
-            "@id(\"allow_connect_{i}\")\n\
-             permit (principal, action == Egress::Action::\"Connect\", resource)\n\
-             when {{ context.input.host == \"{escaped}\" }};\n\n"
-        ));
-    }
-    policy
+/// Default-deny is implicit (a request with no matching `permit` is denied);
+/// this emits one annotated `permit`-`Connect` rule per host. Hosts are matched
+/// by exact equality — subdomains are folded onto their parent by
+/// [`normalize_to_allowed_host`] before matching.
+fn default_rules_from_hosts(hosts: &[String]) -> Vec<Rule> {
+    hosts
+        .iter()
+        .enumerate()
+        .map(|(i, host)| Rule {
+            effect: Effect::Permit,
+            action: Action::Connect,
+            host: host.clone(),
+            method: None,
+            path: None,
+            id: Some(format!("allow_connect_{i}")),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -344,39 +339,28 @@ fn default_policy_from_hosts(hosts: &[String]) -> String {
 mod tests {
     use super::*;
 
-    /// A fresh engine store under a unique temp directory per test.
-    fn store_path(name: &str) -> std::path::PathBuf {
-        let pid = std::process::id();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("devbox-egress-policy-{name}-{pid}-{nanos}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join("store.redb")
-    }
-
-    fn policy_from_csv(name: &str, csv: &str) -> EgressPolicy {
-        EgressPolicy::from_allowlist_csv(csv, &store_path(name)).unwrap()
+    fn policy_from_csv(csv: &str) -> EgressPolicy {
+        EgressPolicy::from_allowlist_csv(csv).unwrap()
     }
 
     #[test]
     fn default_deny_denies_unconfigured_host() {
-        let policy = policy_from_csv("deny", "crates.io");
+        let policy = policy_from_csv("crates.io");
         let d = policy.decide_connect("i-123", "evil.com");
         assert!(!d.allowed, "unconfigured host must be denied: {d:?}");
+        assert_eq!(d.reason, "default-deny");
     }
 
     #[test]
     fn permitted_host_allows_connect() {
-        let policy = policy_from_csv("allow", "crates.io, github.com");
+        let policy = policy_from_csv("crates.io, github.com");
         assert!(policy.decide_connect("i-123", "crates.io").allowed);
         assert!(policy.decide_connect("i-123", "github.com").allowed);
     }
 
     #[test]
     fn subdomain_matches_like_egress_allowlist() {
-        let policy = policy_from_csv("subdomain", "crates.io, github.com");
+        let policy = policy_from_csv("crates.io, github.com");
         // Subdomains of a permitted host are allowed (static.crates.io when
         // crates.io is), exactly like egress::Allowlist.
         assert!(policy.decide_connect("i-1", "static.crates.io").allowed);
@@ -389,10 +373,10 @@ mod tests {
 
     #[test]
     fn allowlist_outcome_parity_with_egress_allowlist() {
-        // Representative host set decided through the Dogwood policy must match
+        // Representative host set decided through the native policy must match
         // the legacy egress Allowlist's allow/deny outcome for each host.
         let csv = "crates.io, static.crates.io, github.com";
-        let policy = policy_from_csv("parity", csv);
+        let policy = policy_from_csv(csv);
         let cases = [
             ("crates.io", true),
             ("static.crates.io", true),
@@ -411,7 +395,7 @@ mod tests {
 
     #[test]
     fn empty_allowlist_denies_everything() {
-        let policy = policy_from_csv("empty", "");
+        let policy = policy_from_csv("");
         assert!(!policy.decide_connect("i-1", "crates.io").allowed);
     }
 
@@ -419,25 +403,22 @@ mod tests {
     fn http_request_discriminates_method_and_path() {
         // Permit only GET /v1/data to api.example.com; everything else denied.
         let policy = r#"
-@id("allow_get_data")
-permit (principal, action == Egress::Action::"HttpRequest", resource)
-when {
-  context.input.host == "api.example.com" &&
-  context.input.method == "GET" &&
-  context.input.path == "/v1/data"
-};
-"#;
-        let engine = EgressPolicy::from_policy_source(
-            policy,
-            &store_path("http"),
-            vec!["api.example.com".to_string()],
-        )
-        .unwrap();
-        assert!(
-            engine
-                .decide_http("i-1", "api.example.com", "GET", "/v1/data")
-                .allowed
-        );
+            [
+              {
+                "effect": "permit",
+                "action": "http_request",
+                "host": "api.example.com",
+                "method": "GET",
+                "path": "/v1/data",
+                "id": "allow_get_data"
+              }
+            ]
+        "#;
+        let engine =
+            EgressPolicy::from_policy_source(policy, vec!["api.example.com".to_string()]).unwrap();
+        let allow = engine.decide_http("i-1", "api.example.com", "GET", "/v1/data");
+        assert!(allow.allowed);
+        assert_eq!(allow.reason, "allow_get_data");
         // Wrong method.
         assert!(
             !engine
@@ -455,75 +436,111 @@ when {
     #[test]
     fn forbid_overrides_permit() {
         let policy = r#"
-@id("allow_all_connect")
-permit (principal, action == Egress::Action::"Connect", resource);
-
-@id("forbid_quarantined")
-forbid (principal, action == Egress::Action::"Connect", resource)
-when { context.input.host == "blocked.example.com" };
-"#;
-        let engine =
-            EgressPolicy::from_policy_source(policy, &store_path("forbid"), Vec::new()).unwrap();
+            [
+              { "effect": "permit", "action": "connect", "host": "ok.example.com", "id": "allow_ok" },
+              { "effect": "permit", "action": "connect", "host": "blocked.example.com", "id": "allow_blocked" },
+              { "effect": "forbid", "action": "connect", "host": "blocked.example.com", "id": "forbid_quarantined" }
+            ]
+        "#;
+        let engine = EgressPolicy::from_policy_source(policy, Vec::new()).unwrap();
         // A host the permit would allow is still denied by the forbid.
-        assert!(!engine.decide_connect("i-1", "blocked.example.com").allowed);
-        // Another host is allowed by the blanket permit.
+        let deny = engine.decide_connect("i-1", "blocked.example.com");
+        assert!(!deny.allowed);
+        assert_eq!(deny.reason, "forbid_quarantined");
+        // Another host is allowed by its permit.
         assert!(engine.decide_connect("i-1", "ok.example.com").allowed);
     }
 
     #[test]
-    fn temporal_clause_gates_on_prior_event() {
-        // HttpRequest is permitted only if the same box recorded a Connect
-        // response within the last hour. This exercises the temporal engine's
-        // event history: a request is denied based on earlier recorded events.
+    fn forbid_overrides_permit_regardless_of_order() {
+        // A permit appearing AFTER a forbid for the same host must still be
+        // overridden by the forbid — forbid-override is order-independent.
         let policy = r#"
-@id("allow_connect")
-permit (principal, action == Egress::Action::"Connect", resource);
+            [
+              { "effect": "forbid", "action": "connect", "host": "blocked.example.com", "id": "forbid_first" },
+              { "effect": "permit", "action": "connect", "host": "blocked.example.com", "id": "allow_second" }
+            ]
+        "#;
+        let engine = EgressPolicy::from_policy_source(policy, Vec::new()).unwrap();
+        assert!(!engine.decide_connect("i-1", "blocked.example.com").allowed);
+    }
 
-@id("http_after_connect")
-permit (principal, action == Egress::Action::"HttpRequest", resource)
-when temporal {
-  formerly within 1h Egress::Action::"Connect"::response{ input.host: context.input.host }
-};
-"#;
-        let engine = EgressPolicy::from_policy_source(
-            policy,
-            &store_path("temporal"),
-            vec!["api.example.com".to_string()],
-        )
-        .unwrap();
-        // Before any connect, the HttpRequest has no prior event and is denied.
-        assert!(
-            !engine
-                .decide_http("i-1", "api.example.com", "GET", "/")
-                .allowed,
-            "http without a prior connect must be denied by the temporal clause"
-        );
-        // Record a Connect response for the same host...
+    #[test]
+    fn record_response_is_a_noop() {
+        // Temporal history was dropped; record_response is retained as a no-op
+        // for API stability and must not change any later decision.
+        let policy = r#"
+            [
+              {
+                "effect": "permit",
+                "action": "http_request",
+                "host": "api.example.com",
+                "method": "GET",
+                "path": "/",
+                "id": "allow_root"
+              }
+            ]
+        "#;
+        let engine =
+            EgressPolicy::from_policy_source(policy, vec!["api.example.com".to_string()]).unwrap();
+        // Before any recorded response.
+        let before = engine
+            .decide_http("i-1", "api.example.com", "GET", "/")
+            .allowed;
         engine.record_response("i-1", "Connect", &[("host", "api.example.com")]);
-        // ...now the HttpRequest is permitted because a Connect response exists
-        // within the window.
+        // After — identical, because record_response does nothing.
+        let after = engine
+            .decide_http("i-1", "api.example.com", "GET", "/")
+            .allowed;
+        assert!(before);
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn unknown_action_fails_closed() {
+        // A policy source with an unrecognized action value fails to parse,
+        // which the caller must treat as a hard error (fail closed) rather than
+        // silently loading an empty/permissive policy.
+        let bad = r#"[{ "effect": "permit", "action": "telepathy", "host": "x" }]"#;
+        let err = EgressPolicy::from_policy_source(bad, Vec::new());
+        assert!(err.is_err(), "unknown action must not parse");
+    }
+
+    #[test]
+    fn allowlist_policy_default_denies_http_requests() {
+        // The allowlist-derived policy permits Connect only; an HttpRequest to
+        // the same host is default-denied (fail-closed for the uncovered
+        // action).
+        let policy = policy_from_csv("api.example.com");
+        let d = policy.decide_http("i-1", "api.example.com", "POST", "/v1/data");
+        assert!(!d.allowed, "allowlist policy must not permit http: {d:?}");
+        assert_eq!(d.reason, "default-deny");
+    }
+
+    #[test]
+    fn crafted_host_or_subject_cannot_break_matching() {
+        // The old Dogwood adapter had to escape quotes/backslashes when
+        // interpolating the instance id into a Cedar entity-id literal. The
+        // native matcher compares plain Rust strings, so there is no DSL to
+        // inject into: a host or subject full of quotes/backslashes/policy
+        // syntax simply does not equal any configured host and is denied.
+        let policy = policy_from_csv("crates.io");
+        let nasty_subject = "i-\"); permit(principal, action, resource); //";
+        let nasty_host = "crates.io\" || true || \"";
         assert!(
-            engine
-                .decide_http("i-1", "api.example.com", "GET", "/")
-                .allowed,
-            "http after a recorded connect within the window must be allowed"
+            !policy.decide_connect(nasty_subject, nasty_host).allowed,
+            "injection-style host must not match"
+        );
+        // A legitimate host still works even with a nasty subject.
+        assert!(
+            policy.decide_connect(nasty_subject, "crates.io").allowed,
+            "subject does not affect host matching"
         );
     }
 
     #[test]
-    fn fail_closed_when_action_not_in_schema() {
-        // An event whose action is not in the installed schema is unservable;
-        // the engine errors and the decision must fail closed (deny).
-        let policy = policy_from_csv("failclosed", "crates.io");
-        let event = Event::builder_for(ACTION_NAMESPACE, "Nonexistent", "request")
-            .principal(&box_uid("i-1"))
-            .resource(GATEWAY_UID)
-            .field("input", "host", Value::String("crates.io".to_string()))
-            .request_context("input", "host", Value::String("crates.io".to_string()));
-        let decision = policy.decide(event, "Nonexistent");
-        assert!(
-            !decision.allowed,
-            "unservable event must fail closed: {decision:?}"
-        );
+    fn allowlist_is_infallible() {
+        // from_allowlist_csv never errors, even on odd input.
+        assert!(EgressPolicy::from_allowlist_csv(", ,, . .").is_ok());
     }
 }

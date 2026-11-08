@@ -139,9 +139,9 @@ async fn main() -> Result<()> {
         .context("initialize egress reverse proxy")?;
 
     // Build the shared egress policy + decision sink ONCE, independently of the
-    // CONNECT listener address. The SAME EgressPolicy (one Dogwood engine + event
-    // history) and the same decision sink back BOTH the CONNECT listener and the
-    // reverse proxy's decide_http, per the temporal link requirement.
+    // CONNECT listener address. The SAME EgressPolicy (one native rule set) and
+    // the same decision sink back BOTH the CONNECT listener and the reverse
+    // proxy's decide_http, so both gates share one policy and one audit sink.
     //
     // It is built whenever egress is configured at all: either the CONNECT
     // listener (EGRESS_PROXY_ADDR) or the reverse proxy (EGRESS_UPSTREAMS => an

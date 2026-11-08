@@ -1,7 +1,7 @@
 //! Policy-driven HTTPS CONNECT forward proxy.
 //!
 //! A devbox sets `HTTPS_PROXY` at this listener; for each `CONNECT host:443` the
-//! proxy asks the Dogwood [`EgressPolicy`] (default-deny) whether the host is
+//! proxy asks the native [`EgressPolicy`] (default-deny) whether the host is
 //! permitted, resolves it, refuses any non-public IP (SSRF / IMDS / RFC1918
 //! protection), then relays the encrypted TLS bytes. It runs as a second listener
 //! in the server binary, independent of the API router.
@@ -20,7 +20,6 @@
 //! proxy, not here. The policy is therefore a fleet-wide host gate on this path.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -36,15 +35,11 @@ use crate::policy::{EgressDecision, EgressPolicy};
 
 const PROXY_ADDR_ENV: &str = "EGRESS_PROXY_ADDR";
 const ALLOWLIST_ENV: &str = "EGRESS_ALLOWLIST";
-/// Optional path to a Dogwood policy source file (`.dw`). When set, it replaces
-/// the allowlist-derived default policy; `EGRESS_ALLOWLIST` is still read and its
-/// hosts are used for subdomain folding before the policy call.
+/// Optional path to a native egress policy source file (JSON; see
+/// [`crate::policy`]). When set, it replaces the allowlist-derived default
+/// policy; `EGRESS_ALLOWLIST` is still read and its hosts are used for subdomain
+/// folding before the policy call.
 const POLICY_PATH_ENV: &str = "EGRESS_POLICY_PATH";
-/// Optional override for the redb-backed Dogwood temporal event-history store
-/// path (the engine's event log that `when temporal { formerly ... }` clauses
-/// read; it holds history, not policies). Defaults to a file under the system
-/// temp dir; the ephemeral path is fine on ECS/Fargate.
-const HISTORY_STORE_ENV: &str = "EGRESS_HISTORY_STORE";
 /// Optional path to append JSONL decision records to, in addition to the default
 /// `tracing` sink.
 const DECISION_LOG_ENV: &str = "EGRESS_DECISION_LOG";
@@ -210,17 +205,10 @@ impl DecisionSink {
     }
 }
 
-/// Default redb temporal event-history store filename used when
-/// `EGRESS_HISTORY_STORE` is unset. This file holds the Dogwood engine's event
-/// history, not egress policies.
-fn default_history_store_path() -> PathBuf {
-    std::env::temp_dir().join("devbox-egress-history.redb")
-}
-
-/// The shared Dogwood egress policy engine plus decision sink.
+/// The shared native egress policy engine plus decision sink.
 ///
 /// This is intentionally independent of the CONNECT listener address: the same
-/// `EgressPolicy` (one Dogwood engine + event history) and the same
+/// `EgressPolicy` (one native rule set) and the same
 /// [`DecisionSink`] back BOTH the CONNECT proxy ([`serve`]) and the
 /// credential-injecting reverse proxy ([`crate::egress_proxy`] via
 /// [`crate::policy::EgressPolicy::decide_http`]). Building it here — rather than
@@ -237,21 +225,18 @@ impl EgressShared {
     /// Build the shared policy + sink from the environment.
     ///
     /// `EGRESS_ALLOWLIST` drives the default-deny policy (each listed host, and
-    /// its subdomains, permits `Connect`). A richer Dogwood policy can be supplied
-    /// via `EGRESS_POLICY_PATH`; the redb temporal event-history store path
-    /// defaults under the system temp dir but is overridable via
-    /// `EGRESS_HISTORY_STORE`. Records are emitted
-    /// via `tracing` and, when `EGRESS_DECISION_LOG` is set, appended to that file.
+    /// its subdomains, permits `Connect`). A richer native policy can be supplied
+    /// via `EGRESS_POLICY_PATH` (a JSON rule document; see [`crate::policy`]).
+    /// Records are emitted via `tracing` and, when `EGRESS_DECISION_LOG` is set,
+    /// appended to that file.
     ///
     /// # Errors
     ///
     /// Returns an error when `EGRESS_POLICY_PATH` is set but unreadable, when the
-    /// Dogwood store cannot be opened or the policy fails to install (egress must
-    /// not boot fail-open), or when `EGRESS_DECISION_LOG` cannot be opened.
+    /// policy source fails to parse (egress must not boot fail-open), or when
+    /// `EGRESS_DECISION_LOG` cannot be opened.
     pub fn from_env() -> Result<Self> {
         let allowlist_raw = env_non_empty(ALLOWLIST_ENV).unwrap_or_default();
-        let store_path =
-            env_non_empty(HISTORY_STORE_ENV).map_or_else(default_history_store_path, PathBuf::from);
 
         let policy = if let Some(policy_path) = env_non_empty(POLICY_PATH_ENV) {
             let source = std::fs::read_to_string(&policy_path)
@@ -259,7 +244,7 @@ impl EgressShared {
             // Hosts from EGRESS_ALLOWLIST still drive subdomain folding so a
             // custom policy keeps the dot-boundary semantics for its hosts.
             let allow_hosts = parse_allow_hosts(&allowlist_raw);
-            EgressPolicy::from_policy_source(&source, &store_path, allow_hosts)
+            EgressPolicy::from_policy_source(&source, allow_hosts)
                 .context("build egress policy from EGRESS_POLICY_PATH")?
         } else {
             if allowlist_raw.is_empty() {
@@ -268,7 +253,7 @@ impl EgressShared {
                      (reverse-proxy upstreams require a matching EGRESS_POLICY_PATH permit)"
                 );
             }
-            EgressPolicy::from_allowlist_csv(&allowlist_raw, &store_path)
+            EgressPolicy::from_allowlist_csv(&allowlist_raw)
                 .context("build egress policy from EGRESS_ALLOWLIST")?
         };
 
@@ -282,7 +267,7 @@ impl EgressShared {
 /// Configuration for the CONNECT egress proxy listener, or `None` when
 /// `EGRESS_PROXY_ADDR` is unset (the CONNECT listener is disabled). The policy and
 /// sink are the shared ones from [`EgressShared`], so the CONNECT listener and the
-/// reverse proxy share one Dogwood engine + event history and one audit sink.
+/// reverse proxy share one native policy engine and one audit sink.
 pub struct EgressConfig {
     pub addr: SocketAddr,
     pub policy: Arc<EgressPolicy>,
@@ -377,8 +362,8 @@ async fn handle_connection(
         return refuse(&mut client, "403 Forbidden").await;
     }
 
-    // The engine mutex lives inside decide_connect and is dropped before this
-    // returns, so nothing is held across the connect/tunnel awaits below.
+    // decide_connect is synchronous and lock-free, so nothing is held across the
+    // connect/tunnel awaits below.
     let decision = policy.decide_connect(CONNECT_SUBJECT, &host);
     sink.emit(&DecisionRecord::connect(CONNECT_SUBJECT, &host, &decision));
     if !decision.allowed {
@@ -587,18 +572,8 @@ mod tests {
         is_forbidden_ip(ip.parse().unwrap())
     }
 
-    /// A fresh engine store under a unique temp path per test.
-    fn store_path(name: &str) -> std::path::PathBuf {
-        let pid = std::process::id();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("devbox-egress-{name}-{pid}-{nanos}.redb"))
-    }
-
-    fn policy_from_csv(name: &str, csv: &str) -> EgressPolicy {
-        EgressPolicy::from_allowlist_csv(csv, &store_path(name)).unwrap()
+    fn policy_from_csv(csv: &str) -> EgressPolicy {
+        EgressPolicy::from_allowlist_csv(csv).unwrap()
     }
 
     #[test]
@@ -606,7 +581,7 @@ mod tests {
         // A permitted host (and its subdomains, dot-boundary) passes the gate,
         // reproducing the old Allowlist semantics now that the policy is the
         // authorization path on the CONNECT hop.
-        let policy = policy_from_csv("gate-allow", "crates.io, github.com");
+        let policy = policy_from_csv("crates.io, github.com");
         assert!(policy.decide_connect(CONNECT_SUBJECT, "crates.io").allowed);
         assert!(
             policy
@@ -622,7 +597,7 @@ mod tests {
 
     #[test]
     fn policy_gate_denies_non_members_and_lookalikes() {
-        let policy = policy_from_csv("gate-deny", "crates.io");
+        let policy = policy_from_csv("crates.io");
         assert!(!policy.decide_connect(CONNECT_SUBJECT, "evil.com").allowed);
         // A suffix match must be on a dot boundary, not a substring.
         assert!(
@@ -636,13 +611,13 @@ mod tests {
                 .allowed
         );
         // An empty allowlist denies all (backward compatible with the warning).
-        let empty = policy_from_csv("gate-empty", "");
+        let empty = policy_from_csv("");
         assert!(!empty.decide_connect(CONNECT_SUBJECT, "crates.io").allowed);
     }
 
     #[test]
     fn decision_record_captures_documented_fields() {
-        let policy = policy_from_csv("record", "crates.io");
+        let policy = policy_from_csv("crates.io");
         // Allow record.
         let allow = policy.decide_connect(CONNECT_SUBJECT, "crates.io");
         let allow_rec = DecisionRecord::connect(CONNECT_SUBJECT, "crates.io", &allow);
@@ -675,7 +650,7 @@ mod tests {
         // The shared HTTP record (used by the reverse proxy in egress_proxy)
         // carries operation "http_request" and records the method/path alongside
         // the host, for both an allow and a deny decision.
-        let policy = policy_from_csv("http-record", "api.example.com");
+        let policy = policy_from_csv("api.example.com");
         // The default allowlist policy permits Connect only, so an HttpRequest is
         // default-denied here — exercise the deny shape.
         let deny = policy.decide_http("i-abc", "api.example.com", "POST", "/v1/data");

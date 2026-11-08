@@ -86,10 +86,10 @@ pub struct AppState {
     /// method/path-aware generalization of the git proxy). `None` when
     /// `EGRESS_UPSTREAMS` is unset, in which case `/egress/*` returns 503.
     pub egress_proxy: Option<Arc<crate::egress_proxy::EgressProxy>>,
-    /// The shared Dogwood egress policy. The SAME instance (and engine/event
-    /// history) backs the CONNECT proxy ([`crate::egress`]); threading it here so
-    /// the reverse proxy's `decide_http` decisions share that history. `None` when
-    /// the egress proxy listener is disabled (`EGRESS_PROXY_ADDR` unset).
+    /// The shared native egress policy. The SAME instance backs the CONNECT
+    /// proxy ([`crate::egress`]); threading it here so the reverse proxy's
+    /// `decide_http` decisions share one policy. `None` when the egress proxy
+    /// listener is disabled (`EGRESS_PROXY_ADDR` unset).
     pub egress_policy: Option<Arc<crate::policy::EgressPolicy>>,
     /// The shared decision-record sink (same `tracing`/JSONL sink the CONNECT
     /// proxy uses). `None` when egress is disabled; a default `tracing`-only sink
@@ -439,8 +439,8 @@ async fn handle_egress_proxy(
     let path = format!("/{}", rest.trim_start_matches('/'));
     let subject = agent.instance_id.as_ref();
 
-    // Apply the shared Dogwood policy before forwarding, and record the decision.
-    // The engine mutex lives inside decide_http and is dropped before any await.
+    // Apply the shared native policy before forwarding, and record the decision.
+    // decide_http is synchronous and lock-free, so nothing is held across awaits.
     let decision = match state.egress_policy.as_ref() {
         Some(policy) => policy.decide_http(subject, &host, method.as_str(), &path),
         // Without a shared policy the proxy fails closed (default-deny).
@@ -816,15 +816,9 @@ mod tests {
         }
     }
 
-    /// A unique redb store path for a policy built in a test (the Dogwood engine
-    /// is on-disk; each test gets its own file so they don't collide).
-    fn policy_store(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("devbox-routes-test-{name}.redb"))
-    }
-
     /// Build an `AppState` whose agent auth resolves to [`test_agent`], with a
     /// configured egress proxy (`upstream` -> `host`, no AWS) and the given
-    /// Dogwood `policy`. The decision sink is the default `tracing`-only sink.
+    /// native `policy`. The decision sink is the default `tracing`-only sink.
     async fn setup_state_with_egress(
         upstream: &str,
         host: &str,
@@ -849,8 +843,7 @@ mod tests {
         // the host/method/path must 403 (default-deny), without any upstream call.
         // This pins the policy gate inside handle_egress_proxy: remove the gate
         // and this request would instead attempt to forward (and no longer 403).
-        let policy =
-            crate::policy::EgressPolicy::from_allowlist_csv("", &policy_store("deny")).unwrap();
+        let policy = crate::policy::EgressPolicy::from_allowlist_csv("").unwrap();
         let state = setup_state_with_egress("anthropic", "api.anthropic.com", policy).await;
 
         let req = Request::builder()
@@ -871,8 +864,7 @@ mod tests {
     async fn egress_proxy_unknown_upstream_is_404_even_when_authenticated() {
         // With a valid agent identity but an unconfigured upstream name, the
         // handler 404s via host_for BEFORE the policy call — the single 404 gate.
-        let policy =
-            crate::policy::EgressPolicy::from_allowlist_csv("", &policy_store("notfound")).unwrap();
+        let policy = crate::policy::EgressPolicy::from_allowlist_csv("").unwrap();
         let state = setup_state_with_egress("anthropic", "api.anthropic.com", policy).await;
 
         let req = Request::builder()
@@ -887,7 +879,7 @@ mod tests {
 
     #[tokio::test]
     async fn egress_proxy_allow_decision_is_reached_and_emits_record() {
-        // The allow arm of the gate: a Dogwood policy that permits the
+        // The allow arm of the gate: a native policy that permits the
         // HttpRequest for this host/method/path makes decide_http return allowed,
         // so the handler would proceed past the 403 gate to forward. Driving the
         // full handler to a real upstream needs network, so assert the allow
@@ -896,20 +888,19 @@ mod tests {
         // path is reached and a record is produced before forwarding — the mirror
         // of the 403-deny test that pins the deny arm end to end.
         let policy_src = r#"
-            @id("allow_messages")
-            permit (
-                principal,
-                action == Egress::Action::"HttpRequest",
-                resource
-            ) when {
-                context.input.host == "api.anthropic.com" &&
-                context.input.method == "POST" &&
-                context.input.path == "/v1/messages"
-            };
+            [
+              {
+                "effect": "permit",
+                "action": "http_request",
+                "host": "api.anthropic.com",
+                "method": "POST",
+                "path": "/v1/messages",
+                "id": "allow_messages"
+              }
+            ]
         "#;
         let policy = crate::policy::EgressPolicy::from_policy_source(
             policy_src,
-            &policy_store("allow"),
             vec!["api.anthropic.com".to_string()],
         )
         .unwrap();
