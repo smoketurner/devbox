@@ -43,6 +43,10 @@ const POLICY_PATH_ENV: &str = "EGRESS_POLICY_PATH";
 /// Optional path to append JSONL decision records to, in addition to the default
 /// `tracing` sink.
 const DECISION_LOG_ENV: &str = "EGRESS_DECISION_LOG";
+/// Optional selector for the built-in DEFAULT-ON egress bundle catalog (see
+/// [`crate::egress_bundles`]). Unset => all default bundles on; a comma-separated
+/// list => only those bundles; the token `none` (or empty-after-trim) => all off.
+const DEFAULT_BUNDLES_ENV: &str = "EGRESS_DEFAULT_BUNDLES";
 
 /// The coarse subject used for every CONNECT decision (see the module docs).
 const CONNECT_SUBJECT: &str = "pool";
@@ -244,28 +248,71 @@ impl EgressShared {
     pub fn from_env(integration_rules: Vec<crate::policy::PolicyRule>) -> Result<Self> {
         let allowlist_raw = env_non_empty(ALLOWLIST_ENV).unwrap_or_default();
 
+        // Resolve the built-in DEFAULT-ON bundle catalog selection from
+        // EGRESS_DEFAULT_BUNDLES (a pure parse of the raw value), log any unknown
+        // names, and compute the package-repo bundle Connect hosts to merge into
+        // the SAME shared policy alongside the operator allowlist.
+        let (selection, unknown) = crate::egress_bundles::BundleSelection::parse(
+            env_non_empty(DEFAULT_BUNDLES_ENV).as_deref(),
+        );
+        for name in &unknown {
+            tracing::warn!(
+                bundle = %name,
+                "unknown egress bundle in EGRESS_DEFAULT_BUNDLES; ignored"
+            );
+        }
+        let bundle_hosts = crate::egress_bundles::connect_hosts(&selection);
+        log_active_bundles(&selection, &bundle_hosts);
+
         let mut policy = if let Some(policy_path) = env_non_empty(POLICY_PATH_ENV) {
             let source = std::fs::read_to_string(&policy_path)
                 .with_context(|| format!("read {POLICY_PATH_ENV} at {policy_path}"))?;
-            // Hosts from EGRESS_ALLOWLIST still drive subdomain folding so a
-            // custom policy keeps the dot-boundary semantics for its hosts.
-            let allow_hosts = parse_allow_hosts(&allowlist_raw);
-            EgressPolicy::from_policy_source(&source, allow_hosts)
-                .context("build egress policy from EGRESS_POLICY_PATH")?
+            // Hosts from EGRESS_ALLOWLIST (and the active bundles) still drive
+            // subdomain folding so a custom policy keeps the dot-boundary
+            // semantics for those hosts.
+            let mut allow_hosts = parse_allow_hosts(&allowlist_raw);
+            for host in &bundle_hosts {
+                if !allow_hosts.contains(host) {
+                    allow_hosts.push(host.clone());
+                }
+            }
+            let mut policy = EgressPolicy::from_policy_source(&source, allow_hosts)
+                .context("build egress policy from EGRESS_POLICY_PATH")?;
+            // A custom policy bypasses the allowlist seed, so the bundle hosts are
+            // merged as generated permit-Connect rules (one authorization path).
+            // A custom `forbid` still overrides these (forbid-override holds).
+            policy.extend_rules(bundle_hosts.iter().enumerate().map(|(i, host)| {
+                crate::policy::PolicyRule::permit_connect(host, format!("bundle_connect_{i}"))
+            }));
+            policy
         } else {
-            if allowlist_raw.is_empty() && integration_rules.is_empty() {
+            if allowlist_raw.is_empty() && integration_rules.is_empty() && bundle_hosts.is_empty() {
+                // Only deny-all now: bundles OFF (=none or all-unknown) AND no
+                // operator config of any kind.
                 tracing::warn!(
-                    "egress enabled with an empty allowlist and no integrations; all egress \
-                     is denied (configure EGRESS_ALLOWLIST, EGRESS_POLICY_PATH, or \
-                     EGRESS_UPSTREAMS)"
+                    "egress enabled with no bundles, an empty allowlist, and no integrations; \
+                     all egress is denied (set EGRESS_DEFAULT_BUNDLES, EGRESS_ALLOWLIST, \
+                     EGRESS_POLICY_PATH, or EGRESS_UPSTREAMS)"
                 );
             }
-            EgressPolicy::from_allowlist_csv(&allowlist_raw)
-                .context("build egress policy from EGRESS_ALLOWLIST")?
+            // Seed the shared policy with the operator allowlist AND the active
+            // bundle Connect hosts together, so both get permit-Connect rules and
+            // identical dot-boundary subdomain folding via the one allowlist path.
+            let mut hosts = parse_allow_hosts(&allowlist_raw);
+            for host in &bundle_hosts {
+                if !hosts.contains(host) {
+                    hosts.push(host.clone());
+                }
+            }
+            EgressPolicy::from_allowlist_csv(&hosts.join(","))
+                .context("build egress policy from EGRESS_ALLOWLIST + default bundles")?
         };
 
         // Compile the inline EGRESS_UPSTREAMS method/path scoping into the SAME
-        // policy, so there is exactly one authorization path for both gates.
+        // policy, so there is exactly one authorization path for both gates. A
+        // default-on API template becomes live ONLY here, when the operator names
+        // it in EGRESS_UPSTREAMS with a credential (see crate::egress_bundles);
+        // an unconfigured template contributes no rule and stays fail-closed.
         policy.extend_rules(integration_rules);
 
         Ok(Self {
@@ -311,6 +358,44 @@ impl EgressConfig {
             sink: shared.sink.clone(),
         }))
     }
+}
+
+/// Emit startup logging describing the active built-in egress bundle catalog:
+/// the catalog version, the active package-repo bundles and their per-bundle
+/// host counts, the total Connect host count contributed, and the API templates
+/// the selection makes eligible (still inert until the operator supplies a
+/// credential via `EGRESS_UPSTREAMS`). A clear line is logged when bundles are
+/// disabled (`EGRESS_DEFAULT_BUNDLES=none`).
+fn log_active_bundles(selection: &crate::egress_bundles::BundleSelection, bundle_hosts: &[String]) {
+    use crate::egress_bundles::{
+        BundleSelection, CATALOG_VERSION, active_api_templates, active_package_bundles,
+    };
+    if matches!(selection, BundleSelection::None) {
+        tracing::info!(
+            catalog_version = CATALOG_VERSION,
+            "egress default bundles disabled (EGRESS_DEFAULT_BUNDLES=none); no built-in hosts \
+             permitted"
+        );
+        return;
+    }
+    let packages = active_package_bundles(selection);
+    for (name, host_count) in &packages {
+        tracing::info!(
+            catalog_version = CATALOG_VERSION,
+            bundle = %name,
+            hosts = host_count,
+            "egress default bundle active"
+        );
+    }
+    let templates = active_api_templates(selection);
+    tracing::info!(
+        catalog_version = CATALOG_VERSION,
+        package_bundles = packages.len(),
+        connect_hosts = bundle_hosts.len(),
+        api_templates = ?templates,
+        "egress default bundle catalog loaded (API templates inert until a credential is \
+         supplied via EGRESS_UPSTREAMS)"
+    );
 }
 
 /// Parse a comma-separated allowlist into normalized host entries (lowercase,

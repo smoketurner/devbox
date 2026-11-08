@@ -149,21 +149,29 @@ impl EgressDecision {
 
 /// A policy rule constructed programmatically by another module (rather than
 /// parsed from a Dogwood source), used to compile per-integration method/path
-/// scoping into the shared policy (see [`EgressPolicy::extend_rules`]).
+/// scoping and the built-in bundle catalog ([`crate::egress_bundles`]) into the
+/// shared policy (see [`EgressPolicy::extend_rules`]).
 ///
-/// It is compiled into a generated `@id`-annotated `permit`-`HttpRequest`
-/// Dogwood rule appended to the policy source. The `host` is normalized through
+/// It is compiled into a generated `@id`-annotated `permit` Dogwood rule
+/// appended to the policy source: a `permit`-`HttpRequest` rule
+/// ([`PolicyRule::permit_http`]) or a `permit`-`Connect` rule
+/// ([`PolicyRule::permit_connect`]). The `host` is normalized through
 /// [`normalize_host`] — the **same** normalization applied to request hosts
-/// before matching — so a configured integration host containing uppercase
-/// still matches the lowercased request host.
+/// before matching — so a configured host containing uppercase still matches the
+/// lowercased request host.
 #[derive(Clone, Debug)]
 pub struct PolicyRule {
     /// The exact (normalized) host this rule permits.
     host: String,
-    /// The exact HTTP method this rule permits.
+    /// The HTTP method this rule permits (empty for a `Connect` rule, which has
+    /// no method).
     method: String,
     /// Optional exact path; `None` permits any path on the host for the method.
+    /// Always `None` for a `Connect` rule.
     path: Option<String>,
+    /// Whether this rule permits `Connect` (a CONNECT-tunnel host gate) rather
+    /// than `HttpRequest` (a method/path-scoped request).
+    connect: bool,
     /// The annotation surfaced in the decision reason.
     id: String,
 }
@@ -182,13 +190,41 @@ impl PolicyRule {
             host: normalize_host(&host.into()),
             method: method.into(),
             path,
+            connect: false,
             id: id.into(),
         }
     }
 
-    /// Render this rule as an `@id`-annotated `permit`-`HttpRequest` Dogwood
-    /// rule. Host/method/path are interpolated as escaped Cedar string literals.
+    /// A `permit` rule that lets the CONNECT host gate reach `host` (the same
+    /// semantics an `EGRESS_ALLOWLIST` entry gets). Used to merge the built-in
+    /// bundle catalog's package-repository hosts into the shared policy on the
+    /// custom-`EGRESS_POLICY_PATH` path, where the allowlist seed is bypassed.
+    /// `id` is surfaced in the decision reason. The host participates in
+    /// subdomain folding exactly like an allowlist host because
+    /// [`EgressPolicy::extend_rules`] records it in the folding guard.
+    pub fn permit_connect(host: impl Into<String>, id: impl Into<String>) -> Self {
+        Self {
+            host: normalize_host(&host.into()),
+            method: String::new(),
+            path: None,
+            connect: true,
+            id: id.into(),
+        }
+    }
+
+    /// Render this rule as an `@id`-annotated `permit` Dogwood rule — a
+    /// `Connect` rule when [`Self::connect`], otherwise an `HttpRequest` rule.
+    /// Host/method/path are interpolated as escaped Cedar string literals.
     fn to_dw(&self) -> String {
+        if self.connect {
+            return format!(
+                "@id(\"{}\")\n\
+                 permit (principal, action == Egress::Action::\"Connect\", resource)\n\
+                 when {{ context.input.host == \"{}\" }};\n\n",
+                escape_cedar_str(&self.id),
+                escape_cedar_str(&self.host),
+            );
+        }
         let mut conditions = format!(
             "context.input.host == \"{}\" &&\n  context.input.method == \"{}\"",
             escape_cedar_str(&self.host),

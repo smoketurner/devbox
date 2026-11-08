@@ -6,6 +6,7 @@ pub mod convert;
 pub mod db;
 pub mod documents;
 pub mod egress;
+pub mod egress_bundles;
 pub mod egress_proxy;
 pub mod error;
 pub mod github;
