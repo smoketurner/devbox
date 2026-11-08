@@ -40,9 +40,11 @@ const ALLOWLIST_ENV: &str = "EGRESS_ALLOWLIST";
 /// the allowlist-derived default policy; `EGRESS_ALLOWLIST` is still read and its
 /// hosts are used for subdomain folding before the policy call.
 const POLICY_PATH_ENV: &str = "EGRESS_POLICY_PATH";
-/// Optional override for the redb-backed Dogwood store path. Defaults to a file
-/// under the system temp dir; the ephemeral path is fine on ECS/Fargate.
-const POLICY_STORE_ENV: &str = "EGRESS_POLICY_STORE";
+/// Optional override for the redb-backed Dogwood temporal event-history store
+/// path (the engine's event log that `when temporal { formerly ... }` clauses
+/// read; it holds history, not policies). Defaults to a file under the system
+/// temp dir; the ephemeral path is fine on ECS/Fargate.
+const HISTORY_STORE_ENV: &str = "EGRESS_HISTORY_STORE";
 /// Optional path to append JSONL decision records to, in addition to the default
 /// `tracing` sink.
 const DECISION_LOG_ENV: &str = "EGRESS_DECISION_LOG";
@@ -208,9 +210,11 @@ impl DecisionSink {
     }
 }
 
-/// Default redb store filename used when `EGRESS_POLICY_STORE` is unset.
-fn default_store_path() -> PathBuf {
-    std::env::temp_dir().join("devbox-egress-policy.redb")
+/// Default redb temporal event-history store filename used when
+/// `EGRESS_HISTORY_STORE` is unset. This file holds the Dogwood engine's event
+/// history, not egress policies.
+fn default_history_store_path() -> PathBuf {
+    std::env::temp_dir().join("devbox-egress-history.redb")
 }
 
 /// The shared Dogwood egress policy engine plus decision sink.
@@ -234,8 +238,9 @@ impl EgressShared {
     ///
     /// `EGRESS_ALLOWLIST` drives the default-deny policy (each listed host, and
     /// its subdomains, permits `Connect`). A richer Dogwood policy can be supplied
-    /// via `EGRESS_POLICY_PATH`; the redb store path defaults under the system
-    /// temp dir but is overridable via `EGRESS_POLICY_STORE`. Records are emitted
+    /// via `EGRESS_POLICY_PATH`; the redb temporal event-history store path
+    /// defaults under the system temp dir but is overridable via
+    /// `EGRESS_HISTORY_STORE`. Records are emitted
     /// via `tracing` and, when `EGRESS_DECISION_LOG` is set, appended to that file.
     ///
     /// # Errors
@@ -246,7 +251,7 @@ impl EgressShared {
     pub fn from_env() -> Result<Self> {
         let allowlist_raw = env_non_empty(ALLOWLIST_ENV).unwrap_or_default();
         let store_path =
-            env_non_empty(POLICY_STORE_ENV).map_or_else(default_store_path, PathBuf::from);
+            env_non_empty(HISTORY_STORE_ENV).map_or_else(default_history_store_path, PathBuf::from);
 
         let policy = if let Some(policy_path) = env_non_empty(POLICY_PATH_ENV) {
             let source = std::fs::read_to_string(&policy_path)

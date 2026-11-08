@@ -123,13 +123,15 @@ impl EgressPolicy {
     /// backward compatibility: each listed host (and its subdomains, via the
     /// existing dot-boundary semantics) permits `Connect`.
     ///
-    /// The engine is opened at `store_path`; the durable store is redb-backed
-    /// and recovers its history across restarts.
+    /// The engine is opened at `store_path`; that redb-backed store holds the
+    /// temporal EVENT HISTORY the engine recovers across restarts (the prior
+    /// Connect/HttpRequest events temporal clauses read). It does not hold the
+    /// policy itself; the policy is the Dogwood source installed here.
     ///
     /// # Errors
     ///
-    /// Returns an error when the durable store cannot be opened, or when the
-    /// generated default policy or schema fails to install.
+    /// Returns an error when the temporal event-history store cannot be opened,
+    /// or when the generated default policy or schema fails to install.
     pub fn from_allowlist_csv(raw: &str, store_path: &std::path::Path) -> anyhow::Result<Self> {
         let hosts = parse_hosts(raw);
         let policy = default_policy_from_hosts(&hosts);
@@ -143,8 +145,8 @@ impl EgressPolicy {
     ///
     /// # Errors
     ///
-    /// Returns an error when the durable store cannot be opened, or when the
-    /// supplied policy or schema fails to install.
+    /// Returns an error when the temporal event-history store cannot be opened,
+    /// or when the supplied policy or schema fails to install.
     pub fn from_policy_source(
         policy_source: &str,
         store_path: &std::path::Path,
@@ -153,7 +155,8 @@ impl EgressPolicy {
         Self::install(policy_source, store_path, allow_hosts)
     }
 
-    /// Open the durable engine and install `policy_source` against [`SCHEMA`].
+    /// Open the durable temporal event-history engine and install `policy_source`
+    /// against [`SCHEMA`].
     fn install(
         policy_source: &str,
         store_path: &std::path::Path,
