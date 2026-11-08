@@ -9,6 +9,7 @@ pub mod egress;
 pub mod error;
 pub mod github;
 pub mod naming;
+pub mod policy;
 pub mod reconcile;
 pub mod routes;
 pub mod service;

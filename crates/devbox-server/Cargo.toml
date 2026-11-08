@@ -32,6 +32,8 @@ aws-sdk-ssm = { workspace = true, features = ["rt-tokio", "default-https-client"
 axum = { workspace = true, features = ["json", "tokio", "http1", "form", "query"] }
 base64 = { workspace = true, features = ["alloc"] }
 devbox-common = { path = "../devbox-common" }
+dogwood-language = { workspace = true }
+dogwood-local-engine = { workspace = true }
 jiff = { workspace = true, features = ["std", "serde"] }
 jsonwebtoken = { workspace = true, features = ["aws_lc_rs", "use_pem"] }
 reqwest = { workspace = true, features = ["json", "rustls", "stream"] }
