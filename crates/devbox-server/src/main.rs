@@ -131,6 +131,23 @@ async fn main() -> Result<()> {
         .context("initialize git reverse proxy")?
         .map(Arc::new);
 
+    // The credential-injecting reverse proxy registry: upstream hosts + their
+    // server-held credentials (static SSM secrets / SigV4). `None` when
+    // EGRESS_UPSTREAMS is unset so local/dev boots without AWS.
+    let egress_proxy = devbox_server::egress_proxy::EgressProxy::from_env(&aws_config)
+        .await
+        .context("initialize egress reverse proxy")?;
+
+    // Build the shared egress policy + decision sink once. The SAME EgressPolicy
+    // (one Dogwood engine + event history) and the same decision sink back both
+    // the CONNECT listener and the reverse proxy's decide_http, per the temporal
+    // link requirement. `None` when the CONNECT listener is disabled.
+    let egress_config = devbox_server::egress::EgressConfig::from_env()?;
+    let (egress_policy, egress_sink) = match &egress_config {
+        Some(cfg) => (Some(Arc::clone(&cfg.policy)), Some(cfg.sink.clone())),
+        None => (None, None),
+    };
+
     // Build router. State is shared as a single Arc<AppState>.
     let app = build_router(Arc::new(AppState {
         store: Arc::clone(&store),
@@ -139,11 +156,15 @@ async fn main() -> Result<()> {
         github_app,
         git_proxy,
         compute: Some(ec2_client),
+        egress_proxy,
+        egress_policy,
+        egress_sink,
     }));
 
     // Optional allowlisting HTTPS egress proxy: a second listener in this binary,
-    // stopped by the same cancellation token as the reconciler.
-    if let Some(egress) = devbox_server::egress::EgressConfig::from_env()? {
+    // stopped by the same cancellation token as the reconciler. It shares the
+    // EgressPolicy/sink already threaded into AppState above.
+    if let Some(egress) = egress_config {
         let egress_listener = TcpListener::bind(egress.addr)
             .await
             .with_context(|| format!("bind egress proxy on {}", egress.addr))?;

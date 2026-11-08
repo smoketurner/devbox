@@ -654,6 +654,9 @@ mod tests {
             github_app: None,
             git_proxy: None,
             compute: None,
+            egress_proxy: None,
+            egress_policy: None,
+            egress_sink: None,
         }
     }
 

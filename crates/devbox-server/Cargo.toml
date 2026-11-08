@@ -24,7 +24,10 @@ path = "src/main.rs"
 anyhow = { workspace = true, features = ["std"] }
 askama = { workspace = true, features = ["derive", "alloc"] }
 aws-config = { workspace = true, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
+aws-credential-types = { workspace = true }
 aws-lc-rs = { workspace = true }
+aws-sigv4 = { workspace = true }
+aws-smithy-runtime-api = { workspace = true }
 aws-sdk-autoscaling = { workspace = true, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
 aws-sdk-dsql = { workspace = true, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
 aws-sdk-ec2 = { workspace = true, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }

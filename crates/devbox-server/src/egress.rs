@@ -113,6 +113,29 @@ impl DecisionRecord {
             timestamp: jiff::Timestamp::now().to_string(),
         }
     }
+
+    /// Build an HTTP reverse-proxy decision record from a policy decision for a
+    /// `method`/`path` request to `host`. Shared with [`crate::egress_proxy`] so
+    /// the CONNECT gate and the credential-injecting reverse proxy emit the same
+    /// JSONL record shape; the `operation` is `"http_request"` and the `host` is
+    /// recorded with the request method and path appended as `METHOD path` so an
+    /// auditor can distinguish HTTP decisions from opaque CONNECT ones.
+    pub(crate) fn http(
+        subject: &str,
+        host: &str,
+        method: &str,
+        path: &str,
+        decision: &EgressDecision,
+    ) -> Self {
+        Self {
+            subject: subject.to_string(),
+            operation: "http_request".to_string(),
+            host: format!("{host} {method} {path}"),
+            decision: if decision.allowed { "allow" } else { "deny" }.to_string(),
+            reason: decision.reason.clone(),
+            timestamp: jiff::Timestamp::now().to_string(),
+        }
+    }
 }
 
 /// Where decision records are emitted. The default `tracing` event is always
@@ -136,7 +159,7 @@ impl DecisionSink {
     /// Returns an error when `EGRESS_DECISION_LOG` is set but the file cannot be
     /// opened for appending — a misconfigured audit sink is a hard startup error
     /// rather than silently losing records.
-    fn from_env() -> Result<Self> {
+    pub(crate) fn from_env() -> Result<Self> {
         let Some(path) = env_non_empty(DECISION_LOG_ENV) else {
             return Ok(Self::default());
         };
@@ -153,7 +176,7 @@ impl DecisionSink {
     /// Emit a decision record: always a structured `tracing` event, plus a JSONL
     /// line to the file sink when configured. Best-effort: serialization or write
     /// failures are logged and swallowed so the hot path is never blocked.
-    fn emit(&self, record: &DecisionRecord) {
+    pub(crate) fn emit(&self, record: &DecisionRecord) {
         tracing::info!(
             subject = %record.subject,
             operation = %record.operation,
@@ -602,6 +625,43 @@ mod tests {
         let deny = policy.decide_connect(CONNECT_SUBJECT, "evil.com");
         let deny_rec = DecisionRecord::connect(CONNECT_SUBJECT, "evil.com", &deny);
         assert_eq!(deny_rec.decision, "deny");
+    }
+
+    #[test]
+    fn http_decision_record_captures_method_and_path_for_allow_and_deny() {
+        // The shared HTTP record (used by the reverse proxy in egress_proxy)
+        // carries operation "http_request" and records the method/path alongside
+        // the host, for both an allow and a deny decision.
+        let policy = policy_from_csv("http-record", "api.example.com");
+        // The default allowlist policy permits Connect only, so an HttpRequest is
+        // default-denied here — exercise the deny shape.
+        let deny = policy.decide_http("i-abc", "api.example.com", "POST", "/v1/data");
+        let deny_rec = DecisionRecord::http("i-abc", "api.example.com", "POST", "/v1/data", &deny);
+        assert_eq!(deny_rec.subject, "i-abc");
+        assert_eq!(deny_rec.operation, "http_request");
+        assert_eq!(deny_rec.host, "api.example.com POST /v1/data");
+        assert_eq!(deny_rec.decision, "deny");
+        assert!(!deny_rec.reason.is_empty());
+
+        // An allow shape, synthesized from an allow decision, serializes with all
+        // six documented keys.
+        let allow = EgressDecision {
+            allowed: true,
+            reason: "permit_http".to_string(),
+        };
+        let allow_rec = DecisionRecord::http("i-abc", "api.example.com", "GET", "/v1/ping", &allow);
+        assert_eq!(allow_rec.decision, "allow");
+        let json: serde_json::Value = serde_json::to_value(&allow_rec).unwrap();
+        for key in [
+            "subject",
+            "operation",
+            "host",
+            "decision",
+            "reason",
+            "timestamp",
+        ] {
+            assert!(json.get(key).is_some(), "http record missing {key}");
+        }
     }
 
     #[test]
