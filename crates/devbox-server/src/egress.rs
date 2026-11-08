@@ -213,37 +213,37 @@ fn default_store_path() -> PathBuf {
     std::env::temp_dir().join("devbox-egress-policy.redb")
 }
 
-/// Configuration for the egress proxy, or `None` when `EGRESS_PROXY_ADDR` is unset
-/// (the proxy is disabled).
-pub struct EgressConfig {
-    pub addr: SocketAddr,
+/// The shared Dogwood egress policy engine plus decision sink.
+///
+/// This is intentionally independent of the CONNECT listener address: the same
+/// `EgressPolicy` (one Dogwood engine + event history) and the same
+/// [`DecisionSink`] back BOTH the CONNECT proxy ([`serve`]) and the
+/// credential-injecting reverse proxy ([`crate::egress_proxy`] via
+/// [`crate::policy::EgressPolicy::decide_http`]). Building it here — rather than
+/// only on the CONNECT path — means the reverse proxy always has a usable policy
+/// whenever egress is configured at all, so a deployment that sets
+/// `EGRESS_UPSTREAMS` without `EGRESS_PROXY_ADDR` is not silently deny-all.
+#[derive(Clone)]
+pub struct EgressShared {
     pub policy: Arc<EgressPolicy>,
     pub sink: DecisionSink,
 }
 
-impl EgressConfig {
-    /// Read the proxy config from the environment. `Ok(None)` disables the proxy.
+impl EgressShared {
+    /// Build the shared policy + sink from the environment.
     ///
-    /// Backward compatible: `EGRESS_PROXY_ADDR` enables the listener and
-    /// `EGRESS_ALLOWLIST` still drives the default-deny policy (each listed host,
-    /// and its subdomains, permits `Connect`). A richer Dogwood policy can be
-    /// supplied via `EGRESS_POLICY_PATH`; the redb store path defaults under the
-    /// system temp dir but is overridable via `EGRESS_POLICY_STORE`.
+    /// `EGRESS_ALLOWLIST` drives the default-deny policy (each listed host, and
+    /// its subdomains, permits `Connect`). A richer Dogwood policy can be supplied
+    /// via `EGRESS_POLICY_PATH`; the redb store path defaults under the system
+    /// temp dir but is overridable via `EGRESS_POLICY_STORE`. Records are emitted
+    /// via `tracing` and, when `EGRESS_DECISION_LOG` is set, appended to that file.
     ///
     /// # Errors
     ///
-    /// Returns an error when `EGRESS_PROXY_ADDR` is not a valid socket address,
-    /// when `EGRESS_POLICY_PATH` is set but unreadable, when the Dogwood store
-    /// cannot be opened or the policy fails to install (the proxy must not boot
-    /// fail-open), or when `EGRESS_DECISION_LOG` cannot be opened.
-    pub fn from_env() -> Result<Option<Self>> {
-        let Some(addr_raw) = env_non_empty(PROXY_ADDR_ENV) else {
-            return Ok(None);
-        };
-        let addr: SocketAddr = addr_raw
-            .parse()
-            .with_context(|| format!("invalid {PROXY_ADDR_ENV}: {addr_raw}"))?;
-
+    /// Returns an error when `EGRESS_POLICY_PATH` is set but unreadable, when the
+    /// Dogwood store cannot be opened or the policy fails to install (egress must
+    /// not boot fail-open), or when `EGRESS_DECISION_LOG` cannot be opened.
+    pub fn from_env() -> Result<Self> {
         let allowlist_raw = env_non_empty(ALLOWLIST_ENV).unwrap_or_default();
         let store_path =
             env_non_empty(POLICY_STORE_ENV).map_or_else(default_store_path, PathBuf::from);
@@ -259,17 +259,55 @@ impl EgressConfig {
         } else {
             if allowlist_raw.is_empty() {
                 tracing::warn!(
-                    "egress proxy enabled with an empty allowlist; all egress is denied"
+                    "egress enabled with an empty allowlist; all CONNECT egress is denied \
+                     (reverse-proxy upstreams require a matching EGRESS_POLICY_PATH permit)"
                 );
             }
             EgressPolicy::from_allowlist_csv(&allowlist_raw, &store_path)
                 .context("build egress policy from EGRESS_ALLOWLIST")?
         };
 
-        Ok(Some(Self {
-            addr,
+        Ok(Self {
             policy: Arc::new(policy),
             sink: DecisionSink::from_env()?,
+        })
+    }
+}
+
+/// Configuration for the CONNECT egress proxy listener, or `None` when
+/// `EGRESS_PROXY_ADDR` is unset (the CONNECT listener is disabled). The policy and
+/// sink are the shared ones from [`EgressShared`], so the CONNECT listener and the
+/// reverse proxy share one Dogwood engine + event history and one audit sink.
+pub struct EgressConfig {
+    pub addr: SocketAddr,
+    pub policy: Arc<EgressPolicy>,
+    pub sink: DecisionSink,
+}
+
+impl EgressConfig {
+    /// Read the CONNECT listener config from the environment, reusing the already
+    /// built shared policy + sink. `Ok(None)` disables the CONNECT listener (but
+    /// the shared policy may still back the reverse proxy).
+    ///
+    /// Backward compatible: `EGRESS_PROXY_ADDR` enables the listener; the policy
+    /// semantics (including `EGRESS_ALLOWLIST`) live in [`EgressShared::from_env`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `EGRESS_PROXY_ADDR` is set but is not a valid socket
+    /// address.
+    pub fn from_env(shared: &EgressShared) -> Result<Option<Self>> {
+        let Some(addr_raw) = env_non_empty(PROXY_ADDR_ENV) else {
+            return Ok(None);
+        };
+        let addr: SocketAddr = addr_raw
+            .parse()
+            .with_context(|| format!("invalid {PROXY_ADDR_ENV}: {addr_raw}"))?;
+
+        Ok(Some(Self {
+            addr,
+            policy: Arc::clone(&shared.policy),
+            sink: shared.sink.clone(),
         }))
     }
 }

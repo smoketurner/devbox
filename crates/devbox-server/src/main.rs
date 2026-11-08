@@ -138,14 +138,32 @@ async fn main() -> Result<()> {
         .await
         .context("initialize egress reverse proxy")?;
 
-    // Build the shared egress policy + decision sink once. The SAME EgressPolicy
-    // (one Dogwood engine + event history) and the same decision sink back both
-    // the CONNECT listener and the reverse proxy's decide_http, per the temporal
-    // link requirement. `None` when the CONNECT listener is disabled.
-    let egress_config = devbox_server::egress::EgressConfig::from_env()?;
-    let (egress_policy, egress_sink) = match &egress_config {
-        Some(cfg) => (Some(Arc::clone(&cfg.policy)), Some(cfg.sink.clone())),
+    // Build the shared egress policy + decision sink ONCE, independently of the
+    // CONNECT listener address. The SAME EgressPolicy (one Dogwood engine + event
+    // history) and the same decision sink back BOTH the CONNECT listener and the
+    // reverse proxy's decide_http, per the temporal link requirement.
+    //
+    // It is built whenever egress is configured at all: either the CONNECT
+    // listener (EGRESS_PROXY_ADDR) or the reverse proxy (EGRESS_UPSTREAMS => an
+    // `egress_proxy` registry) is present. This is the fix for a deployment that
+    // sets EGRESS_UPSTREAMS without EGRESS_PROXY_ADDR: the reverse proxy now has a
+    // usable shared policy instead of a None that would deny every request.
+    let connect_addr_set = std::env::var_os("EGRESS_PROXY_ADDR").is_some_and(|v| !v.is_empty());
+    let egress_shared = if connect_addr_set || egress_proxy.is_some() {
+        Some(devbox_server::egress::EgressShared::from_env()?)
+    } else {
+        None
+    };
+    let (egress_policy, egress_sink) = match &egress_shared {
+        Some(shared) => (Some(Arc::clone(&shared.policy)), Some(shared.sink.clone())),
         None => (None, None),
+    };
+
+    // The CONNECT listener config is `None` unless EGRESS_PROXY_ADDR is set; it
+    // reuses the shared policy + sink above.
+    let egress_config = match &egress_shared {
+        Some(shared) => devbox_server::egress::EgressConfig::from_env(shared)?,
+        None => None,
     };
 
     // Build router. State is shared as a single Arc<AppState>.

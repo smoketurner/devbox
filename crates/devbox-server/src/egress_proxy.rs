@@ -83,15 +83,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// cannot block server start-up (this runs in `main` before the listener binds).
 const KEY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Why a proxied request was refused before forwarding, mapped to a status by the
-/// caller. Resolution/policy errors are modeled here so the thin route handler
-/// stays a pure adapter.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ProxyReject {
-    /// The named upstream is not configured → 404.
-    UnknownUpstream(String),
-}
-
 /// How an upstream's credential is injected.
 ///
 /// Secrets are held only here on the control plane and never sent to the box.
@@ -233,17 +224,44 @@ impl EgressProxy {
         self.upstreams.get(upstream).map(|u| u.host.as_str())
     }
 
+    /// Test-only constructor: a proxy with a single static-header upstream
+    /// (`name` -> `host`), needing no AWS. Lets route-handler tests exercise the
+    /// policy gate (which runs before any forwarding) against a *known* upstream
+    /// so the 404-unknown path does not short-circuit the 403-deny path.
+    #[cfg(test)]
+    pub(crate) fn for_test(name: &str, host: &str) -> Arc<Self> {
+        let client = reqwest::Client::builder()
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        let mut upstreams = HashMap::new();
+        upstreams.insert(
+            name.to_string(),
+            Upstream {
+                host: host.to_string(),
+                credential: Credential::StaticHeader {
+                    header_name: HeaderName::from_static("x-api-key"),
+                    value: SecretString::from("test-secret".to_string()),
+                },
+            },
+        );
+        Arc::new(Self { client, upstreams })
+    }
+
     /// Forward an already-authorized request to `upstream`, injecting the
     /// configured credential and streaming the response back.
     ///
     /// `rest` is the path tail after `/egress/{upstream}/`; `query` is the raw
-    /// query string. The caller must have applied the policy first; this method
-    /// performs the credential injection and transport only.
+    /// query string. The caller must have resolved the upstream (via
+    /// [`EgressProxy::host_for`], which is the single 404 gate) and applied the
+    /// policy first; this method performs the credential injection and transport
+    /// only. A `None` lookup here is therefore an internal invariant violation
+    /// (the handler resolved it moments earlier), surfaced as an `anyhow` error
+    /// rather than a second, drift-prone 404 path.
     ///
     /// # Errors
     ///
-    /// Returns [`ProxyReject::UnknownUpstream`] when `upstream` is not configured.
-    /// Propagates signing and upstream transport failures as `anyhow` errors.
+    /// Returns an error when `upstream` is not configured (unreachable in the
+    /// wired path), or when signing or the upstream transport fails.
     pub(crate) async fn forward(
         &self,
         upstream: &str,
@@ -252,10 +270,11 @@ impl EgressProxy {
         query: Option<&str>,
         headers: &HeaderMap,
         body: Bytes,
-    ) -> Result<std::result::Result<reqwest::Response, ProxyReject>> {
-        let Some(up) = self.upstreams.get(upstream) else {
-            return Ok(Err(ProxyReject::UnknownUpstream(upstream.to_string())));
-        };
+    ) -> Result<reqwest::Response> {
+        let up = self
+            .upstreams
+            .get(upstream)
+            .with_context(|| format!("egress upstream '{upstream}' resolved then vanished"))?;
         let url = build_upstream_url(&up.host, rest, query);
 
         // Collect the forwardable client headers (Authorization always dropped).
@@ -302,7 +321,7 @@ impl EgressProxy {
             .send()
             .await
             .with_context(|| format!("forward egress request to {url}"))?;
-        Ok(Ok(resp))
+        Ok(resp)
     }
 }
 
@@ -651,6 +670,79 @@ mod tests {
     }
 
     #[test]
+    fn sigv4_signs_over_the_forwarded_header_set() {
+        // Regression guard for a signed-vs-sent header mismatch: sign with a
+        // NON-EMPTY forward-header set (exactly the headers `forward` collects and
+        // then hands to reqwest) and assert each forwarded header name appears in
+        // the SigV4 `SignedHeaders` list. If the signed set ever diverged from the
+        // headers actually sent, the upstream would reject with
+        // SignatureDoesNotMatch; pinning the SignedHeaders here makes that visible.
+        let creds = aws_credential_types::Credentials::new(
+            "AKIDEXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            None,
+            None,
+            "test",
+        );
+        let forward_headers = vec![
+            (CONTENT_TYPE, HeaderValue::from_static("application/json")),
+            (
+                USER_AGENT,
+                HeaderValue::from_static("devbox-server-egress-proxy"),
+            ),
+            (ACCEPT, HeaderValue::from_static("application/json")),
+        ];
+        // AWS SigV4's default settings deliberately EXCLUDE a few headers from the
+        // signature (notably `user-agent`, `x-amzn-trace-id`, `authorization`),
+        // because clients and intermediaries routinely rewrite them — reqwest
+        // sets its own `user-agent`, so signing over it would guarantee a
+        // SignatureDoesNotMatch. So `user-agent` is forwarded but NOT signed,
+        // which is exactly what the upstream expects; `content-type` and `accept`
+        // ARE signed and must match what is sent.
+        let signable_names = ["content-type", "accept"];
+        let headers = sigv4_headers(
+            "bedrock",
+            "us-east-1",
+            creds,
+            &Method::POST,
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/x/invoke",
+            b"{\"prompt\":\"hi\"}",
+            &forward_headers,
+        )
+        .unwrap();
+        let auth = headers
+            .iter()
+            .find(|(n, _)| n.as_str() == "authorization")
+            .map(|(_, v)| v.to_str().unwrap().to_string())
+            .unwrap();
+        // The Authorization header carries a `SignedHeaders=a;b;c,` segment that
+        // lists every signed header (lowercased, semicolon-joined, sorted).
+        let signed_segment = auth
+            .split("SignedHeaders=")
+            .nth(1)
+            .and_then(|rest| rest.split(',').next())
+            .unwrap_or_default();
+        assert!(
+            signed_segment.contains("host"),
+            "host must always be signed: {auth}"
+        );
+        for name in signable_names {
+            assert!(
+                signed_segment.contains(name),
+                "forwarded signable header '{name}' must be in SignedHeaders ({signed_segment})"
+            );
+        }
+        // user-agent is forwarded on the wire but intentionally NOT signed (see
+        // the SigV4 default-exclusion note above), so it must be absent from the
+        // signed set — proving the signed set matches AWS's expectation rather
+        // than naively over-signing every forwarded header.
+        assert!(
+            !signed_segment.contains("user-agent"),
+            "user-agent must NOT be in the signed set (SigV4 excludes it): {signed_segment}"
+        );
+    }
+
+    #[test]
     fn sigv4_without_resolved_credentials_fails_cleanly() {
         // When the async resolution produced no credentials (local/dev without
         // AWS), the sync header computation must error rather than sign unsigned.
@@ -679,7 +771,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forward_rejects_unknown_upstream() {
+    async fn forward_errors_on_unknown_upstream() {
+        // The handler resolves the upstream via `host_for` first (the single 404
+        // gate), so reaching `forward` with an unknown name is an internal
+        // invariant violation, surfaced as an error rather than a second 404.
         let proxy = proxy_with(vec![("example", static_upstream())]);
         let out = proxy
             .forward(
@@ -690,12 +785,8 @@ mod tests {
                 &HeaderMap::new(),
                 Bytes::new(),
             )
-            .await
-            .unwrap();
-        assert!(matches!(
-            out,
-            Err(ProxyReject::UnknownUpstream(name)) if name == "nope"
-        ));
+            .await;
+        assert!(out.is_err(), "unknown upstream must error");
     }
 
     #[test]
