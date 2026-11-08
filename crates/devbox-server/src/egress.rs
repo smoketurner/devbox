@@ -1,14 +1,27 @@
-//! Policy-driven HTTPS CONNECT forward proxy.
+//! Policy-driven CONNECT forward proxy.
 //!
-//! A devbox sets `HTTPS_PROXY` at this listener; for each `CONNECT host:443` the
-//! proxy asks the dogwood-language-backed [`EgressPolicy`] (default-deny) whether the host is
-//! permitted, resolves it, refuses any non-public IP (SSRF / IMDS / RFC1918
-//! protection), then relays the encrypted TLS bytes. It runs as a second listener
-//! in the server binary, independent of the API router.
+//! A devbox sets `HTTPS_PROXY`/`HTTP_PROXY` at this listener; for each
+//! `CONNECT host:port` the proxy asks the dogwood-language-backed [`EgressPolicy`]
+//! (default-deny) whether the host is permitted, resolves it, refuses any
+//! non-public IP (SSRF / IMDS / RFC1918 protection), then relays the raw bytes. It
+//! runs as a second listener in the server binary, independent of the API router.
 //!
-//! The proxy tunnels ciphertext — it never sees inside TLS, so it cannot inject
-//! credentials. That is the reverse proxy's job ([`crate::github::git_proxy`]); this
-//! is the policy-driven host gate for everything else.
+//! # Allowed ports
+//!
+//! The proxy relays a CONNECT only to the host on port 80 or 443 — exactly that
+//! set (see [`ALLOWED_PORTS`]). The set is intentionally fixed to `{80, 443}` and
+//! is not operator-configurable; a CONNECT to any other port is refused with
+//! `403` before any policy call or DNS resolution. Port 443 is HTTPS; port 80 is
+//! for plain-HTTP package mirrors (`apt`/`yum` and friends) whose repositories are
+//! served over HTTP. The SSRF / IMDS / RFC1918 guard ([`resolve_public`] +
+//! [`is_forbidden_ip`], connecting to the exact resolved address so there is no
+//! DNS-rebind window) and the default-deny host policy apply identically on both
+//! ports — widening the port gate does NOT widen any other guard.
+//!
+//! The proxy tunnels bytes opaquely — on 443 it never sees inside TLS and on 80 it
+//! does not parse the forwarded HTTP, so it cannot inject credentials. That is the
+//! reverse proxy's job ([`crate::github::git_proxy`]); this is the policy-driven
+//! host gate for everything else.
 //!
 //! # Subject identity
 //!
@@ -54,8 +67,20 @@ const CONNECT_SUBJECT: &str = "pool";
 /// The operation recorded in a CONNECT decision record.
 const CONNECT_OPERATION: &str = "connect";
 
-/// Only HTTPS is proxied; a CONNECT to any other port is refused.
-const ALLOWED_PORT: u16 = 443;
+/// The ports a CONNECT may target, checked by [`is_allowed_port`]. The set is
+/// intentionally fixed and explicit (never "any port"): `443` is HTTPS and `80`
+/// is for plain-HTTP package mirrors (`apt`/`yum`). A CONNECT to any other port
+/// is refused with `403` before any policy call or DNS resolution. This is NOT
+/// operator-configurable by design — widening it would be a security-relevant
+/// change, so it lives in source where it is reviewed.
+const ALLOWED_PORTS: &[u16] = &[80, 443];
+
+/// Whether a CONNECT to `port` is allowed by the explicit [`ALLOWED_PORTS`] set.
+/// Anything outside the set is refused before the policy call and DNS resolution,
+/// so the SSRF/IMDS/RFC1918 guard and host policy only ever run for `{80, 443}`.
+fn is_allowed_port(port: u16) -> bool {
+    ALLOWED_PORTS.contains(&port)
+}
 
 /// Cap on the CONNECT request head read before giving up.
 const MAX_HEAD: usize = 8 * 1024;
@@ -452,8 +477,10 @@ async fn handle_connection(
             Err(_) => return refuse(&mut client, "408 Request Timeout").await,
         };
 
-    // Port refusal happens before any policy call (preserved exactly).
-    if port != ALLOWED_PORT {
+    // Port refusal happens before any policy call or DNS resolution (preserved
+    // exactly): only the explicit {80, 443} set is admitted; anything else is
+    // refused here so the SSRF guard and host policy run only for allowed ports.
+    if !is_allowed_port(port) {
         tracing::info!(host, port, "egress denied (port not allowed)");
         return refuse(&mut client, "403 Forbidden").await;
     }
@@ -809,6 +836,54 @@ mod tests {
             Some(22)
         );
         assert_eq!(find_head_end(b"CONNECT x:443 HTTP/1.1\r\n"), None);
+    }
+
+    #[test]
+    fn allowed_ports_are_exactly_80_and_443() {
+        // The explicit port gate admits HTTPS (443) and plain-HTTP package
+        // mirrors (80), and nothing else. This runs before any policy call or DNS
+        // resolution in handle_connection.
+        assert!(is_allowed_port(80));
+        assert!(is_allowed_port(443));
+        // Representative disallowed ports: SSH, a common alt-HTTP port, SMTP.
+        assert!(!is_allowed_port(22));
+        assert!(!is_allowed_port(8080));
+        assert!(!is_allowed_port(25));
+        assert!(!is_allowed_port(0));
+        // The set is exactly {80, 443}.
+        assert_eq!(ALLOWED_PORTS, &[80, 443]);
+    }
+
+    #[test]
+    fn ssrf_guard_applies_identically_on_port_80() {
+        // is_forbidden_ip / is_forbidden_v4 / is_forbidden_v6 are port-agnostic:
+        // resolve_public takes the port only to build the SocketAddr, so once the
+        // port gate admits 80 the SAME SSRF/IMDS/RFC1918 guard covers a port-80
+        // CONNECT exactly as it covers 443. These denials therefore hold for
+        // port-80 CONNECTs identically.
+        assert!(forbidden("169.254.169.254")); // IMDS link-local
+        assert!(forbidden("10.0.0.5")); // RFC1918 private
+        assert!(forbidden("127.0.0.1")); // loopback
+        assert!(forbidden("100.64.0.1")); // CGNAT shared
+        assert!(forbidden("::1")); // IPv6 loopback
+        assert!(forbidden("fe80::1")); // IPv6 link-local
+        assert!(forbidden("::ffff:169.254.169.254")); // IPv4-mapped IMDS
+    }
+
+    #[test]
+    fn policy_gate_is_host_only_on_the_connect_path() {
+        // decide_connect is host-only (port-independent), so an unallowlisted
+        // host is denied on the CONNECT path regardless of which allowed port
+        // (80 or 443) the client targeted — the default-deny host policy gates
+        // port-80 CONNECTs identically to 443.
+        let policy = policy_from_csv("crates.io");
+        assert!(policy.decide_connect(CONNECT_SUBJECT, "crates.io").allowed);
+        assert!(
+            !policy
+                .decide_connect(CONNECT_SUBJECT, "deb.debian.org")
+                .allowed
+        );
+        assert!(!policy.decide_connect(CONNECT_SUBJECT, "evil.com").allowed);
     }
 
     #[test]
