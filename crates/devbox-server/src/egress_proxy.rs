@@ -61,23 +61,24 @@ use aws_credential_types::provider::ProvideCredentials;
 use aws_sigv4::http_request::{SignableBody, SignableRequest, SigningSettings, sign as sigv4_sign};
 use aws_sigv4::sign::v4;
 use aws_smithy_runtime_api::client::identity::Identity;
-use axum::body::{Body, Bytes};
-use axum::http::header::{
-    ACCEPT, ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, USER_AGENT,
-};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::body::Bytes;
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
 use devbox_common::env_non_empty;
 
+// Re-exported so the routes.rs call site `egress_proxy::into_axum_response` keeps
+// resolving while the implementation lives in the shared proxy module.
+pub(crate) use crate::proxy::into_axum_response;
+use crate::proxy::{self, is_forwardable_request_header};
+
 /// Env var holding the upstream registry as JSON (see [`UpstreamSpec`]).
 const UPSTREAMS_ENV: &str = "EGRESS_UPSTREAMS";
 
-/// Upstream connect timeout. As with the git proxy there is no total timeout, so
-/// a long streamed response is not cut off mid-flight.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// This reverse proxy forwards no additional request headers beyond the shared
+/// base safelist (unlike the git proxy, which also keeps `git-protocol`).
+const EGRESS_EXTRA_REQUEST_HEADERS: &[&str] = &[];
 
 /// Bound on the one-time SSM reads at startup so a stalled `ssm:GetParameter`
 /// cannot block server start-up (this runs in `main` before the listener binds).
@@ -209,11 +210,7 @@ impl EgressProxy {
             );
         }
 
-        let client = reqwest::Client::builder()
-            .user_agent("devbox-server-egress-proxy")
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-            .context("build egress-proxy HTTP client")?;
+        let client = proxy::build_client("devbox-server-egress-proxy")?;
 
         Ok(Some(Arc::new(Self { client, upstreams })))
     }
@@ -280,7 +277,7 @@ impl EgressProxy {
         // Collect the forwardable client headers (Authorization always dropped).
         let mut forward_headers: Vec<(HeaderName, HeaderValue)> = Vec::new();
         for (name, value) in headers {
-            if is_forwardable_request_header(name) {
+            if is_forwardable_request_header(name, EGRESS_EXTRA_REQUEST_HEADERS) {
                 forward_headers.push((name.clone(), value.clone()));
             }
         }
@@ -495,50 +492,13 @@ fn build_upstream_url(host: &str, rest: &str, query: Option<&str>) -> String {
     }
 }
 
-/// Whether an incoming request header is forwarded upstream. Mirrors the git
-/// proxy's safelist and, critically, **always drops `Authorization`** (the proxy
-/// injects its own credential) and length/hop-by-hop headers so reqwest re-frames.
-fn is_forwardable_request_header(name: &HeaderName) -> bool {
-    name == ACCEPT
-        || name == ACCEPT_ENCODING
-        || name == CONTENT_TYPE
-        || name == CONTENT_ENCODING
-        || name == USER_AGENT
-}
-
-/// Whether an upstream response header is forwarded back. Keeps content framing
-/// and cache directives; drops length/transfer headers so axum re-frames.
-fn is_forwardable_response_header(name: &HeaderName) -> bool {
-    name == CONTENT_TYPE
-        || name == CONTENT_ENCODING
-        || name == CACHE_CONTROL
-        || name.as_str() == "expires"
-        || name.as_str() == "pragma"
-}
-
-/// Convert an upstream response into a streaming axum response: the status, the
-/// safelisted headers, and the body streamed (never buffered). Mirrors the git
-/// proxy's helper.
-pub(crate) fn into_axum_response(upstream: reqwest::Response) -> Response {
-    let status = upstream.status();
-    let mut builder = Response::builder().status(status);
-    for (name, value) in upstream.headers() {
-        if is_forwardable_response_header(name) {
-            builder = builder.header(name.clone(), value.clone());
-        }
-    }
-    builder
-        .body(Body::from_stream(upstream.bytes_stream()))
-        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
-}
-
 #[cfg(test)]
 #[expect(
     clippy::unwrap_used,
     reason = "test code: panic on assertion failure is acceptable"
 )]
 mod tests {
-    use axum::http::header::AUTHORIZATION;
+    use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 
     use super::*;
 
@@ -590,10 +550,20 @@ mod tests {
 
     #[test]
     fn request_header_forwarding_drops_authorization() {
-        // Authorization must never be forwarded — the proxy injects its own.
-        assert!(!is_forwardable_request_header(&AUTHORIZATION));
-        assert!(is_forwardable_request_header(&CONTENT_TYPE));
-        assert!(is_forwardable_request_header(&ACCEPT));
+        // Authorization must never be forwarded — the proxy injects its own. This
+        // exercises the shared safelist through egress's (empty) extra list.
+        assert!(!is_forwardable_request_header(
+            &AUTHORIZATION,
+            EGRESS_EXTRA_REQUEST_HEADERS
+        ));
+        assert!(is_forwardable_request_header(
+            &CONTENT_TYPE,
+            EGRESS_EXTRA_REQUEST_HEADERS
+        ));
+        assert!(is_forwardable_request_header(
+            &ACCEPT,
+            EGRESS_EXTRA_REQUEST_HEADERS
+        ));
     }
 
     #[test]

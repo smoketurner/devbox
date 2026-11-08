@@ -11,6 +11,7 @@ pub mod error;
 pub mod github;
 pub mod naming;
 pub mod policy;
+pub(crate) mod proxy;
 pub mod reconcile;
 pub mod routes;
 pub mod service;
