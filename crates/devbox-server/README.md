@@ -52,6 +52,22 @@ egress request is authorized through the single `EgressPolicy::decide_http` path
 (the same policy instance as the CONNECT proxy), so there is no parallel ad-hoc
 check and the policy's host can never drift from the host the proxy forwards to.
 
+The credential-injecting reverse proxy **also resolves its upstream and refuses
+non-public IPs** (SSRF / IMDS / RFC1918 protection) via the *same* shared guard
+(`net_guard.rs`) as the CONNECT proxy. The shared reqwest transport
+(`proxy.rs::build_client`) installs a custom DNS resolver that resolves the
+upstream name, drops every forbidden address (loopback, RFC1918, the
+`169.254.169.254` IMDS endpoint, link-local, CGNAT, and the rest), and hands
+reqwest **only validated public addresses**. If a name resolves only to forbidden
+IPs the connection is refused **fail-closed** before any request is sent or
+credential injected (it surfaces as a `5xx`, never a `2xx`). Because reqwest then
+dials exactly one of those validated addresses with no independent second
+resolution, there is **no DNS-rebind window**, while TLS SNI / certificate
+verification still targets the original upstream hostname (the resolver overrides
+only the dialed IP, never the server name). Because `build_client` backs both
+reverse proxies, this guard covers the egress integrations proxy **and** the git
+reverse proxy with one shared implementation.
+
 ### CONNECT forward proxy and allowed ports
 
 Alongside the credential-injecting reverse proxy there is a policy-driven
@@ -67,9 +83,10 @@ set is a fixed constant in source (`ALLOWED_PORTS`); it is **not**
 operator-configurable, and there is no env var to widen it. A CONNECT to any
 other port is refused with `403` before any policy call or DNS resolution. Port
 443 is HTTPS; **port 80** exists for the plain-HTTP `apt`/`yum` package mirrors
-whose repositories are served over HTTP. The SSRF / IMDS / RFC1918 guard
-(`resolve_public` + `is_forbidden_ip`, connecting to the exact resolved address
-so there is no DNS-rebind window) and the default-deny host policy apply
+whose repositories are served over HTTP. The SSRF / IMDS / RFC1918 guard (the
+shared `net_guard.rs` `resolve_public` + `is_forbidden_ip`, connecting to the
+exact resolved address so there is no DNS-rebind window) and the default-deny
+host policy apply
 **identically on both ports** - widening the port gate to 80 does not relax any
 other guard.
 

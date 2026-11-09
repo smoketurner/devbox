@@ -13,9 +13,10 @@
 //! is not operator-configurable; a CONNECT to any other port is refused with
 //! `403` before any policy call or DNS resolution. Port 443 is HTTPS; port 80 is
 //! for plain-HTTP package mirrors (`apt`/`yum` and friends) whose repositories are
-//! served over HTTP. The SSRF / IMDS / RFC1918 guard ([`resolve_public`] +
-//! [`is_forbidden_ip`], connecting to the exact resolved address so there is no
-//! DNS-rebind window) and the default-deny host policy apply identically on both
+//! served over HTTP. The SSRF / IMDS / RFC1918 guard
+//! ([`crate::net_guard::resolve_public`] + [`crate::net_guard::is_forbidden_ip`],
+//! connecting to the exact resolved address so there is no DNS-rebind window) and
+//! the default-deny host policy apply identically on both
 //! ports — widening the port gate does NOT widen any other guard.
 //!
 //! The proxy tunnels bytes opaquely — on 443 it never sees inside TLS and on 80 it
@@ -32,7 +33,7 @@
 //! ([`crate::auth::agent_identity`]) is available on the authenticated reverse
 //! proxy, not here. The policy is therefore a fleet-wide host gate on this path.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -525,7 +526,7 @@ async fn handle_connection(
         return refuse(&mut client, "403 Forbidden").await;
     }
 
-    let Some(target) = resolve_public(&host, port).await? else {
+    let Some(target) = crate::net_guard::resolve_public(&host, port).await? else {
         tracing::warn!(
             host,
             "egress denied (resolves only to non-public addresses)"
@@ -616,104 +617,6 @@ fn parse_connect_target(head: &[u8]) -> Option<(String, u16)> {
     Some((host.to_string(), port.parse().ok()?))
 }
 
-/// Resolve `host:port` and return the first address whose IP is publicly routable,
-/// or `None` when every resolved address is private/loopback/link-local/etc.
-///
-/// The proxy connects to this exact resolved address (not a re-resolution), so a
-/// DNS name cannot rebind to a forbidden IP between the check and the connect.
-async fn resolve_public(host: &str, port: u16) -> Result<Option<SocketAddr>> {
-    let addrs = tokio::net::lookup_host((host, port))
-        .await
-        .with_context(|| format!("resolve {host}"))?;
-    Ok(addrs.into_iter().find(|addr| !is_forbidden_ip(addr.ip())))
-}
-
-/// Whether an IP must not be reached through the proxy: loopback, private, link-local
-/// (incl. the IMDS endpoint), and other non-globally-routable ranges.
-fn is_forbidden_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => is_forbidden_v4(v4),
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(mapped) => is_forbidden_v4(mapped),
-            None => is_forbidden_v6(v6),
-        },
-    }
-}
-
-fn is_forbidden_v4(ip: Ipv4Addr) -> bool {
-    ip.is_private()
-        || ip.is_loopback()
-        || ip.is_link_local()
-        || ip.is_unspecified()
-        || ip.is_broadcast()
-        || ip.is_documentation()
-        || ip.is_multicast()
-        || is_shared_v4(ip)
-        || is_benchmarking_v4(ip)
-        || is_ietf_v4(ip)
-        || is_reserved_v4(ip)
-}
-
-/// 100.64.0.0/10 — CGNAT shared address space.
-fn is_shared_v4(ip: Ipv4Addr) -> bool {
-    let [a, b, ..] = ip.octets();
-    a == 100 && (64..=127).contains(&b)
-}
-
-/// 198.18.0.0/15 — benchmarking.
-fn is_benchmarking_v4(ip: Ipv4Addr) -> bool {
-    let [a, b, ..] = ip.octets();
-    a == 198 && (b == 18 || b == 19)
-}
-
-/// 192.0.0.0/24 — IETF protocol assignments.
-fn is_ietf_v4(ip: Ipv4Addr) -> bool {
-    let [a, b, c, _] = ip.octets();
-    a == 192 && b == 0 && c == 0
-}
-
-/// 240.0.0.0/4 — reserved.
-fn is_reserved_v4(ip: Ipv4Addr) -> bool {
-    let [a, ..] = ip.octets();
-    a >= 240
-}
-
-fn is_forbidden_v6(ip: Ipv6Addr) -> bool {
-    ip.is_loopback()
-        || ip.is_unspecified()
-        || ip.is_multicast()
-        || is_unique_local_v6(ip)
-        || is_link_local_v6(ip)
-        || is_documentation_v6(ip)
-        || is_embedded_v4_compat(ip)
-}
-
-/// fc00::/7 — unique local addresses.
-fn is_unique_local_v6(ip: Ipv6Addr) -> bool {
-    let [a, ..] = ip.segments();
-    (a & 0xfe00) == 0xfc00
-}
-
-/// fe80::/10 — link-local unicast.
-fn is_link_local_v6(ip: Ipv6Addr) -> bool {
-    let [a, ..] = ip.segments();
-    (a & 0xffc0) == 0xfe80
-}
-
-/// 2001:db8::/32 — documentation.
-fn is_documentation_v6(ip: Ipv6Addr) -> bool {
-    let [a, b, ..] = ip.segments();
-    a == 0x2001 && b == 0x0db8
-}
-
-/// ::a.b.c.d — deprecated IPv4-compatible addresses embed an IPv4 host; refuse them
-/// so `::7f00:1` (`::127.0.0.1`) can't tunnel to loopback. `::` and `::1` are already
-/// refused as unspecified/loopback.
-fn is_embedded_v4_compat(ip: Ipv6Addr) -> bool {
-    let [a, b, c, d, e, f, ..] = ip.segments();
-    a == 0 && b == 0 && c == 0 && d == 0 && e == 0 && f == 0
-}
-
 #[cfg(test)]
 #[expect(
     clippy::unwrap_used,
@@ -721,10 +624,6 @@ fn is_embedded_v4_compat(ip: Ipv6Addr) -> bool {
 )]
 mod tests {
     use super::*;
-
-    fn forbidden(ip: &str) -> bool {
-        is_forbidden_ip(ip.parse().unwrap())
-    }
 
     fn policy_from_csv(csv: &str) -> EgressPolicy {
         EgressPolicy::from_allowlist_csv(csv).unwrap()
@@ -886,22 +785,6 @@ mod tests {
     }
 
     #[test]
-    fn ssrf_guard_applies_identically_on_port_80() {
-        // is_forbidden_ip / is_forbidden_v4 / is_forbidden_v6 are port-agnostic:
-        // resolve_public takes the port only to build the SocketAddr, so once the
-        // port gate admits 80 the SAME SSRF/IMDS/RFC1918 guard covers a port-80
-        // CONNECT exactly as it covers 443. These denials therefore hold for
-        // port-80 CONNECTs identically.
-        assert!(forbidden("169.254.169.254")); // IMDS link-local
-        assert!(forbidden("10.0.0.5")); // RFC1918 private
-        assert!(forbidden("127.0.0.1")); // loopback
-        assert!(forbidden("100.64.0.1")); // CGNAT shared
-        assert!(forbidden("::1")); // IPv6 loopback
-        assert!(forbidden("fe80::1")); // IPv6 link-local
-        assert!(forbidden("::ffff:169.254.169.254")); // IPv4-mapped IMDS
-    }
-
-    #[test]
     fn policy_gate_is_host_only_on_the_connect_path() {
         // decide_connect is host-only (port-independent), so an unallowlisted
         // host is denied on the CONNECT path regardless of which allowed port
@@ -915,44 +798,6 @@ mod tests {
                 .allowed
         );
         assert!(!policy.decide_connect(CONNECT_SUBJECT, "evil.com").allowed);
-    }
-
-    #[test]
-    fn public_addresses_are_allowed() {
-        // GitHub, Cloudflare DNS, a public IPv6.
-        assert!(!forbidden("140.82.121.3"));
-        assert!(!forbidden("1.1.1.1"));
-        assert!(!forbidden("2606:4700:4700::1111"));
-    }
-
-    #[test]
-    fn imds_and_private_v4_are_forbidden() {
-        assert!(forbidden("169.254.169.254")); // IMDS — the one that matters most
-        assert!(forbidden("10.0.0.5"));
-        assert!(forbidden("172.16.0.1"));
-        assert!(forbidden("192.168.1.1"));
-        assert!(forbidden("127.0.0.1"));
-        assert!(forbidden("100.64.0.1")); // CGNAT
-        assert!(forbidden("0.0.0.0"));
-        assert!(forbidden("255.255.255.255"));
-        assert!(forbidden("240.0.0.1")); // reserved
-    }
-
-    #[test]
-    fn loopback_and_local_v6_are_forbidden() {
-        assert!(forbidden("::1"));
-        assert!(forbidden("::"));
-        assert!(forbidden("fe80::1")); // link-local
-        assert!(forbidden("fc00::1")); // unique-local
-        assert!(forbidden("2001:db8::1")); // documentation
-    }
-
-    #[test]
-    fn v6_embedded_v4_cannot_smuggle_a_private_host() {
-        // IPv4-mapped and IPv4-compatible forms of loopback must both be refused.
-        assert!(forbidden("::ffff:127.0.0.1"));
-        assert!(forbidden("::ffff:169.254.169.254"));
-        assert!(forbidden("::7f00:1")); // ::127.0.0.1 (compatible form)
     }
 
     #[test]

@@ -11,6 +11,7 @@ pub mod egress_proxy;
 pub mod error;
 pub mod github;
 pub mod naming;
+pub(crate) mod net_guard;
 pub mod policy;
 pub(crate) mod proxy;
 pub mod reconcile;
