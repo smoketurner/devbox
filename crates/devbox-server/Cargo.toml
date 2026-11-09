@@ -24,7 +24,10 @@ path = "src/main.rs"
 anyhow = { workspace = true, features = ["std"] }
 askama = { workspace = true, features = ["derive", "alloc"] }
 aws-config = { workspace = true, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
+aws-credential-types = { workspace = true }
 aws-lc-rs = { workspace = true }
+aws-sigv4 = { workspace = true, features = ["sign-http", "http1"] }
+aws-smithy-runtime-api = { workspace = true, features = ["client"] }
 aws-sdk-autoscaling = { workspace = true, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
 aws-sdk-dsql = { workspace = true, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
 aws-sdk-ec2 = { workspace = true, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
@@ -32,6 +35,7 @@ aws-sdk-ssm = { workspace = true, features = ["rt-tokio", "default-https-client"
 axum = { workspace = true, features = ["json", "tokio", "http1", "form", "query"] }
 base64 = { workspace = true, features = ["alloc"] }
 devbox-common = { path = "../devbox-common" }
+dogwood-language = { workspace = true }
 jiff = { workspace = true, features = ["std", "serde"] }
 jsonwebtoken = { workspace = true, features = ["aws_lc_rs", "use_pem"] }
 reqwest = { workspace = true, features = ["json", "rustls", "stream"] }

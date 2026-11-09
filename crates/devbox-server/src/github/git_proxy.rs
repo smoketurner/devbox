@@ -9,24 +9,24 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::body::{Body, Bytes};
-use axum::http::header::{
-    ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE,
-    USER_AGENT,
-};
-use axum::http::{HeaderMap, HeaderName, Method, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::body::Bytes;
+use axum::http::header::AUTHORIZATION;
+use axum::http::{HeaderMap, Method};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 
 use crate::github::GitHubApp;
+// Re-exported so the routes.rs call site `git_proxy::into_axum_response` keeps
+// resolving while the implementation lives in the shared proxy module.
+pub(crate) use crate::proxy::into_axum_response;
+use crate::proxy::{self, is_forwardable_request_header};
 
 /// Longest owner/repo path segment accepted.
 const MAX_SEGMENT_LEN: usize = 100;
 
-/// Upstream connect timeout. No total timeout — a fetch streams for as long as the
-/// clone takes.
-const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Additional forwardable request headers beyond the shared base safelist: git
+/// keeps `git-protocol` so protocol v2 survives.
+const GIT_EXTRA_REQUEST_HEADERS: &[&str] = &["git-protocol"];
 
 /// A recognized git smart-HTTP endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,28 +185,6 @@ pub(crate) fn basic_auth_header(token: &str) -> String {
     format!("Basic {}", STANDARD.encode(raw))
 }
 
-/// Whether an incoming request header is forwarded upstream. Excludes
-/// `Authorization` (the proxy injects its own) and length/hop-by-hop headers; keeps
-/// `git-protocol` so protocol v2 survives.
-fn is_forwardable_request_header(name: &HeaderName) -> bool {
-    name == ACCEPT
-        || name == ACCEPT_ENCODING
-        || name == CONTENT_TYPE
-        || name == CONTENT_ENCODING
-        || name == USER_AGENT
-        || name.as_str() == "git-protocol"
-}
-
-/// Whether an upstream response header is forwarded back. Keeps content framing and
-/// cache directives; drops length/transfer headers so axum re-frames the stream.
-fn is_forwardable_response_header(name: &HeaderName) -> bool {
-    name == CONTENT_TYPE
-        || name == CONTENT_ENCODING
-        || name == CACHE_CONTROL
-        || name.as_str() == "expires"
-        || name.as_str() == "pragma"
-}
-
 /// Reverse proxy for git traffic. Owns its own HTTP client (no total timeout, so
 /// long clones stream) and the [`GitHubApp`] used to inject a repo-scoped token per
 /// request.
@@ -222,11 +200,7 @@ impl GitProxy {
     ///
     /// Returns an error when the HTTP client cannot be constructed.
     pub fn new(app: Arc<GitHubApp>) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .user_agent("devbox-server-git-proxy")
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-            .context("build git-proxy HTTP client")?;
+        let client = proxy::build_client("devbox-server-git-proxy")?;
         Ok(Self { client, app })
     }
 
@@ -257,7 +231,7 @@ impl GitProxy {
             .header(AUTHORIZATION, basic_auth_header(&token));
 
         for (name, value) in headers {
-            if is_forwardable_request_header(name) {
+            if is_forwardable_request_header(name, GIT_EXTRA_REQUEST_HEADERS) {
                 builder = builder.header(name.clone(), value.clone());
             }
         }
@@ -270,21 +244,6 @@ impl GitProxy {
             .await
             .with_context(|| format!("forward git request to {url}"))
     }
-}
-
-/// Convert an upstream GitHub response into a streaming axum response: the status,
-/// the safelisted headers, and the body streamed (never buffered).
-pub(crate) fn into_axum_response(upstream: reqwest::Response) -> Response {
-    let status = upstream.status();
-    let mut builder = Response::builder().status(status);
-    for (name, value) in upstream.headers() {
-        if is_forwardable_response_header(name) {
-            builder = builder.header(name.clone(), value.clone());
-        }
-    }
-    builder
-        .body(Body::from_stream(upstream.bytes_stream()))
-        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
 
 #[cfg(test)]
@@ -457,11 +416,22 @@ mod tests {
     #[test]
     fn request_header_forwarding_drops_authorization() {
         // Authorization must never be forwarded (the proxy injects its own); the
-        // git-protocol header must be kept so protocol v2 survives.
-        assert!(!is_forwardable_request_header(&AUTHORIZATION));
-        assert!(is_forwardable_request_header(&HeaderName::from_static(
-            "git-protocol"
-        )));
-        assert!(is_forwardable_request_header(&CONTENT_TYPE));
+        // git-protocol header must be kept so protocol v2 survives. This exercises
+        // the shared safelist through git's `GIT_EXTRA_REQUEST_HEADERS`.
+        use axum::http::HeaderName;
+        use axum::http::header::CONTENT_TYPE;
+
+        assert!(!is_forwardable_request_header(
+            &AUTHORIZATION,
+            GIT_EXTRA_REQUEST_HEADERS
+        ));
+        assert!(is_forwardable_request_header(
+            &HeaderName::from_static("git-protocol"),
+            GIT_EXTRA_REQUEST_HEADERS
+        ));
+        assert!(is_forwardable_request_header(
+            &CONTENT_TYPE,
+            GIT_EXTRA_REQUEST_HEADERS
+        ));
     }
 }

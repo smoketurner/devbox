@@ -126,6 +126,13 @@ pub struct Authenticator {
     /// Always `None` in production builds.
     #[cfg(test)]
     test_owner: Option<String>,
+    /// Test-only: when set, [`verify_agent_token`](Self::verify_agent_token)
+    /// resolves every request to this [`AgentIdentity`] without touching the
+    /// network (mocks the AWS web-identity JWKS boundary so handler tests can
+    /// exercise the authenticated reverse-proxy path). Always `None` in
+    /// production builds.
+    #[cfg(test)]
+    test_agent: Option<AgentIdentity>,
 }
 
 impl Authenticator {
@@ -148,7 +155,29 @@ impl Authenticator {
             agent_jwks: RwLock::new(HashMap::new()),
             #[cfg(test)]
             test_owner: None,
+            #[cfg(test)]
+            test_agent: None,
         }
+    }
+
+    /// Test-only constructor: an authenticator whose
+    /// [`verify_agent_token`](Self::verify_agent_token) resolves every request to
+    /// `agent`, bypassing network JWKS verification. Lets handler tests exercise
+    /// the authenticated egress reverse-proxy path without minting a real AWS
+    /// web-identity token; the token-verification path itself is covered by the
+    /// `agent_identity` unit tests.
+    #[cfg(test)]
+    pub(crate) fn with_test_agent(agent: AgentIdentity) -> Self {
+        let mut auth = Self::new(AuthConfig {
+            issuer: "https://us.vouch.sh".to_string(),
+            jwks_uri: "https://us.vouch.sh/oauth/jwks".to_string(),
+            alb_region: None,
+            alb_arn: None,
+            oidc: None,
+            agent: None,
+        });
+        auth.test_agent = Some(agent);
+        auth
     }
 
     /// Test-only constructor: an authenticator that resolves every authenticated
@@ -237,6 +266,11 @@ impl Authenticator {
     /// signature/issuer/audience/expiry validation, or its claims don't resolve to
     /// a trusted devbox host.
     pub async fn verify_agent_token(&self, token: &str) -> Result<AgentIdentity, AuthError> {
+        #[cfg(test)]
+        if let Some(agent) = &self.test_agent {
+            return Ok(agent.clone());
+        }
+
         let agent =
             self.config.agent.as_ref().ok_or_else(|| {
                 AuthError::Invalid("agent authentication not configured".to_string())

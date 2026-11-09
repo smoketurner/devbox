@@ -131,6 +131,54 @@ async fn main() -> Result<()> {
         .context("initialize git reverse proxy")?
         .map(Arc::new);
 
+    // The exe.dev-style integrations layer: a registry of operator-configured
+    // upstreams (host + inline method/path scoping + server-held credential, from
+    // EGRESS_UPSTREAMS). `None` when EGRESS_UPSTREAMS is unset so local/dev boots
+    // without AWS. The returned config carries BOTH the transport-owning proxy and
+    // the compiled per-integration policy rules, which are merged into the single
+    // shared EgressPolicy below so authorization flows through one decide_http.
+    let mut egress_integrations = devbox_server::egress_proxy::EgressProxy::from_env(&aws_config)
+        .await
+        .context("initialize egress integrations layer")?;
+    let integration_rules = egress_integrations
+        .as_mut()
+        .map(devbox_server::egress_proxy::EgressConfig::policy_rules)
+        .unwrap_or_default();
+    let egress_proxy = egress_integrations.map(|cfg| cfg.proxy);
+
+    // Build the shared egress policy + decision sink ONCE, independently of the
+    // CONNECT listener address. The SAME EgressPolicy (one rule set) and
+    // the same decision sink back BOTH the CONNECT listener and the reverse
+    // proxy's decide_http, so both gates share one policy and one audit sink.
+    //
+    // It is built whenever egress is configured at all: either the CONNECT
+    // listener (EGRESS_PROXY_ADDR) or the reverse proxy (EGRESS_UPSTREAMS => an
+    // `egress_proxy` registry) is present. This is the fix for a deployment that
+    // sets EGRESS_UPSTREAMS without EGRESS_PROXY_ADDR: the reverse proxy now has a
+    // usable shared policy instead of a None that would deny every request.
+    let connect_addr_set = std::env::var_os("EGRESS_PROXY_ADDR").is_some_and(|v| !v.is_empty());
+    let egress_shared = if connect_addr_set || egress_proxy.is_some() {
+        // The per-integration method/path scoping compiled from EGRESS_UPSTREAMS is
+        // merged into the shared policy here, so the reverse proxy's decide_http and
+        // the CONNECT gate share exactly one rule set.
+        Some(devbox_server::egress::EgressShared::from_env(
+            integration_rules,
+        )?)
+    } else {
+        None
+    };
+    let (egress_policy, egress_sink) = match &egress_shared {
+        Some(shared) => (Some(Arc::clone(&shared.policy)), Some(shared.sink.clone())),
+        None => (None, None),
+    };
+
+    // The CONNECT listener config is `None` unless EGRESS_PROXY_ADDR is set; it
+    // reuses the shared policy + sink above.
+    let egress_config = match &egress_shared {
+        Some(shared) => devbox_server::egress::EgressConfig::from_env(shared)?,
+        None => None,
+    };
+
     // Build router. State is shared as a single Arc<AppState>.
     let app = build_router(Arc::new(AppState {
         store: Arc::clone(&store),
@@ -139,18 +187,23 @@ async fn main() -> Result<()> {
         github_app,
         git_proxy,
         compute: Some(ec2_client),
+        egress_proxy,
+        egress_policy,
+        egress_sink,
     }));
 
     // Optional allowlisting HTTPS egress proxy: a second listener in this binary,
-    // stopped by the same cancellation token as the reconciler.
-    if let Some(egress) = devbox_server::egress::EgressConfig::from_env()? {
+    // stopped by the same cancellation token as the reconciler. It shares the
+    // EgressPolicy/sink already threaded into AppState above.
+    if let Some(egress) = egress_config {
         let egress_listener = TcpListener::bind(egress.addr)
             .await
             .with_context(|| format!("bind egress proxy on {}", egress.addr))?;
         tracing::info!(addr = %egress.addr, "egress proxy listening");
         tokio::spawn(devbox_server::egress::serve(
             egress_listener,
-            Arc::new(egress.allowlist),
+            egress.policy,
+            egress.sink,
             cancel.clone(),
         ));
     }

@@ -23,6 +23,8 @@ use devbox_common::{
 
 use crate::auth::{AgentIdentity, Authenticator, Principal};
 use crate::documents::devbox::DevboxDoc;
+use crate::egress::{DecisionRecord, DecisionSink};
+use crate::egress_proxy;
 use crate::error::{AppError, JsonBody};
 use crate::github::git_proxy;
 use crate::service;
@@ -32,6 +34,23 @@ use crate::ui::build_ui_router;
 /// smaller; the cap only bounds a pathological `git-upload-pack` request body
 /// (the large data — the packfile — flows the other way, as a streamed response).
 const GIT_PROXY_BODY_LIMIT: usize = 50 * 1024 * 1024;
+
+/// Body cap for a proxied egress request (50 MiB).
+///
+/// The request body is fully buffered before forwarding because AWS SigV4 signs
+/// over the payload (`SignableBody::Bytes`), so the complete body must be in hand
+/// to compute `x-amz-content-sha256` and the signature — a streaming request body
+/// cannot be signed. This cap bounds that buffering.
+///
+/// 50 MiB comfortably covers the intended upstreams' request payloads: LLM invoke
+/// APIs (Anthropic Messages, Bedrock `InvokeModel`/`Converse`) send JSON prompts
+/// that are at most a few MiB even with large context windows, and Bedrock's own
+/// per-request payload limits (single-digit MiB for `InvokeModel`) sit well under
+/// it. The large data in this proxy is the upstream *response* (streamed tokens),
+/// which is **never** buffered — [`egress_proxy::into_axum_response`] streams it
+/// straight back. If a future upstream needs unsigned large uploads, prefer a
+/// static-header credential (which does not require buffering) over raising this.
+const EGRESS_PROXY_BODY_LIMIT: usize = 50 * 1024 * 1024;
 
 /// Application state shared across handlers.
 ///
@@ -63,6 +82,19 @@ pub struct AppState {
     /// reconciler tick. `None` in tests (and any deployment without AWS), where
     /// the reconciler's `apply_pending_owner_tags` remains the sole tagger.
     pub compute: Option<Arc<crate::compute::ec2::Ec2>>,
+    /// Credential-injecting reverse proxy for configured upstreams (the
+    /// method/path-aware generalization of the git proxy). `None` when
+    /// `EGRESS_UPSTREAMS` is unset, in which case `/egress/*` returns 503.
+    pub egress_proxy: Option<Arc<crate::egress_proxy::EgressProxy>>,
+    /// The shared egress policy. The SAME instance backs the CONNECT
+    /// proxy ([`crate::egress`]); threading it here so the reverse proxy's
+    /// `decide_http` decisions share one policy. `None` when the egress proxy
+    /// listener is disabled (`EGRESS_PROXY_ADDR` unset).
+    pub egress_policy: Option<Arc<crate::policy::EgressPolicy>>,
+    /// The shared decision-record sink (same `tracing`/JSONL sink the CONNECT
+    /// proxy uses). `None` when egress is disabled; a default `tracing`-only sink
+    /// is used as a fallback when the proxy is configured without the listener.
+    pub egress_sink: Option<crate::egress::DecisionSink>,
 }
 
 /// Handle to the shared application state, passed to every handler.
@@ -159,6 +191,21 @@ pub fn build_router(state: SharedState) -> Router {
         )
         .layer(DefaultBodyLimit::max(GIT_PROXY_BODY_LIMIT));
 
+    // The credential-injecting reverse proxy authenticates inline (box web-identity
+    // token as a Bearer header), like the git proxy, so it carries its own edge
+    // rather than sharing require_auth. GET/POST/PUT/PATCH/DELETE are accepted so a
+    // box can route arbitrary REST flows through it.
+    let egress = Router::new()
+        .route(
+            "/egress/{upstream}/{*rest}",
+            get(handle_egress_proxy)
+                .post(handle_egress_proxy)
+                .put(handle_egress_proxy)
+                .patch(handle_egress_proxy)
+                .delete(handle_egress_proxy),
+        )
+        .layer(DefaultBodyLimit::max(EGRESS_PROXY_BODY_LIMIT));
+
     Router::new()
         .route("/health", get(health_check))
         .route(
@@ -168,6 +215,7 @@ pub fn build_router(state: SharedState) -> Router {
         .merge(api)
         .merge(agent)
         .merge(git)
+        .merge(egress)
         .merge(build_ui_router())
         .with_state(state)
 }
@@ -352,6 +400,91 @@ async fn handle_git_proxy(
     Ok(git_proxy::into_axum_response(upstream))
 }
 
+/// HTTP adapter: credential-injecting reverse proxy for a configured upstream.
+///
+/// Authenticates inline exactly like [`handle_git_proxy`] — the box presents its
+/// web-identity token as a `Bearer` header, resolving a verified
+/// [`AgentIdentity`]. The box's real instance id is the policy subject (unlike the
+/// coarse CONNECT subject), so [`crate::policy::EgressPolicy::decide_http`] can
+/// discriminate per box on host + method + path. On allow the request is forwarded
+/// with a server-held credential injected (see [`crate::egress_proxy`]); every
+/// decision emits a shared decision record.
+///
+/// Status mapping: a missing/invalid credential is 401; an unknown upstream is
+/// 404; a policy deny is 403; an unconfigured proxy is 503; an upstream transport
+/// failure is 502.
+async fn handle_egress_proxy(
+    State(state): State<SharedState>,
+    method: Method,
+    Path((upstream, rest)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let token = bearer_token(&headers)?;
+    let agent = state.auth.verify_agent_token(&token).await?;
+
+    let proxy = state.egress_proxy.as_ref().ok_or_else(|| {
+        AppError::ServiceUnavailable("egress proxy is not configured".to_string())
+    })?;
+
+    // Resolve the upstream host for the policy decision; unknown upstream => 404.
+    let host = proxy
+        .host_for(&upstream)
+        .ok_or_else(|| AppError::NotFound(format!("unknown egress upstream '{upstream}'")))?
+        .to_string();
+
+    // The policy path is `/{rest}` (the tail after the upstream name), matching
+    // what is forwarded upstream.
+    let path = format!("/{}", rest.trim_start_matches('/'));
+    let subject = agent.instance_id.as_ref();
+
+    // Apply the shared policy before forwarding, and record the decision.
+    // decide_http is synchronous and lock-free, so nothing is held across awaits.
+    let decision = match state.egress_policy.as_ref() {
+        Some(policy) => policy.decide_http(subject, &host, method.as_str(), &path),
+        // Without a shared policy the proxy fails closed (default-deny).
+        None => crate::policy::EgressDecision {
+            allowed: false,
+            reason: "egress policy not configured".to_string(),
+        },
+    };
+    emit_egress_decision(&state, subject, &host, method.as_str(), &path, &decision);
+    if !decision.allowed {
+        return Err(AppError::Forbidden(format!(
+            "egress denied by policy: {}",
+            decision.reason
+        )));
+    }
+
+    // `host_for` above is the single 404 gate for an unknown upstream; `forward`
+    // treats a missing upstream as an internal invariant violation, so there is
+    // only one 404 source for this handler.
+    let upstream_resp = proxy
+        .forward(&upstream, &method, &rest, query.as_deref(), &headers, body)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(egress_proxy::into_axum_response(upstream_resp))
+}
+
+/// Emit a shared egress decision record for an HTTP reverse-proxy decision, using
+/// the shared sink when configured (falling back to a default `tracing`-only
+/// sink), so CONNECT and HTTP decisions land in the same audit stream.
+fn emit_egress_decision(
+    state: &AppState,
+    subject: &str,
+    host: &str,
+    method: &str,
+    path: &str,
+    decision: &crate::policy::EgressDecision,
+) {
+    let record = DecisionRecord::http(subject, host, method, path, decision);
+    match state.egress_sink.as_ref() {
+        Some(sink) => sink.emit(&record),
+        None => DecisionSink::default().emit(&record),
+    }
+}
+
 /// HTTP adapter: record a warm-up report from a verified devbox host onto its
 /// `DevboxDoc` (see [`service::record_warmup_report`]).
 async fn handle_agent_warmup_report(
@@ -397,6 +530,9 @@ mod tests {
             github_app: None,
             git_proxy: None,
             compute: None,
+            egress_proxy: None,
+            egress_policy: None,
+            egress_sink: None,
         })
     }
 
@@ -425,6 +561,9 @@ mod tests {
             github_app: None,
             git_proxy: None,
             compute: None,
+            egress_proxy: None,
+            egress_policy: None,
+            egress_sink: None,
         })
     }
 
@@ -504,6 +643,9 @@ mod tests {
             github_app: None,
             git_proxy: None,
             compute: None,
+            egress_proxy: None,
+            egress_policy: None,
+            egress_sink: None,
         });
 
         let Json(meta) = protected_resource_metadata(State(state), HeaderMap::new()).await;
@@ -642,6 +784,214 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("Basic realm=\"devbox\"")
         );
+    }
+
+    #[tokio::test]
+    async fn egress_proxy_route_requires_a_credential() {
+        // The egress reverse proxy authenticates inline with a Bearer web-identity
+        // token. A request with no credential is 401 — and wired (not 404),
+        // pinning the route. All forwarded methods resolve to the handler.
+        for (method, uri) in [
+            ("GET", "/egress/anthropic/v1/models"),
+            ("POST", "/egress/bedrock/model/x/invoke"),
+            ("PUT", "/egress/anthropic/v1/thing"),
+            ("DELETE", "/egress/anthropic/v1/thing"),
+        ] {
+            let state = setup_state_no_principal().await;
+            let status = router_status(state, method, uri).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "expected 401 for {method} {uri}"
+            );
+        }
+    }
+
+    /// A verified agent identity for the authenticated reverse-proxy path.
+    fn test_agent() -> AgentIdentity {
+        AgentIdentity {
+            instance_id: devbox_common::InstanceId("i-0abc123def4567890".to_string()),
+            role: crate::auth::AgentRole::Pool,
+            owner: None,
+        }
+    }
+
+    /// Build an `AppState` whose agent auth resolves to [`test_agent`], with a
+    /// configured egress proxy (`upstream` -> `host`, no AWS) and the given
+    /// `policy`. The decision sink is the default `tracing`-only sink.
+    async fn setup_state_with_egress(
+        upstream: &str,
+        host: &str,
+        policy: crate::policy::EgressPolicy,
+    ) -> SharedState {
+        Arc::new(AppState {
+            store: Arc::new(test_store().await),
+            auth: Authenticator::with_test_agent(test_agent()),
+            aws_account_id: None,
+            github_app: None,
+            git_proxy: None,
+            compute: None,
+            egress_proxy: Some(crate::egress_proxy::EgressProxy::for_test(upstream, host)),
+            egress_policy: Some(Arc::new(policy)),
+            egress_sink: Some(crate::egress::DecisionSink::default()),
+        })
+    }
+
+    #[tokio::test]
+    async fn egress_proxy_denies_with_403_when_policy_rejects() {
+        // A configured + authenticated reverse proxy whose policy does NOT permit
+        // the host/method/path must 403 (default-deny), without any upstream call.
+        // This pins the policy gate inside handle_egress_proxy: remove the gate
+        // and this request would instead attempt to forward (and no longer 403).
+        let policy = crate::policy::EgressPolicy::from_allowlist_csv("").unwrap();
+        let state = setup_state_with_egress("anthropic", "api.anthropic.com", policy).await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/egress/anthropic/v1/messages")
+            .header(AUTHORIZATION, "Bearer any-token-resolves-to-test-agent")
+            .body(Body::empty())
+            .unwrap();
+        let status = build_router(state).oneshot(req).await.unwrap().status();
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a policy deny must surface as 403 from the egress reverse proxy"
+        );
+    }
+
+    #[tokio::test]
+    async fn egress_proxy_disallowed_path_is_403_for_a_known_integration() {
+        // Method/path scoping through the handler: the integration name is known
+        // (so NOT a 404), its policy permits only POST /v1/messages, and a request
+        // to a DIFFERENT path on the same host is default-denied => 403. This pins
+        // that the inline EGRESS_UPSTREAMS scoping is enforced via decide_http at
+        // the handler boundary, not merely at the unit level.
+        let policy_src = r#"
+@id("egress_anthropic_0")
+permit (principal, action == Egress::Action::"HttpRequest", resource)
+when {
+  context.input.host == "api.anthropic.com" &&
+  context.input.method == "POST" &&
+  context.input.path == "/v1/messages"
+};
+"#;
+        let policy = crate::policy::EgressPolicy::from_policy_source(
+            policy_src,
+            vec!["api.anthropic.com".to_string()],
+        )
+        .unwrap();
+        let state = setup_state_with_egress("anthropic", "api.anthropic.com", policy).await;
+
+        // A path the integration does not permit: known upstream, so 403 (deny),
+        // never 404.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/egress/anthropic/v1/other")
+            .header(AUTHORIZATION, "Bearer any-token-resolves-to-test-agent")
+            .body(Body::empty())
+            .unwrap();
+        let status = build_router(state).oneshot(req).await.unwrap().status();
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a known integration with an unmatched path must 403 (default-deny), not 404"
+        );
+    }
+
+    #[tokio::test]
+    async fn egress_proxy_unknown_upstream_is_404_even_when_authenticated() {
+        // With a valid agent identity but an unconfigured upstream name, the
+        // handler 404s via host_for BEFORE the policy call — the single 404 gate.
+        let policy = crate::policy::EgressPolicy::from_allowlist_csv("").unwrap();
+        let state = setup_state_with_egress("anthropic", "api.anthropic.com", policy).await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/egress/does-not-exist/v1/models")
+            .header(AUTHORIZATION, "Bearer any-token-resolves-to-test-agent")
+            .body(Body::empty())
+            .unwrap();
+        let status = build_router(state).oneshot(req).await.unwrap().status();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn egress_proxy_allow_decision_is_reached_and_emits_record() {
+        // The allow arm of the gate: a policy that permits the
+        // HttpRequest for this host/method/path makes decide_http return allowed,
+        // so the handler would proceed past the 403 gate to forward. Driving the
+        // full handler to a real upstream needs network, so assert the allow
+        // decision + emitted record at the exact seam the handler uses
+        // (decide_http -> DecisionRecord::http -> sink.emit), proving the allow
+        // path is reached and a record is produced before forwarding — the mirror
+        // of the 403-deny test that pins the deny arm end to end.
+        let policy_src = r#"
+@id("allow_messages")
+permit (principal, action == Egress::Action::"HttpRequest", resource)
+when {
+  context.input.host == "api.anthropic.com" &&
+  context.input.method == "POST" &&
+  context.input.path == "/v1/messages"
+};
+"#;
+        let policy = crate::policy::EgressPolicy::from_policy_source(
+            policy_src,
+            vec!["api.anthropic.com".to_string()],
+        )
+        .unwrap();
+        let agent = test_agent();
+        let subject = agent.instance_id.as_ref();
+
+        let allow = policy.decide_http(subject, "api.anthropic.com", "POST", "/v1/messages");
+        assert!(
+            allow.allowed,
+            "the permitted host/method/path must be allowed: {allow:?}"
+        );
+        // A different path is still denied by default — the gate discriminates.
+        let deny = policy.decide_http(subject, "api.anthropic.com", "POST", "/v1/other");
+        assert!(!deny.allowed, "an unpermitted path must deny: {deny:?}");
+
+        let record = crate::egress::DecisionRecord::http(
+            subject,
+            "api.anthropic.com",
+            "POST",
+            "/v1/messages",
+            &allow,
+        );
+        assert_eq!(record.decision, "allow");
+        assert_eq!(record.operation, "http_request");
+        assert_eq!(record.host, "api.anthropic.com POST /v1/messages");
+        // It still serializes as one JSONL line with all the documented keys.
+        let line = serde_json::to_string(&record).unwrap();
+        for key in [
+            "subject",
+            "operation",
+            "host",
+            "decision",
+            "reason",
+            "timestamp",
+        ] {
+            assert!(line.contains(key), "record line missing '{key}': {line}");
+        }
+        // Emitting the record (what the handler does before forwarding) must not
+        // panic on the default tracing-only sink.
+        crate::egress::DecisionSink::default().emit(&record);
+    }
+
+    #[tokio::test]
+    async fn egress_proxy_rejects_invalid_credential() {
+        // A present-but-invalid Bearer token (agent auth unconfigured here) fails
+        // closed with 401, exactly like the agent JSON endpoints.
+        let state = setup_state_no_principal().await;
+        let req = Request::builder()
+            .method("GET")
+            .uri("/egress/anthropic/v1/models")
+            .header(AUTHORIZATION, "Bearer not-a-real-agent-token")
+            .body(Body::empty())
+            .unwrap();
+        let status = build_router(state).oneshot(req).await.unwrap().status();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
