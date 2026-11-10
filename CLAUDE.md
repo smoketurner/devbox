@@ -359,7 +359,7 @@ are tagged inline):
   (`sandbox/api.rs`: pause/resume, clean shutdown via the guest's control port),
   `attach` (daemon splices the CLI to the guest's tmux session; `sandbox/terminal.rs`),
   and the guest init `devbox-agent guest` (`sandbox/guest.rs`: mounts the
-  workspace, bridges loopback to the host relay over vsock with `socat`, pushes
+  workspace, bridges loopback to the host relay over vsock with `tokio-vsock`, pushes
   the branch, runs the harness in tmux, WIP-commits and powers off). The guest
   rootfs build and `devbox-sandboxd.service` are in devbox-infra
   (`07-nitro-sandboxes`, `08-sandbox-guest`). Still missing: a sandbox-capable

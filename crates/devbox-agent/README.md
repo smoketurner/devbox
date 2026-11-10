@@ -250,9 +250,9 @@ a message naming the fix:
     `/workspace` and reads `task.json`.
   - It serves loopback listeners for the egress (`HTTPS_PROXY=http://127.0.0.1:3128`)
     and model ports (`ANTHROPIC_BASE_URL=http://127.0.0.1:8080/anthropic`,
-    `OPENAI_BASE_URL=…/openai/v1`), each carried to the host relay over vsock
-    with `socat`.
-  - It adds a `devbox` git remote (`ext::socat STDIO VSOCK-CONNECT:2:9418`,
+    `OPENAI_BASE_URL=…/openai/v1`), each carried to the host relay
+    over vsock (`tokio-vsock`).
+  - It adds a `devbox` git remote (`ext::devbox-agent guest vsock-pipe 9418`,
     `push.negotiate` off) and pushes the agent branch every 30 s when it moves.
   - It runs the harness against the task in tmux. Built in: `claude`
     (`--dangerously-skip-permissions`), `codex`

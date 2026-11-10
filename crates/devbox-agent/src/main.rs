@@ -79,9 +79,24 @@ enum Command {
     /// VMMs and their vsock relays for `sandbox` commands.
     Sandboxd,
     /// The init inside a sandbox guest (run by the guest image's
-    /// `devbox-guest.service`, not on the host).
+    /// `devbox-guest.service`, not on the host). Linux only, like vsock.
+    #[cfg(target_os = "linux")]
     #[command(hide = true)]
-    Guest,
+    Guest {
+        #[command(subcommand)]
+        command: Option<GuestCommand>,
+    },
+}
+
+/// `devbox-agent guest` subcommands (none: run the init).
+#[cfg(target_os = "linux")]
+#[derive(Subcommand)]
+enum GuestCommand {
+    /// Connect stdin/stdout to host vsock port PORT (git's `ext::` transport).
+    VsockPipe {
+        /// Host vsock port.
+        port: u32,
+    },
 }
 
 // Current-thread runtime: the agent reads IMDS / calls the AWS SDK (both async)
@@ -145,7 +160,21 @@ async fn main() -> ExitCode {
                 }
             }
         }
-        Command::Guest => {
+        #[cfg(target_os = "linux")]
+        Command::Guest {
+            command: Some(GuestCommand::VsockPipe { port }),
+        } => {
+            // git speaks its protocol on stdout: errors only, on stderr.
+            match sandbox::guest::vsock_pipe(port).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("vsock-pipe: {e:#}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        #[cfg(target_os = "linux")]
+        Command::Guest { command: None } => {
             init_tracing();
             match sandbox::guest::run(sandbox::guest::Config::guest()).await {
                 Ok(ending) => {

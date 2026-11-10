@@ -19,7 +19,9 @@
 //! 6. when the harness exits or `shutdown` arrives: commit what is left as a WIP
 //!    commit, push a last time, and power off (which ends the VMM).
 //!
-//! The vsock hops use `socat` (in the guest image); everything else is here. For
+//! Linux only, like AF_VSOCK itself (`mod.rs` compiles this module on Linux).
+//! vsock is spoken natively through `tokio-vsock`; git reaches the inbox through
+//! `devbox-agent guest vsock-pipe <port>` as its `ext::` transport. For
 //! tests, the vsock side can be replaced by the host relay's Unix sockets, and
 //! the tmux session by a plain child process.
 
@@ -31,8 +33,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+#[cfg(all(test, target_os = "linux"))]
+use tokio::net::{UnixListener, UnixStream};
 #[cfg(all(test, target_os = "linux"))]
 use tokio::process::Child;
 use tokio::process::Command;
@@ -40,12 +44,6 @@ use tokio::sync::mpsc;
 
 /// Where the workspace drive is mounted.
 const WORKSPACE: &str = "/workspace";
-
-/// The control socket the vsock control port is bridged to.
-const CONTROL_SOCKET: &str = "/run/devbox-guest/control.sock";
-
-/// Host CID (Firecracker's host side of vsock).
-const HOST_CID: u32 = 2;
 
 /// The tmux session the harness runs in.
 const SESSION: &str = "agent";
@@ -84,14 +82,20 @@ pub(crate) struct Ports {
     pub(crate) control_port: u32,
 }
 
-/// How the guest reaches the host relay.
+/// How the guest reaches the host relay, and how the host reaches the guest's
+/// control port.
 #[derive(Debug, Clone)]
 pub(crate) enum Upstream {
-    /// Real vsock, through `socat`.
+    /// Real vsock (`tokio-vsock`): host CID for outgoing connections, and a
+    /// vsock listener for the control port.
     Vsock,
-    /// The relay's Unix sockets in this directory (`vsock.sock_<port>`): tests.
+    /// Tests: the relay's Unix sockets in `relay_dir` (`vsock.sock_<port>`), and
+    /// a Unix control socket.
     #[cfg(all(test, target_os = "linux"))]
-    Unix(PathBuf),
+    Unix {
+        relay_dir: PathBuf,
+        control_socket: PathBuf,
+    },
 }
 
 /// How the harness runs.
@@ -111,12 +115,12 @@ pub(crate) struct Config {
     /// Mount the workspace drive first.
     pub(crate) mount: bool,
     pub(crate) upstream: Upstream,
-    pub(crate) control_socket: PathBuf,
     pub(crate) session: Session,
     /// Loopback addresses for the egress and model ports (`None`: the task's
     /// port numbers on 127.0.0.1).
     pub(crate) listen: Option<(SocketAddr, SocketAddr)>,
-    /// Git remote URL for the inbox (`None`: vsock via `ext::socat`).
+    /// Git remote URL for the inbox (`None`: vsock via
+    /// `ext::devbox-agent guest vsock-pipe <port>`).
     pub(crate) remote_url: Option<String>,
     pub(crate) push_interval: Duration,
     /// Command run last to power off (empty: just exit).
@@ -132,7 +136,6 @@ impl Config {
             workspace: PathBuf::from(WORKSPACE),
             mount: true,
             upstream: Upstream::Vsock,
-            control_socket: PathBuf::from(CONTROL_SOCKET),
             session: Session::Tmux,
             listen: None,
             remote_url: None,
@@ -164,12 +167,17 @@ pub(crate) async fn run(config: Config) -> Result<Ending> {
     }
     let task = load_task(&config.workspace.join("task.json"))?;
     let repo = config.workspace.join("repo");
-    let remote = config.remote_url.clone().unwrap_or_else(|| {
-        format!(
-            "ext::socat STDIO VSOCK-CONNECT:{HOST_CID}:{}",
-            task.vsock.git_port
-        )
-    });
+    let remote = match config.remote_url.clone() {
+        Some(url) => url,
+        None => {
+            let agent = std::env::current_exe().context("locate devbox-agent")?;
+            format!(
+                "ext::{} guest vsock-pipe {}",
+                agent.display(),
+                task.vsock.git_port
+            )
+        }
+    };
     configure_repo(&repo, &task, &remote).await?;
 
     let (egress_addr, model_addr) = config.listen.unwrap_or_else(|| {
@@ -198,14 +206,17 @@ pub(crate) async fn run(config: Config) -> Result<Ending> {
     ));
 
     let (control_tx, mut control_rx) = mpsc::channel(4);
-    let control = bind_control(&config.control_socket)?;
-    if matches!(config.upstream, Upstream::Vsock) {
-        bridges.spawn(control_vsock_bridge(
-            task.vsock.control_port,
-            config.control_socket.clone(),
-        ));
+    match &config.upstream {
+        Upstream::Vsock => {
+            let listener = vsock::listen(task.vsock.control_port)?;
+            bridges.spawn(vsock::control_loop(listener, control_tx, config.session));
+        }
+        #[cfg(all(test, target_os = "linux"))]
+        Upstream::Unix { control_socket, .. } => {
+            let listener = bind_control(control_socket)?;
+            bridges.spawn(unix_control_loop(listener, control_tx, config.session));
+        }
     }
-    bridges.spawn(control_loop(control, control_tx, config.session));
 
     let command = harness_command_in(&config.harness_dir, &task.harness, &task.prompt)?;
     let mut harness = Harness::start(config.session, &command, &repo, &env).await?;
@@ -465,31 +476,15 @@ async fn bridge_loop(listener: TcpListener, upstream: Upstream, port: u32) {
 async fn bridge(mut conn: TcpStream, upstream: &Upstream, port: u32) -> Result<()> {
     match upstream {
         Upstream::Vsock => {
-            let mut socat = Command::new("socat")
-                .arg("STDIO")
-                .arg(format!("VSOCK-CONNECT:{HOST_CID}:{port}"))
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .context("start socat")?;
-            let mut to_host = socat.stdin.take().context("socat stdin")?;
-            let mut from_host = socat.stdout.take().context("socat stdout")?;
-            let (mut read, mut write) = conn.split();
-            let up = async {
-                let copied = tokio::io::copy(&mut read, &mut to_host).await;
-                drop(to_host);
-                copied
-            };
-            let down = tokio::io::copy(&mut from_host, &mut write);
-            let (up, down) = tokio::join!(up, down);
-            up.context("copy to host")?;
-            down.context("copy from host")?;
+            let mut host = vsock::connect_host(port).await?;
+            tokio::io::copy_bidirectional(&mut conn, &mut host)
+                .await
+                .context("relay bytes")?;
             Ok(())
         }
         #[cfg(all(test, target_os = "linux"))]
-        Upstream::Unix(dir) => {
-            let mut host = UnixStream::connect(super::relay::socket_path(dir, port))
+        Upstream::Unix { relay_dir, .. } => {
+            let mut host = UnixStream::connect(super::relay::socket_path(relay_dir, port))
                 .await
                 .context("connect to the relay")?;
             tokio::io::copy_bidirectional(&mut conn, &mut host)
@@ -500,7 +495,8 @@ async fn bridge(mut conn: TcpStream, upstream: &Upstream, port: u32) -> Result<(
     }
 }
 
-/// Bind the control socket the vsock control port is bridged to.
+/// Bind the Unix control socket (tests stand it in for the vsock control port).
+#[cfg(all(test, target_os = "linux"))]
 fn bind_control(path: &Path) -> Result<UnixListener> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -509,32 +505,28 @@ fn bind_control(path: &Path) -> Result<UnixListener> {
     UnixListener::bind(path).with_context(|| format!("bind {}", path.display()))
 }
 
-/// Forward host connections on vsock port `port` to the control socket.
-async fn control_vsock_bridge(port: u32, socket: PathBuf) {
-    let status = Command::new("socat")
-        .arg(format!("VSOCK-LISTEN:{port},fork,reuseaddr"))
-        .arg(format!("UNIX-CONNECT:{}", socket.display()))
-        .kill_on_drop(true)
-        .status()
-        .await;
-    tracing::warn!(?status, "control port bridge exited");
-}
-
-/// Serve control requests: `shutdown` ends the run; `attach R C` attaches a
-/// terminal to the harness's tmux session.
-async fn control_loop(listener: UnixListener, shutdown: mpsc::Sender<()>, session: Session) {
+/// Serve control requests on a Unix socket (tests).
+#[cfg(all(test, target_os = "linux"))]
+async fn unix_control_loop(listener: UnixListener, shutdown: mpsc::Sender<()>, session: Session) {
     loop {
         let Ok((conn, _)) = listener.accept().await else {
             tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         };
-        let shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            if let Err(e) = control(conn, &shutdown, session).await {
-                tracing::warn!(error = %format!("{e:#}"), "control request failed");
-            }
-        });
+        spawn_control(conn, shutdown.clone(), session);
     }
+}
+
+/// Handle one control connection on its own task.
+fn spawn_control<S>(conn: S, shutdown: mpsc::Sender<()>, session: Session)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        if let Err(e) = control(conn, &shutdown, session).await {
+            tracing::warn!(error = %format!("{e:#}"), "control request failed");
+        }
+    });
 }
 
 /// A parsed control request.
@@ -557,7 +549,12 @@ pub(crate) fn parse_control(line: &str) -> Option<ControlRequest> {
     }
 }
 
-async fn control(conn: UnixStream, shutdown: &mpsc::Sender<()>, session: Session) -> Result<()> {
+/// Serve one control request: `shutdown` ends the run; `attach R C` attaches
+/// a terminal to the harness's tmux session.
+async fn control<S>(conn: S, shutdown: &mpsc::Sender<()>, session: Session) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let mut reader = BufReader::new(conn);
     let mut line = String::new();
     reader
@@ -593,7 +590,10 @@ pub(crate) fn attach_command(rows: u16, cols: u16) -> Vec<String> {
     ]
 }
 
-async fn attach(conn: UnixStream, rows: u16, cols: u16) -> Result<()> {
+async fn attach<S>(conn: S, rows: u16, cols: u16) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let command = attach_command(rows, cols);
     let (program, args) = command.split_first().context("empty attach command")?;
     let mut child = Command::new(program)
@@ -606,12 +606,83 @@ async fn attach(conn: UnixStream, rows: u16, cols: u16) -> Result<()> {
         .context("start the attach terminal")?;
     let mut stdin = child.stdin.take().context("attach stdin")?;
     let mut stdout = child.stdout.take().context("attach stdout")?;
-    let (mut read, mut write) = conn.into_split();
+    let (mut read, mut write) = tokio::io::split(conn);
     let input = tokio::spawn(async move { tokio::io::copy(&mut read, &mut stdin).await });
     tokio::io::copy(&mut stdout, &mut write).await.ok();
     input.abort();
     child.wait().await.context("wait for the attach terminal")?;
     Ok(())
+}
+
+/// `devbox-agent guest vsock-pipe <port>`: connect stdin and stdout to host
+/// vsock port `port`. git runs it as the `ext::` transport for the inbox remote.
+///
+/// # Errors
+///
+/// Returns an error if the host port can't be reached.
+pub(crate) async fn vsock_pipe(port: u32) -> Result<()> {
+    vsock::pipe_stdio(port).await
+}
+
+/// The vsock side, through `tokio-vsock`.
+mod vsock {
+    use anyhow::{Context, Result};
+    use tokio::io::AsyncWriteExt;
+    use tokio::sync::mpsc;
+    use tokio_vsock::{VMADDR_CID_ANY, VMADDR_CID_HOST, VsockAddr, VsockListener, VsockStream};
+
+    use super::{Session, spawn_control};
+
+    /// Connect to host vsock port `port`.
+    pub(super) async fn connect_host(port: u32) -> Result<VsockStream> {
+        VsockStream::connect(VsockAddr::new(VMADDR_CID_HOST, port))
+            .await
+            .with_context(|| format!("connect to host vsock port {port}"))
+    }
+
+    /// Listen on guest vsock port `port`.
+    pub(super) fn listen(port: u32) -> Result<VsockListener> {
+        VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, port))
+            .with_context(|| format!("listen on vsock port {port}"))
+    }
+
+    /// Serve control requests arriving on the vsock control port.
+    pub(super) async fn control_loop(
+        listener: VsockListener,
+        shutdown: mpsc::Sender<()>,
+        session: Session,
+    ) {
+        loop {
+            match listener.accept().await {
+                Ok((conn, _)) => spawn_control(conn, shutdown.clone(), session),
+                Err(e) => {
+                    tracing::warn!(error = %e, "control accept failed");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
+    /// Pipe stdin/stdout to host vsock port `port` until both sides finish.
+    pub(super) async fn pipe_stdio(port: u32) -> Result<()> {
+        let host = connect_host(port).await?;
+        let (mut from_host, mut to_host) = host.into_split();
+        let up = async {
+            tokio::io::copy(&mut tokio::io::stdin(), &mut to_host).await?;
+            // EOF from git: half-close so the host side sees the end of input.
+            to_host.shutdown().await?;
+            anyhow::Ok(())
+        };
+        let down = async {
+            let mut stdout = tokio::io::stdout();
+            tokio::io::copy(&mut from_host, &mut stdout).await?;
+            stdout.flush().await?;
+            anyhow::Ok(())
+        };
+        let (up, down) = tokio::join!(up, down);
+        up.context("copy to host")?;
+        down.context("copy from host")
+    }
 }
 
 /// Push the agent branch to the inbox if HEAD moved since `last`. Returns the
@@ -683,7 +754,7 @@ mod tests {
     use crate::sandbox::test_support::temp_root;
 
     #[cfg(target_os = "linux")]
-    /// A git `ext::` transport standing in for `socat`: stdio to a Unix socket.
+    /// A git `ext::` transport standing in for `vsock-pipe`: stdio to a Unix socket.
     const BRIDGE: &str = r#"
 import os, socket, sys, threading
 s = socket.socket(socket.AF_UNIX)
@@ -789,8 +860,10 @@ exec sleep 60
         let config = Config {
             workspace,
             mount: false,
-            upstream: Upstream::Unix(host.clone()),
-            control_socket: root.join("control.sock"),
+            upstream: Upstream::Unix {
+                relay_dir: host.clone(),
+                control_socket: root.join("control.sock"),
+            },
             session: Session::Direct,
             listen: Some((any, any)),
             remote_url: Some(format!(

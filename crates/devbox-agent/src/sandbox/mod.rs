@@ -22,6 +22,8 @@
 mod api;
 pub(crate) mod daemon;
 mod firecracker;
+// The guest init uses AF_VSOCK, which exists on Linux only (as does the guest).
+#[cfg(target_os = "linux")]
 pub(crate) mod guest;
 mod jail;
 mod process;
