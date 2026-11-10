@@ -7,7 +7,7 @@ never calls the devbox control plane — it only reads its own instance metadata
 (IMDS) and calls the AWS Auto Scaling API for its own instance, using the host
 instance profile.
 
-One binary, five subcommands, each wired to a different host trigger:
+One binary, a handful of subcommands, each wired to a different host trigger:
 
 | Subcommand | Triggered by | Job |
 |------------|--------------|-----|
@@ -16,6 +16,7 @@ One binary, five subcommands, each wired to a different host trigger:
 | `warmup` | `devbox-warmup.service` (systemd, at boot) | Freshen `/workspace` repos, then self-tag `devbox:ready=true` |
 | `checkout <urls>` | the snapshot-builder, or a developer/agent on a claimed box | Clone repos into `/workspace`, minting a read-only token per repo |
 | `doctor` | operator on a claimed box, via `devbox ssh -- devbox-agent doctor` | Print a read-only diagnostic of warm-cache delivery |
+| `sandbox run\|ls\|logs\|diff\|stop` | the claimant, logged in to their box | Run sub-agents in Nitro Sandboxes, each on its own clone; collect their work as `agent/<name>` branches |
 
 ## `principals` — per-claim SSH authorization
 
@@ -142,6 +143,57 @@ A one-shot diagnostic for debugging cold builds on a claimed box. Run via
 
 Read-only and best-effort: every probe degrades to a printed note rather than
 aborting.
+
+## `sandbox` — sub-agents in Nitro Sandboxes
+
+Run a coding agent next to your own session, inside a hardware-isolated child
+VM ([Nitro Sandbox](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/amazon-ec2-nitro-sandboxes.html)),
+without giving it your checkout, credentials, SSH agent or the host's instance
+metadata. From inside any repo under `/workspace`:
+
+```text
+$ devbox-agent sandbox run claude fix the flaky reconcile test
+started sandbox calm-quilt (claude) on branch agent/calm-quilt
+
+$ devbox-agent sandbox ls
+NAME                 STATE     HARNESS  AGE    REPO
+calm-quilt           running   claude   2m     /workspace/devbox
+
+$ devbox-agent sandbox logs calm-quilt -f    # follow the guest console
+$ devbox-agent sandbox stop calm-quilt       # stop it, fetch its work
+collected 3 commit(s) from calm-quilt onto agent/calm-quilt
+$ devbox-agent sandbox diff calm-quilt       # review
+$ git merge agent/calm-quilt                 # take it
+```
+
+How it works:
+
+- `run` clones the repo at `HEAD` onto a new `agent/<name>` branch (refusing a
+  branch that already exists), writes the task to `task.json`, packs both into
+  an ext4 image (`mkfs.ext4 -d`, no root needed), and starts Firecracker with
+  `"enclave": {"direct_mode": true}` so the guest boots as a Nitro Sandbox. The
+  guest has no network device, only a vsock device.
+- `stop` (or `diff`, once the guest exits by itself) replays the image's
+  journal, copies `/repo` out with `debugfs rdump`, and fetches only
+  `agent/<name>` back into your repository. Uncommitted guest changes become a
+  WIP commit first. The guest's repository is treated as hostile: any symlink
+  under `.git` aborts the collect, `.git/config` is replaced with a minimal one,
+  and hooks are removed and disabled, so nothing the guest wrote runs on the
+  host. Your checkout and working tree are never touched.
+- State lives in `/workspace/.sandboxes/<name>/` (`DEVBOX_SANDBOX_DIR` to
+  override): `meta.json`, `console.log`, and the image until it is collected.
+
+Host requirements, checked before anything is created, with a message naming
+the fix: `/dev/nitro_enclaves` (pool `nitro_sandboxes_enabled` in devbox-infra),
+write access to it (the `ne` group), and the VMM and guest image
+(`DEVBOX_SANDBOX_FIRECRACKER`, `DEVBOX_SANDBOX_KERNEL`, `DEVBOX_SANDBOX_ROOTFS`;
+defaults `firecracker` on `PATH` and `/opt/devbox/sandbox/{vmlinux,rootfs.ext4}`).
+
+Not built yet (smoketurner/devbox#164): the guest image and its init (mount the
+workspace, run the harness, commit, power off), the host-side vsock relay to
+the egress proxy and model-credential proxy, `attach`, and the AMI bake of
+Firecracker plus the guest image. Until those land, `run` stops at the preflight
+on every host.
 
 ## Design
 

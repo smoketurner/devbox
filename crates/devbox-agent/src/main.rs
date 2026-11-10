@@ -8,6 +8,8 @@
 //! - `warmup` — warm the host and self-tag `devbox:ready=true` so the reconciler
 //!   marks the `DevboxDoc` Ready; boxes that never tag ready are reaped.
 //! - `doctor` — print a read-only diagnostic of warm-cache delivery.
+//! - `sandbox` — run sub-agents in Nitro Sandboxes (hardware-isolated child VMs)
+//!   on a claimed box, each on its own clone, with work returned as a git branch.
 
 mod checkout;
 mod control_plane;
@@ -18,6 +20,7 @@ mod git_credential;
 mod imds;
 mod owner_sync;
 mod principals;
+mod sandbox;
 mod warmup;
 
 use std::path::PathBuf;
@@ -64,6 +67,12 @@ enum Command {
     GitCredential {
         /// The git credential operation (`get`, `store`, or `erase`).
         operation: String,
+    },
+    /// Run sub-agents in Nitro Sandboxes: each gets its own clone of the repo on
+    /// branch `agent/<name>`, and its work comes back as that branch.
+    Sandbox {
+        #[command(subcommand)]
+        command: sandbox::SandboxCommand,
     },
 }
 
@@ -116,6 +125,16 @@ async fn main() -> ExitCode {
             // git parses stdout: emit only the credential protocol, no tracing.
             git_credential::run(&operation).await;
             ExitCode::SUCCESS
+        }
+        Command::Sandbox { command } => {
+            // Human-facing output on stdout, errors on stderr, like `doctor`.
+            match sandbox::run(command).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e:#}");
+                    ExitCode::FAILURE
+                }
+            }
         }
     }
 }

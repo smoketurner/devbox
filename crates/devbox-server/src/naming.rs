@@ -13,36 +13,10 @@ use std::collections::HashSet;
 
 use anyhow::Result;
 
+use devbox_common::naming::name_from_seed;
+
 use crate::db::DocumentStore;
 use crate::documents::devbox::DevboxDoc;
-
-/// Curated adjectives. Lowercase ASCII, ≤9 chars, no offensive combinations.
-const ADJECTIVES: &[&str] = &[
-    "amber", "ample", "bold", "brave", "brisk", "calm", "clever", "cosmic", "cozy", "crisp",
-    "dapper", "dawn", "deft", "eager", "early", "easy", "fair", "fancy", "fleet", "fluffy", "fond",
-    "frosty", "fuzzy", "gentle", "giddy", "glad", "golden", "grand", "happy", "hardy", "hazel",
-    "humble", "ivory", "jolly", "keen", "kind", "lively", "lucky", "lunar", "mellow", "merry",
-    "mighty", "mint", "misty", "modest", "noble", "olive", "perky", "placid", "plucky", "polite",
-    "proud", "quick", "quiet", "rapid", "regal", "ripe", "rosy", "royal", "ruddy", "rustic",
-    "sage", "sandy", "sharp", "shiny", "silent", "silky", "snappy", "snowy", "solar", "spry",
-    "stark", "steady", "sunny", "swift", "tidy", "trusty", "vivid", "warm", "witty", "zesty",
-    "azure", "balmy", "blithe", "bonny", "breezy", "bright", "chief", "civic", "clear", "comfy",
-    "dandy", "dewy", "dreamy", "elder", "epic", "fervid", "festive", "frank", "free",
-];
-
-/// Curated nouns. Lowercase ASCII, ≤9 chars.
-const NOUNS: &[&str] = &[
-    "acorn", "amber", "anchor", "arbor", "aspen", "badger", "basin", "beacon", "birch", "bison",
-    "brook", "canyon", "cedar", "cobalt", "comet", "coral", "cove", "crane", "delta", "ember",
-    "falcon", "fern", "finch", "fjord", "forest", "fox", "garnet", "geyser", "glade", "harbor",
-    "hazel", "heron", "indigo", "iris", "jade", "kelp", "lagoon", "lark", "ledge", "lily", "lotus",
-    "lynx", "maple", "marsh", "meadow", "mesa", "mist", "moss", "nebula", "nimbus", "oak", "ocean",
-    "onyx", "opal", "orchid", "osprey", "otter", "pebble", "petal", "pine", "plume", "quartz",
-    "quilt", "raven", "reef", "ridge", "river", "robin", "sage", "salmon", "sequoia", "shore",
-    "slate", "sparrow", "spruce", "summit", "thicket", "tundra", "vale", "willow", "badge",
-    "bramble", "breeze", "cliff", "clover", "creek", "dune", "fox", "gale", "grove", "harvest",
-    "hollow", "isle", "lake", "moor", "nook", "pond", "spring", "thorn", "vista",
-];
 
 /// Maximum attempts before [`generate_unique_name`] gives up. With thousands of
 /// `adjective-noun` combinations against a small pool this is never reached; it
@@ -60,19 +34,9 @@ fn fill<const N: usize>() -> Result<[u8; N]> {
     Ok(buf)
 }
 
-/// Pick a word from `words` using `raw` as the source of randomness. The modulo
-/// bias is negligible at these list sizes and names are not a security boundary.
-fn pick(words: &[&'static str], raw: u16) -> &'static str {
-    let idx = usize::from(raw).checked_rem(words.len()).unwrap_or(0);
-    words.get(idx).copied().unwrap_or("box")
-}
-
 /// Generate one random `adjective-noun` name (no uniqueness check).
 fn random_name() -> Result<String> {
-    let [a, b, c, d] = fill::<4>()?;
-    let adj = pick(ADJECTIVES, u16::from_be_bytes([a, b]));
-    let noun = pick(NOUNS, u16::from_be_bytes([c, d]));
-    Ok(format!("{adj}-{noun}"))
+    Ok(name_from_seed(fill::<4>()?))
 }
 
 /// Generate a name that is unique across stored boxes and the `used` set.
@@ -125,14 +89,6 @@ mod tests {
                 "generated name is not valid: {name}"
             );
             assert!(name.contains('-'), "expected adjective-noun: {name}");
-        }
-    }
-
-    #[test]
-    fn wordlists_contain_only_valid_fragments() {
-        for word in ADJECTIVES.iter().chain(NOUNS) {
-            assert!(is_valid_devbox_name(word), "invalid wordlist entry: {word}");
-            assert!(word.len() <= 9, "wordlist entry too long: {word}");
         }
     }
 }
