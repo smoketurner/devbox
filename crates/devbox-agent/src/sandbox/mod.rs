@@ -29,10 +29,9 @@ mod jail;
 mod process;
 mod relay;
 mod store;
-mod terminal;
 mod workspace;
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -40,7 +39,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use serde_json::json;
 
-use daemon::{Client, LiveState, Request, Response};
+use daemon::{Client, Request, Response};
 use firecracker::{CONSOLE_LOG, StopOutcome};
 use store::{SandboxMeta, Store, now_unix};
 
@@ -72,21 +71,6 @@ pub(crate) enum SandboxCommand {
     },
     /// Stop a sandbox and fetch its work onto branch `agent/<name>`.
     Stop {
-        /// Sandbox name.
-        name: String,
-    },
-    /// Pause a running sandbox (its vCPUs stop; memory and state are kept).
-    Pause {
-        /// Sandbox name.
-        name: String,
-    },
-    /// Resume a paused sandbox.
-    Resume {
-        /// Sandbox name.
-        name: String,
-    },
-    /// Attach your terminal to a running sandbox's harness (detach: Ctrl-b d).
-    Attach {
         /// Sandbox name.
         name: String,
     },
@@ -134,9 +118,6 @@ pub(crate) async fn run(command: SandboxCommand) -> Result<()> {
         SandboxCommand::Logs { name, follow } => logs(&store, &name, follow).await,
         SandboxCommand::Diff { name, stat } => diff(&store, &client, &name, stat).await,
         SandboxCommand::Stop { name } => stop(&store, &client, &name).await,
-        SandboxCommand::Pause { name } => set_paused(&client, &name, true).await,
-        SandboxCommand::Resume { name } => set_paused(&client, &name, false).await,
-        SandboxCommand::Attach { name } => attach(&client, &name).await,
     }
 }
 
@@ -318,10 +299,10 @@ async fn collect_and_report(client: &Client, store: &Store, mut meta: SandboxMet
     Ok(())
 }
 
-/// Which sandboxes the daemon reports running or paused.
-async fn live_states(client: &Client) -> Result<BTreeMap<String, LiveState>> {
+/// Names of the sandboxes the daemon reports running.
+async fn running(client: &Client) -> Result<BTreeSet<String>> {
     match client.call(&Request::Status).await? {
-        Response::Status { sandboxes } => Ok(sandboxes),
+        Response::Status { running } => Ok(running),
         other => anyhow::bail!("unexpected answer from the sandbox daemon: {other:?}"),
     }
 }
@@ -333,8 +314,8 @@ async fn live_states(client: &Client) -> Result<BTreeMap<String, LiveState>> {
 async fn diff(store: &Store, client: &Client, name: &str, stat: bool) -> Result<()> {
     let meta = store.load(name)?;
     let dir = store.dir(name)?;
-    let running = !meta.collected && live_states(client).await?.contains_key(name);
-    let target = if running {
+    let is_running = !meta.collected && running(client).await?.contains(name);
+    let target = if is_running {
         let live = format!("refs/sandbox/{name}/live");
         let pushed =
             workspace::fetch_live(&meta.repo, &dir.join(relay::INBOX), &meta.branch, &live).await?;
@@ -387,39 +368,6 @@ async fn logs(store: &Store, name: &str, follow: bool) -> Result<()> {
     Ok(())
 }
 
-/// `sandbox pause` / `sandbox resume`.
-async fn set_paused(client: &Client, name: &str, paused: bool) -> Result<()> {
-    let request = if paused {
-        Request::Pause {
-            name: name.to_owned(),
-        }
-    } else {
-        Request::Resume {
-            name: name.to_owned(),
-        }
-    };
-    client.call(&request).await?;
-    println!("{name} {}", if paused { "paused" } else { "resumed" });
-    Ok(())
-}
-
-/// `sandbox attach`: join the harness's terminal until it detaches or exits.
-async fn attach(client: &Client, name: &str) -> Result<()> {
-    let tty = terminal::Tty::open();
-    let (rows, cols) = tty
-        .as_ref()
-        .and_then(terminal::Tty::size)
-        .unwrap_or((24, 80));
-    let conn = client.attach(name, rows, cols).await?;
-    eprintln!("attached to {name}; detach with Ctrl-b d");
-    // Raw mode for the session; the guard puts the terminal back afterwards.
-    let _raw = match &tty {
-        Some(tty) => Some(tty.raw()?),
-        None => None,
-    };
-    terminal::pipe(conn).await
-}
-
 /// The `sandbox ls` table. If the daemon can't be reached, the records are
 /// still listed, with their state shown as unknown.
 async fn render_list(store: &Store, client: &Client, now: u64) -> Result<String> {
@@ -430,7 +378,7 @@ async fn render_list(store: &Store, client: &Client, now: u64) -> Result<String>
                 .to_owned(),
         );
     }
-    let live = match live_states(client).await {
+    let live = match running(client).await {
         Ok(live) => Some(live),
         Err(e) => {
             eprintln!("warning: {e:#}");
@@ -443,7 +391,7 @@ async fn render_list(store: &Store, client: &Client, now: u64) -> Result<String>
     );
     for meta in metas {
         let state = match &live {
-            Some(live) => state_label(&meta, live.get(&meta.name).copied()),
+            Some(live) => state_label(&meta, live.contains(&meta.name)),
             None => "unknown",
         };
         out.push_str(&format!(
@@ -458,14 +406,16 @@ async fn render_list(store: &Store, client: &Client, now: u64) -> Result<String>
     Ok(out)
 }
 
-/// A sandbox's lifecycle state, from its record and what the daemon reports.
-fn state_label(meta: &SandboxMeta, live: Option<LiveState>) -> &'static str {
-    match live {
-        Some(LiveState::Running) => "running",
-        Some(LiveState::Paused) => "paused",
-        None if meta.collected => "collected",
-        // Stopped on its own (or crashed) with work not yet fetched.
-        None => "exited",
+/// A sandbox's lifecycle state, from its record and whether the daemon reports
+/// its VMM running.
+fn state_label(meta: &SandboxMeta, running: bool) -> &'static str {
+    if running {
+        "running"
+    } else if meta.collected {
+        "collected"
+    } else {
+        // Finished (or crashed) with work not yet fetched.
+        "exited"
     }
 }
 
@@ -576,7 +526,7 @@ pub(crate) mod test_support {
     reason = "test code: panic on assertion failure is acceptable"
 )]
 mod tests {
-    use super::daemon::{Client, LiveState};
+    use super::daemon::Client;
     use super::store::{SandboxMeta, Store};
     use super::test_support::temp_root;
     use super::{age, is_valid_harness, render_list, state_label};
@@ -628,12 +578,11 @@ mod tests {
     }
 
     #[test]
-    fn state_prefers_live_state_then_collected() {
+    fn state_prefers_running_then_collected() {
         let collected = meta("a", 0, true);
-        assert_eq!(state_label(&collected, Some(LiveState::Running)), "running");
-        assert_eq!(state_label(&collected, Some(LiveState::Paused)), "paused");
-        assert_eq!(state_label(&collected, None), "collected");
-        assert_eq!(state_label(&meta("a", 0, false), None), "exited");
+        assert_eq!(state_label(&collected, true), "running");
+        assert_eq!(state_label(&collected, false), "collected");
+        assert_eq!(state_label(&meta("a", 0, false), false), "exited");
     }
 
     #[test]
@@ -670,7 +619,7 @@ mod e2e {
     use super::relay::Upstreams;
     use super::store::{Store, now_unix};
     use super::test_support::{git, init_repo, temp_root};
-    use super::{RunArgs, diff, render_list, set_paused, start, stop};
+    use super::{RunArgs, diff, render_list, start, stop};
 
     /// Stands in for jailer: finds the chroot jailer would have built and execs
     /// the VMM there (as the same user: tests can't chroot or change uid), with
@@ -689,11 +638,11 @@ os.chdir(root)
 os.execv(sys.executable, [sys.executable, exe, "--id", name] + rest)
 "#;
 
-    /// Stands in for the VMM: writes an untracked file into the guest's
-    /// workspace image (as a sub-agent would), serves a minimal API and the
-    /// guest control port, and powers off when asked.
+    /// Stands in for the VMM of a guest that is still working: writes an
+    /// untracked file into the workspace image (as a sub-agent would), serves a
+    /// minimal API and the guest control port, and powers off when asked.
     const FAKE_VMM: &str = r#"#!/usr/bin/env python3
-import json, os, socket, socketserver, subprocess, sys, threading
+import os, socket, socketserver, subprocess, sys, threading
 from http.server import BaseHTTPRequestHandler
 
 root = os.environ["FAKE_CHROOT"]
@@ -706,8 +655,6 @@ subprocess.run(["debugfs", "-w", "-R", f"write {sandbox}/guest.txt /repo/guest.t
                 f"{root}/workspace.img"], capture_output=True)
 with open(f"{sandbox}/booted", "w") as f:
     f.write("yes\n")
-state = {"s": "Running"}
-
 class Api(BaseHTTPRequestHandler):
     def address_string(self):
         return "vmm"
@@ -720,11 +667,6 @@ class Api(BaseHTTPRequestHandler):
         self.wfile.write(body)
     def body(self):
         return self.rfile.read(int(self.headers.get("Content-Length", 0))).decode()
-    def do_GET(self):
-        self.reply(200, json.dumps({"id": "x", "state": state["s"]}).encode())
-    def do_PATCH(self):
-        state["s"] = "Paused" if "Paused" in self.body() else "Running"
-        self.reply(204)
     def do_PUT(self):
         self.body()
         self.reply(400, b'{"fault_message":"not supported"}')
@@ -739,24 +681,12 @@ control.listen()
 while True:
     conn, _ = control.accept()
     stream = conn.makefile("rwb")
-    # A paused guest can't answer its control port.
-    if stream.readline().strip() != b"CONNECT 1024" or state["s"] == "Paused":
+    if stream.readline().strip() != b"CONNECT 1024":
         conn.close()
         continue
     stream.write(b"OK 1073741824\n")
     stream.flush()
     line = stream.readline().strip()
-    if line.startswith(b"attach "):
-        # Stand-in terminal: greet with the size, then echo lines back.
-        def session(conn, stream, size):
-            stream.write(b"hello " + size + b"\n")
-            stream.flush()
-            for echoed in stream:
-                stream.write(echoed)
-                stream.flush()
-            conn.close()
-        threading.Thread(target=session, args=(conn, stream, line[7:]), daemon=True).start()
-        continue
     if line == b"shutdown":
         with open(f"{sandbox}/clean-shutdown", "w") as f:
             f.write("yes\n")
@@ -775,6 +705,21 @@ while True:
                 .status();
         }
     }
+
+    /// Stands in for the VMM of a guest that finishes its task by itself:
+    /// writes its work into the workspace image, then powers off.
+    const FAKE_VMM_DONE: &str = r#"#!/usr/bin/env python3
+import os, subprocess
+root = os.environ["FAKE_CHROOT"]
+sandbox = os.path.normpath(os.path.join(root, "..", "..", "..", ".."))
+with open(f"{sandbox}/guest.txt", "w") as f:
+    f.write("done by the guest\n")
+subprocess.run(["debugfs", "-w", "-R", f"write {sandbox}/guest.txt /repo/guest.txt",
+                f"{root}/workspace.img"], capture_output=True)
+# Stay up past the daemon's boot check, then power off like a finished guest.
+import time
+time.sleep(1.5)
+"#;
 
     fn write_executable(path: &Path, contents: &str) {
         std::fs::write(path, contents).unwrap();
@@ -826,7 +771,7 @@ while True:
     }
 
     #[tokio::test]
-    async fn run_pause_live_diff_stop_and_collect_through_the_daemon() {
+    async fn run_live_diff_stop_and_collect_through_the_daemon() {
         let root = temp_root("e2e");
         let _reap = Reap(root.clone());
         let (store, client) = host(&root, FAKE_VMM).await;
@@ -849,26 +794,6 @@ while True:
         assert!(chroot.join("vm.json").is_file() && chroot.join("vsock.sock_9418").exists());
         assert!(!dir.join("stage").exists(), "staging copy must be removed");
         assert!(ls(&store, &client).await.contains("running"));
-
-        // `attach` reaches the guest's control port through the daemon, with
-        // the terminal size, and then carries the session both ways.
-        {
-            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-            let conn = client.attach("calm-quilt", 40, 120).await.unwrap();
-            let mut session = tokio::io::BufReader::new(conn);
-            let mut line = String::new();
-            session.read_line(&mut line).await.unwrap();
-            assert_eq!(line, "hello 40 120\n");
-            session.get_mut().write_all(b"ls\n").await.unwrap();
-            line.clear();
-            session.read_line(&mut line).await.unwrap();
-            assert_eq!(line, "ls\n");
-        }
-        let err = client.attach("no-such-box", 24, 80).await.unwrap_err();
-        assert!(format!("{err:#}").contains("not running"), "{err:#}");
-
-        set_paused(&client, "calm-quilt", true).await.unwrap();
-        assert!(ls(&store, &client).await.contains("paused"));
 
         // Nothing pushed yet: a live diff says so.
         let err = diff(&store, &client, "calm-quilt", true).await.unwrap_err();
@@ -904,9 +829,9 @@ while True:
             &["ls-tree", "--name-only", "refs/sandbox/calm-quilt/live"],
         );
         assert!(live.contains("progress.txt"), "{live}");
-        assert!(ls(&store, &client).await.contains("paused"));
+        assert!(ls(&store, &client).await.contains("running"));
 
-        // Stopping a paused guest resumes it, then asks it to power off.
+        // Stopping asks the guest to power off.
         stop(&store, &client, "calm-quilt").await.unwrap();
         assert!(
             dir.join("clean-shutdown").exists(),
@@ -935,6 +860,35 @@ while True:
         assert!(ls(&store, &client).await.contains("collected"));
         // Stopping again is harmless.
         stop(&store, &client, "calm-quilt").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_guest_that_finishes_shows_exited_and_diff_collects_it() {
+        let root = temp_root("e2e-done");
+        let _reap = Reap(root.clone());
+        let (store, client) = host(&root, FAKE_VMM_DONE).await;
+        let repo = init_repo(&root.join("repo"));
+
+        start(&store, &client, run_args(repo.clone()))
+            .await
+            .unwrap();
+        let mut exited = false;
+        for _ in 0..100 {
+            if ls(&store, &client).await.contains("exited") {
+                exited = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(exited, "{}", ls(&store, &client).await);
+
+        // diff on a finished sandbox collects it first, then shows the branch.
+        diff(&store, &client, "calm-quilt", true).await.unwrap();
+        let files = git(&repo, &["ls-tree", "--name-only", "agent/calm-quilt"]);
+        assert!(files.contains("guest.txt"), "{files}");
+        assert!(ls(&store, &client).await.contains("collected"));
+        let dir = store.dir("calm-quilt").unwrap();
+        assert!(!dir.join("j").exists(), "the jail is removed");
     }
 
     #[tokio::test]

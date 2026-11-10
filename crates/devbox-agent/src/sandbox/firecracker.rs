@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::process::Command;
 
-use super::api::{self, VmState};
+use super::api;
 use super::process::{cmdline_contains, terminate, wait_exit};
 use super::store::SandboxMeta;
 
@@ -102,8 +102,8 @@ pub(crate) fn vm_config(meta: &SandboxMeta) -> Value {
 /// Stop the VMM `pid` (identified by `needle`) whose chroot is `vm_dir`,
 /// cleanly if the guest cooperates.
 ///
-/// A paused guest is resumed first, then asked to power off through its
-/// control port (and, on x86_64, sent Ctrl-Alt-Del). If it is still running
+/// The guest is asked to power off through its control port (and, on
+/// x86_64, sent Ctrl-Alt-Del). If it is still running
 /// after [`STOP_GRACE`], or never accepted the request, it gets SIGTERM and
 /// then SIGKILL.
 ///
@@ -113,9 +113,6 @@ pub(crate) fn vm_config(meta: &SandboxMeta) -> Value {
 pub(crate) async fn stop_vmm(vm_dir: &Path, pid: u32, needle: &str) -> Result<StopOutcome> {
     if !cmdline_contains(pid, needle) {
         return Ok(StopOutcome::NotRunning);
-    }
-    if matches!(api::vm_state(vm_dir).await, Ok(VmState::Paused)) {
-        api::set_paused(vm_dir, false).await.ok();
     }
     let mut asked = api::request_guest_shutdown(vm_dir).await.is_ok();
     if cfg!(target_arch = "x86_64") {

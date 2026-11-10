@@ -16,7 +16,7 @@ One binary, a handful of subcommands, each wired to a different host trigger:
 | `warmup` | `devbox-warmup.service` (systemd, at boot) | Freshen `/workspace` repos, then self-tag `devbox:ready=true` |
 | `checkout <urls>` | the snapshot-builder, or a developer/agent on a claimed box | Clone repos into `/workspace`, minting a read-only token per repo |
 | `doctor` | operator on a claimed box, via `devbox ssh -- devbox-agent doctor` | Print a read-only diagnostic of warm-cache delivery |
-| `sandbox run\|ls\|logs\|diff\|attach\|pause\|resume\|stop` | the claimant, logged in to their box | Run sub-agents in Nitro Sandboxes, each on its own clone; collect their work as `agent/<name>` branches |
+| `sandbox run\|ls\|logs\|diff\|stop` | the claimant, logged in to their box | Run sub-agents in Nitro Sandboxes, each on its own clone; collect their work as `agent/<name>` branches |
 | `sandboxd` | `devbox-sandboxd.service` (systemd, root) | Jail and run sandbox VMMs and their vsock relays for `sandbox` |
 
 ## `principals` — per-claim SSH authorization
@@ -160,10 +160,11 @@ $ devbox-agent sandbox ls
 NAME                 STATE     HARNESS  AGE    REPO
 calm-quilt           running   claude   2m     /workspace/devbox
 
-$ devbox-agent sandbox logs calm-quilt -f    # follow the guest console
-$ devbox-agent sandbox attach calm-quilt     # join the harness's terminal (detach: Ctrl-b d)
-$ devbox-agent sandbox pause calm-quilt      # freeze it; `resume` continues
-$ devbox-agent sandbox stop calm-quilt       # stop it, fetch its work
+$ devbox-agent sandbox logs calm-quilt -f    # follow the harness's output
+$ devbox-agent sandbox diff calm-quilt       # its pushed progress, while it runs
+$ devbox-agent sandbox ls                    # ... once it finishes:
+calm-quilt           exited    claude   9m     /workspace/devbox
+$ devbox-agent sandbox stop calm-quilt       # collect its work (or stop it early)
 collected 3 commit(s) from calm-quilt onto agent/calm-quilt
 $ cd /workspace/.sandboxes/calm-quilt/worktree   # open, build, test it
 $ devbox-agent sandbox diff calm-quilt       # review
@@ -175,7 +176,7 @@ How it works:
 - **Two halves.** The `sandbox` CLI runs as you and does everything that needs
   no privilege. A root daemon, `devbox-agent sandboxd`
   (`devbox-sandboxd.service`), owns the VMMs. The CLI asks it to `preflight`,
-  `start`, `stop`, `pause`, `resume` and report `status` over
+  `start`, `stop` and report `status` over
   `/run/devbox/sandboxd.sock` (`DEVBOX_SANDBOXD_SOCKET`), one JSON line each
   way. The daemon checks the caller's peer credentials: only the owner of
   `/workspace` (the claimant, `DEVBOX_SANDBOX_OWNER_PATH`) and root may call. It
@@ -198,13 +199,13 @@ How it works:
     Nitro Sandbox. The guest has no network device, only vsock.
   - If the VMM exits during boot, `run` fails with its console output and
     removes everything it created.
-- **Runtime control.** Firecracker also serves its API on the chroot's
-  `api.sock`. The daemon uses it for `ls` (running or paused), `pause`,
-  `resume` and `stop`. `stop` asks for a clean power-off first: it resumes a
-  paused guest, then sends `shutdown` to guest vsock port 1024 (and Ctrl-Alt-Del
-  on x86_64). Only a guest that doesn't answer, or doesn't power off within
-  15 s, gets SIGTERM and then SIGKILL, and `stop` says which happened. The
-  daemon then gives the image back to you and deletes the chroot.
+- **Single-shot.** A sandbox does its one task and powers off by itself; `ls`
+  then shows it `exited`, and `stop` or `diff` collects it. `stop` on a sandbox
+  that is still running ends it early: it sends `shutdown` to guest vsock port
+  1024 (and Ctrl-Alt-Del through Firecracker's `api.sock` on x86_64). Only a
+  guest that doesn't answer, or doesn't power off within 15 s, gets SIGTERM and
+  then SIGKILL, and `stop` says which happened. The daemon then gives the image
+  back to you and deletes the chroot.
 - **Collect**, as you, on `stop` (or `diff`, once the guest exits by itself):
   replays the image's journal, copies `/repo` out with `debugfs rdump`, and
   fetches only `agent/<name>` back into your repository. Uncommitted guest
@@ -254,19 +255,15 @@ a message naming the fix:
     over vsock (`tokio-vsock`).
   - It adds a `devbox` git remote (`ext::devbox-agent guest vsock-pipe 9418`,
     `push.negotiate` off) and pushes the agent branch every 30 s when it moves.
-  - It runs the harness against the task in tmux. Built in: `claude`
-    (`--dangerously-skip-permissions`), `codex`
-    (`--dangerously-bypass-approvals-and-sandbox`) and `shell`. A script at
-    `/etc/devbox/harnesses/<name>` overrides or adds one. The harness sees only
-    placeholder API keys.
-  - On the control port (1024) it accepts `shutdown` and `attach <rows> <cols>`.
-    `attach` runs `tmux attach` in a pty sized to your terminal.
+  - It runs the harness once, single-shot, with its output on the console
+    (`logs`). Built in: `claude -p --dangerously-skip-permissions`, `codex exec
+    --dangerously-bypass-approvals-and-sandbox`, and `shell` (`bash -lc
+    <task>`). A script at `/etc/devbox/harnesses/<name>` overrides or adds one.
+    The harness sees only placeholder API keys.
+  - On the control port (1024) it accepts `shutdown`, which ends the harness
+    early.
   - When the harness exits, or on `shutdown`, it commits what is left as a WIP
     commit, pushes, and powers off.
-- **`attach`**: the CLI asks the daemon, which opens the guest's control port and
-  splices your connection to it. Your terminal goes into raw mode (through
-  `stty`) and is restored afterwards. Detaching (Ctrl-b d) leaves the harness
-  running.
 
 Not built yet (smoketurner/devbox#164): the AMI bake of Firecracker, `jailer`
 and a guest kernel. The guest rootfs build is devbox-infra's `08-sandbox-guest`

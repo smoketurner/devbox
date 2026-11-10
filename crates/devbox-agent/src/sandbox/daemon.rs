@@ -12,8 +12,7 @@
 //! | `preflight` | checks the host can run a jailed sandbox |
 //! | `start` | builds the jail, starts the relay, boots the VMM under `jailer` |
 //! | `stop` | stops the VMM (cleanly if the guest cooperates) and relay, hands the image back, removes the jail |
-//! | `pause` / `resume` | pauses or resumes the VM through its API socket |
-//! | `status` | reports which sandboxes are running or paused |
+//! | `status` | reports which sandboxes are running |
 //!
 //! Requests are one JSON line each way. Only the claimant (the owner of
 //! `/workspace`, `DEVBOX_SANDBOX_OWNER_PATH`) and root may call, checked with
@@ -25,7 +24,7 @@
 //! so restarting the daemon leaves running sandboxes alone; on start it finds
 //! them again (from each sandbox's `runtime.json`) and resumes their relays.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -38,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-use super::api::{self, VmState};
+use super::api;
 use super::firecracker::{CONSOLE_LOG, StopOutcome, stop_vmm};
 use super::jail::{self, Jail, Runtime, owner_of};
 use super::process::wait_started;
@@ -68,34 +67,9 @@ const CLIENT_TIMEOUT: Duration = Duration::from_mins(5);
 #[serde(tag = "op", rename_all = "snake_case")]
 pub(crate) enum Request {
     Preflight,
-    Start {
-        name: String,
-    },
-    Stop {
-        name: String,
-    },
-    Pause {
-        name: String,
-    },
-    Resume {
-        name: String,
-    },
+    Start { name: String },
+    Stop { name: String },
     Status,
-    /// Attach a terminal to the harness. After an `ok` answer the connection
-    /// carries the terminal session in both directions.
-    Attach {
-        name: String,
-        rows: u16,
-        cols: u16,
-    },
-}
-
-/// A running sandbox's state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum LiveState {
-    Running,
-    Paused,
 }
 
 /// The daemon's answer.
@@ -106,8 +80,9 @@ pub(crate) enum Response {
     Stopped {
         outcome: StopOutcome,
     },
+    /// Names of the sandboxes whose VMM is running.
     Status {
-        sandboxes: BTreeMap<String, LiveState>,
+        running: BTreeSet<String>,
     },
     Error {
         message: String,
@@ -212,40 +187,11 @@ impl Daemon {
             Ok(()) => serde_json::from_str::<Request>(line.trim())
                 .map_err(|e| anyhow::anyhow!("malformed request: {e}")),
         };
-        if let Ok(Request::Attach { name, rows, cols }) = &request {
-            return self.attach(conn, name, *rows, *cols).await;
-        }
         let response = match request {
             Ok(request) => self.handle(request).await.unwrap_or_else(|e| error(&e)),
             Err(e) => error(&e),
         };
         reply(&mut conn, &response).await
-    }
-
-    /// `attach`: connect to the guest's control port and splice the caller's
-    /// connection to it until either side closes.
-    async fn attach(&self, mut conn: UnixStream, name: &str, rows: u16, cols: u16) -> Result<()> {
-        let guest = async {
-            let (dir, _) = self
-                .live(name)
-                .with_context(|| format!("sandbox {name} is not running"))?;
-            let mut guest = api::open_control(&self.config.jail.vm_dir(&dir, name)).await?;
-            guest
-                .write_all(format!("attach {rows} {cols}\n").as_bytes())
-                .await
-                .context("ask the guest to attach")?;
-            anyhow::Ok(guest)
-        }
-        .await;
-        let mut guest = match guest {
-            Ok(guest) => guest,
-            Err(e) => return reply(&mut conn, &error(&e)).await,
-        };
-        reply(&mut conn, &Response::Ok).await?;
-        tokio::io::copy_bidirectional(&mut conn, &mut guest)
-            .await
-            .ok();
-        Ok(())
     }
 
     /// Allow root and the claimant (the owner of the owner path) only.
@@ -271,18 +217,9 @@ impl Daemon {
             Request::Stop { name } => Ok(Response::Stopped {
                 outcome: self.stop(&name).await?,
             }),
-            Request::Pause { name } => {
-                self.set_paused(&name, true).await?;
-                Ok(Response::Ok)
-            }
-            Request::Resume { name } => {
-                self.set_paused(&name, false).await?;
-                Ok(Response::Ok)
-            }
             Request::Status => Ok(Response::Status {
-                sandboxes: self.status().await,
+                running: self.running(),
             }),
-            Request::Attach { .. } => anyhow::bail!("attach is served on its own connection"),
         }
     }
 
@@ -418,27 +355,16 @@ impl Daemon {
         Ok(outcome)
     }
 
-    async fn set_paused(&self, name: &str, paused: bool) -> Result<()> {
-        let (dir, _) = self
-            .live(name)
-            .with_context(|| format!("sandbox {name} is not running"))?;
-        api::set_paused(&self.config.jail.vm_dir(&dir, name), paused).await
-    }
-
-    async fn status(&self) -> BTreeMap<String, LiveState> {
-        let mut sandboxes = BTreeMap::new();
-        for meta in self.config.store.list().unwrap_or_default() {
-            let Some((dir, _)) = self.live(&meta.name) else {
-                continue;
-            };
-            let vm_dir = self.config.jail.vm_dir(&dir, &meta.name);
-            let state = match api::vm_state(&vm_dir).await {
-                Ok(VmState::Paused) => LiveState::Paused,
-                _ => LiveState::Running,
-            };
-            sandboxes.insert(meta.name, state);
-        }
-        sandboxes
+    /// Names of the sandboxes whose VMM is running.
+    fn running(&self) -> BTreeSet<String> {
+        self.config
+            .store
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|meta| self.live(&meta.name).is_some())
+            .map(|meta| meta.name)
+            .collect()
     }
 
     /// Resume the relays of sandboxes that kept running across a daemon restart.
@@ -520,32 +446,6 @@ impl Client {
         }
     }
 
-    /// Send an `attach` request; on success, return the connection, which now
-    /// carries the terminal session.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the daemon is unreachable or refuses.
-    pub(crate) async fn attach(&self, name: &str, rows: u16, cols: u16) -> Result<UnixStream> {
-        let mut conn = self.connect().await?;
-        let request = Request::Attach {
-            name: name.to_owned(),
-            rows,
-            cols,
-        };
-        let mut line = serde_json::to_vec(&request).context("serialize request")?;
-        line.push(b'\n');
-        conn.write_all(&line).await.context("send request")?;
-        let answer = api::read_line_unbuffered(&mut conn, MAX_REQUEST)
-            .await
-            .context("read the daemon's answer")?;
-        match serde_json::from_str(answer.trim()).context("parse the daemon's answer")? {
-            Response::Ok => Ok(conn),
-            Response::Error { message } => Err(anyhow::anyhow!(message)),
-            other => anyhow::bail!("unexpected answer from the sandbox daemon: {other:?}"),
-        }
-    }
-
     async fn connect(&self) -> Result<UnixStream> {
         UnixStream::connect(&self.socket).await.with_context(|| {
             format!(
@@ -577,9 +477,9 @@ impl Client {
     reason = "test code: panic on assertion failure is acceptable"
 )]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
 
-    use super::{LiveState, Request, Response, tail_lines};
+    use super::{Request, Response, tail_lines};
     use crate::sandbox::firecracker::StopOutcome;
 
     #[test]
@@ -599,7 +499,7 @@ mod tests {
         .unwrap();
         assert_eq!(stopped, r#"{"result":"stopped","outcome":"clean"}"#);
         let status = Response::Status {
-            sandboxes: BTreeMap::from([("calm-quilt".to_owned(), LiveState::Paused)]),
+            running: BTreeSet::from(["calm-quilt".to_owned()]),
         };
         let round: Response =
             serde_json::from_str(&serde_json::to_string(&status).unwrap()).unwrap();

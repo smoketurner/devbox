@@ -12,18 +12,17 @@
 //! 3. point the repo's `devbox` remote at the host inbox over vsock (git's
 //!    `ext::` transport, `push.negotiate` off) and push the agent branch as it
 //!    moves, so the claimant's live `diff` sees progress;
-//! 4. run the harness against the task in a tmux session (so `attach` can join
-//!    it), with placeholder credentials only;
-//! 5. listen on the control port: `shutdown` stops the harness, `attach R C`
-//!    attaches a terminal to it;
+//! 4. run the harness once against the task, in single-shot mode
+//!    (`claude -p`, `codex exec`), with placeholder credentials only; its output
+//!    goes to the console, which the host keeps as the sandbox's `console.log`;
+//! 5. listen on the control port: `shutdown` stops the harness early;
 //! 6. when the harness exits or `shutdown` arrives: commit what is left as a WIP
 //!    commit, push a last time, and power off (which ends the VMM).
 //!
 //! Linux only, like AF_VSOCK itself (`mod.rs` compiles this module on Linux).
 //! vsock is spoken natively through `tokio-vsock`; git reaches the inbox through
 //! `devbox-agent guest vsock-pipe <port>` as its `ext::` transport. For
-//! tests, the vsock side can be replaced by the host relay's Unix sockets, and
-//! the tmux session by a plain child process.
+//! tests, the vsock side can be replaced by the host relay's Unix sockets.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -37,16 +36,11 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 #[cfg(all(test, target_os = "linux"))]
 use tokio::net::{UnixListener, UnixStream};
-#[cfg(all(test, target_os = "linux"))]
-use tokio::process::Child;
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 /// Where the workspace drive is mounted.
 const WORKSPACE: &str = "/workspace";
-
-/// The tmux session the harness runs in.
-const SESSION: &str = "agent";
 
 /// Per-harness launch scripts the image may provide (`<name> <prompt>`).
 const HARNESS_DIR: &str = "/etc/devbox/harnesses";
@@ -58,7 +52,7 @@ const REMOTE: &str = "devbox";
 const PUSH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How often the harness is checked for having exited.
-const SESSION_POLL: Duration = Duration::from_millis(500);
+const HARNESS_POLL: Duration = Duration::from_millis(500);
 
 /// Time budget for each git step.
 const GIT_TIMEOUT: Duration = Duration::from_mins(5);
@@ -98,16 +92,6 @@ pub(crate) enum Upstream {
     },
 }
 
-/// How the harness runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Session {
-    /// In a detached tmux session, so `attach` can join it.
-    Tmux,
-    /// As a plain child process (tests; no `attach`).
-    #[cfg(all(test, target_os = "linux"))]
-    Direct,
-}
-
 /// The guest init's configuration.
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
@@ -115,7 +99,6 @@ pub(crate) struct Config {
     /// Mount the workspace drive first.
     pub(crate) mount: bool,
     pub(crate) upstream: Upstream,
-    pub(crate) session: Session,
     /// Loopback addresses for the egress and model ports (`None`: the task's
     /// port numbers on 127.0.0.1).
     pub(crate) listen: Option<(SocketAddr, SocketAddr)>,
@@ -136,7 +119,6 @@ impl Config {
             workspace: PathBuf::from(WORKSPACE),
             mount: true,
             upstream: Upstream::Vsock,
-            session: Session::Tmux,
             listen: None,
             remote_url: None,
             push_interval: PUSH_INTERVAL,
@@ -209,28 +191,28 @@ pub(crate) async fn run(config: Config) -> Result<Ending> {
     match &config.upstream {
         Upstream::Vsock => {
             let listener = vsock::listen(task.vsock.control_port)?;
-            bridges.spawn(vsock::control_loop(listener, control_tx, config.session));
+            bridges.spawn(vsock::control_loop(listener, control_tx));
         }
         #[cfg(all(test, target_os = "linux"))]
         Upstream::Unix { control_socket, .. } => {
             let listener = bind_control(control_socket)?;
-            bridges.spawn(unix_control_loop(listener, control_tx, config.session));
+            bridges.spawn(unix_control_loop(listener, control_tx));
         }
     }
 
     let command = harness_command_in(&config.harness_dir, &task.harness, &task.prompt)?;
-    let mut harness = Harness::start(config.session, &command, &repo, &env).await?;
+    let mut harness = start_harness(&command, &repo, &env)?;
 
     let mut pushed = None;
     let mut push_tick = tokio::time::interval(config.push_interval);
-    let mut poll = tokio::time::interval(SESSION_POLL);
+    let mut poll = tokio::time::interval(HARNESS_POLL);
     let ending = loop {
         tokio::select! {
             _ = push_tick.tick() => {
                 pushed = push_if_moved(&repo, &task.branch, pushed).await;
             }
             _ = poll.tick() => {
-                if !harness.running().await {
+                if !matches!(harness.try_wait(), Ok(None)) {
                     break Ending::HarnessExited;
                 }
             }
@@ -239,7 +221,7 @@ pub(crate) async fn run(config: Config) -> Result<Ending> {
     };
 
     if ending == Ending::Shutdown {
-        harness.stop().await;
+        let _killed = harness.kill().await;
     }
     finish(&repo, &task).await;
     bridges.abort_all();
@@ -353,15 +335,22 @@ fn harness_command_in(dir: &Path, harness: &str, prompt: &str) -> Result<Vec<Str
     }
     let owned = |args: &[&str]| args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
     match harness {
-        // The sandbox is the boundary, so the harness runs without its own
-        // permission prompts.
-        "claude" => Ok(owned(&["claude", "--dangerously-skip-permissions", prompt])),
+        // Single-shot: each does the task and exits. The sandbox is the
+        // boundary, so the harness runs without its own permission prompts.
+        "claude" => Ok(owned(&[
+            "claude",
+            "-p",
+            "--dangerously-skip-permissions",
+            prompt,
+        ])),
         "codex" => Ok(owned(&[
             "codex",
+            "exec",
             "--dangerously-bypass-approvals-and-sandbox",
             prompt,
         ])),
-        "shell" => Ok(owned(&["bash", "-l"])),
+        // The task is a shell command line.
+        "shell" => Ok(owned(&["bash", "-lc", prompt])),
         other => anyhow::bail!(
             "unknown harness {other:?}; built in: claude, codex, shell \
              (or add {})",
@@ -370,90 +359,18 @@ fn harness_command_in(dir: &Path, harness: &str, prompt: &str) -> Result<Vec<Str
     }
 }
 
-/// The running harness.
-enum Harness {
-    Tmux,
-    #[cfg(all(test, target_os = "linux"))]
-    Direct(Child),
-}
-
-impl Harness {
-    async fn start(
-        session: Session,
-        command: &[String],
-        repo: &Path,
-        env: &BTreeMap<String, String>,
-    ) -> Result<Self> {
-        match session {
-            Session::Tmux => {
-                let mut tmux = Command::new("tmux");
-                tmux.args([
-                    "new-session",
-                    "-d",
-                    "-s",
-                    SESSION,
-                    "-x",
-                    "200",
-                    "-y",
-                    "50",
-                    "-c",
-                ])
-                .arg(repo);
-                for (key, value) in env {
-                    tmux.arg("-e").arg(format!("{key}={value}"));
-                }
-                let status = tmux
-                    .arg("--")
-                    .args(command)
-                    .status()
-                    .await
-                    .context("start tmux")?;
-                anyhow::ensure!(status.success(), "tmux new-session failed");
-                Ok(Self::Tmux)
-            }
-            #[cfg(all(test, target_os = "linux"))]
-            Session::Direct => {
-                let (program, args) = command.split_first().context("empty harness command")?;
-                let child = Command::new(program)
-                    .args(args)
-                    .current_dir(repo)
-                    .envs(env)
-                    .stdin(Stdio::null())
-                    .kill_on_drop(true)
-                    .spawn()
-                    .with_context(|| format!("start {program}"))?;
-                Ok(Self::Direct(child))
-            }
-        }
-    }
-
-    async fn running(&mut self) -> bool {
-        match self {
-            Self::Tmux => Command::new("tmux")
-                .args(["has-session", "-t", SESSION])
-                .stderr(Stdio::null())
-                .status()
-                .await
-                .is_ok_and(|s| s.success()),
-            #[cfg(all(test, target_os = "linux"))]
-            Self::Direct(child) => matches!(child.try_wait(), Ok(None)),
-        }
-    }
-
-    async fn stop(&mut self) {
-        match self {
-            Self::Tmux => {
-                let _status = Command::new("tmux")
-                    .args(["kill-session", "-t", SESSION])
-                    .status()
-                    .await;
-            }
-            #[cfg(all(test, target_os = "linux"))]
-            Self::Direct(child) => {
-                let _killed = child.kill().await;
-            }
-        }
-    }
+/// Start the harness as a child process in `repo`. Its stdout and stderr are
+/// the init's, which systemd sends to the console.
+fn start_harness(command: &[String], repo: &Path, env: &BTreeMap<String, String>) -> Result<Child> {
+    let (program, args) = command.split_first().context("empty harness command")?;
+    Command::new(program)
+        .args(args)
+        .current_dir(repo)
+        .envs(env)
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("start {program}"))
 }
 
 /// Accept on a loopback listener and carry each connection to host port `port`.
@@ -507,51 +424,35 @@ fn bind_control(path: &Path) -> Result<UnixListener> {
 
 /// Serve control requests on a Unix socket (tests).
 #[cfg(all(test, target_os = "linux"))]
-async fn unix_control_loop(listener: UnixListener, shutdown: mpsc::Sender<()>, session: Session) {
+async fn unix_control_loop(listener: UnixListener, shutdown: mpsc::Sender<()>) {
     loop {
         let Ok((conn, _)) = listener.accept().await else {
             tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         };
-        spawn_control(conn, shutdown.clone(), session);
+        spawn_control(conn, shutdown.clone());
     }
 }
 
 /// Handle one control connection on its own task.
-fn spawn_control<S>(conn: S, shutdown: mpsc::Sender<()>, session: Session)
+fn spawn_control<S>(conn: S, shutdown: mpsc::Sender<()>)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        if let Err(e) = control(conn, &shutdown, session).await {
+        if let Err(e) = control(conn, &shutdown).await {
             tracing::warn!(error = %format!("{e:#}"), "control request failed");
         }
     });
 }
 
-/// A parsed control request.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ControlRequest {
-    Shutdown,
-    Attach { rows: u16, cols: u16 },
+/// Whether `line` is the one control request there is: `shutdown`.
+pub(crate) fn is_shutdown(line: &str) -> bool {
+    line.split_whitespace().eq(["shutdown"])
 }
 
-/// Parse one control line.
-pub(crate) fn parse_control(line: &str) -> Option<ControlRequest> {
-    let mut words = line.split_whitespace();
-    match (words.next(), words.next(), words.next(), words.next()) {
-        (Some("shutdown"), None, None, None) => Some(ControlRequest::Shutdown),
-        (Some("attach"), Some(rows), Some(cols), None) => Some(ControlRequest::Attach {
-            rows: rows.parse().ok().filter(|r| *r > 0)?,
-            cols: cols.parse().ok().filter(|c| *c > 0)?,
-        }),
-        _ => None,
-    }
-}
-
-/// Serve one control request: `shutdown` ends the run; `attach R C` attaches
-/// a terminal to the harness's tmux session.
-async fn control<S>(conn: S, shutdown: &mpsc::Sender<()>, session: Session) -> Result<()>
+/// Serve one control request: `shutdown` ends the run early.
+async fn control<S>(conn: S, shutdown: &mpsc::Sender<()>) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -561,56 +462,12 @@ where
         .read_line(&mut line)
         .await
         .context("read control request")?;
-    match parse_control(&line) {
-        Some(ControlRequest::Shutdown) => {
-            shutdown.send(()).await.ok();
-            Ok(())
-        }
-        Some(ControlRequest::Attach { rows, cols }) => {
-            anyhow::ensure!(
-                session == Session::Tmux,
-                "this guest has no attachable session"
-            );
-            attach(reader.into_inner(), rows, cols).await
-        }
-        None => anyhow::bail!("unknown control request {:?}", line.trim()),
-    }
-}
-
-/// The command that attaches a terminal of `rows`x`cols` to the harness
-/// session. `script` gives tmux the pty it needs.
-pub(crate) fn attach_command(rows: u16, cols: u16) -> Vec<String> {
-    vec![
-        "script".to_owned(),
-        "-q".to_owned(),
-        "-e".to_owned(),
-        "-c".to_owned(),
-        format!("stty rows {rows} cols {cols}; exec tmux attach -t {SESSION}"),
-        "/dev/null".to_owned(),
-    ]
-}
-
-async fn attach<S>(conn: S, rows: u16, cols: u16) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let command = attach_command(rows, cols);
-    let (program, args) = command.split_first().context("empty attach command")?;
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .context("start the attach terminal")?;
-    let mut stdin = child.stdin.take().context("attach stdin")?;
-    let mut stdout = child.stdout.take().context("attach stdout")?;
-    let (mut read, mut write) = tokio::io::split(conn);
-    let input = tokio::spawn(async move { tokio::io::copy(&mut read, &mut stdin).await });
-    tokio::io::copy(&mut stdout, &mut write).await.ok();
-    input.abort();
-    child.wait().await.context("wait for the attach terminal")?;
+    anyhow::ensure!(
+        is_shutdown(&line),
+        "unknown control request {:?}",
+        line.trim()
+    );
+    shutdown.send(()).await.ok();
     Ok(())
 }
 
@@ -631,7 +488,7 @@ mod vsock {
     use tokio::sync::mpsc;
     use tokio_vsock::{VMADDR_CID_ANY, VMADDR_CID_HOST, VsockAddr, VsockListener, VsockStream};
 
-    use super::{Session, spawn_control};
+    use super::spawn_control;
 
     /// Connect to host vsock port `port`.
     pub(super) async fn connect_host(port: u32) -> Result<VsockStream> {
@@ -647,14 +504,10 @@ mod vsock {
     }
 
     /// Serve control requests arriving on the vsock control port.
-    pub(super) async fn control_loop(
-        listener: VsockListener,
-        shutdown: mpsc::Sender<()>,
-        session: Session,
-    ) {
+    pub(super) async fn control_loop(listener: VsockListener, shutdown: mpsc::Sender<()>) {
         loop {
             match listener.accept().await {
-                Ok((conn, _)) => spawn_control(conn, shutdown.clone(), session),
+                Ok((conn, _)) => spawn_control(conn, shutdown.clone()),
                 Err(e) => {
                     tracing::warn!(error = %e, "control accept failed");
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -750,7 +603,7 @@ async fn git_output(repo: &Path, args: &[&str]) -> Result<String> {
     reason = "test code: panic on assertion failure is acceptable"
 )]
 mod tests {
-    use super::{ControlRequest, attach_command, harness_command_in, parse_control};
+    use super::{harness_command_in, is_shutdown};
     use crate::sandbox::test_support::temp_root;
 
     #[cfg(target_os = "linux")]
@@ -802,7 +655,7 @@ exec sleep 60
 
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        use super::{Config, Session, Upstream};
+        use super::{Config, Upstream};
         use crate::sandbox::jail::owner_of;
         use crate::sandbox::relay::{GIT_PORT, INBOX, Relay, Upstreams, init_inbox, socket_path};
         use crate::sandbox::test_support::{git, init_repo};
@@ -864,7 +717,6 @@ exec sleep 60
                 relay_dir: host.clone(),
                 control_socket: root.join("control.sock"),
             },
-            session: Session::Direct,
             listen: Some((any, any)),
             remote_url: Some(format!(
                 "ext::python3 {} {}",
@@ -1021,19 +873,24 @@ exec sleep 60
     }
 
     #[test]
-    fn harnesses_map_to_no_prompt_commands_and_scripts_win() {
+    fn harnesses_run_single_shot_without_prompts_and_scripts_win() {
         let dir = temp_root("guest-harness");
         assert_eq!(
             harness_command_in(&dir, "claude", "fix it").unwrap(),
-            ["claude", "--dangerously-skip-permissions", "fix it"]
+            ["claude", "-p", "--dangerously-skip-permissions", "fix it"]
         );
         assert_eq!(
             harness_command_in(&dir, "codex", "fix it").unwrap(),
             [
                 "codex",
+                "exec",
                 "--dangerously-bypass-approvals-and-sandbox",
                 "fix it"
             ]
+        );
+        assert_eq!(
+            harness_command_in(&dir, "shell", "make test").unwrap(),
+            ["bash", "-lc", "make test"]
         );
         let err = harness_command_in(&dir, "aider", "x").unwrap_err();
         assert!(format!("{err:#}").contains("unknown harness"), "{err:#}");
@@ -1046,34 +903,11 @@ exec sleep 60
     }
 
     #[test]
-    fn control_lines_parse_strictly() {
-        assert_eq!(parse_control("shutdown\n"), Some(ControlRequest::Shutdown));
-        assert_eq!(
-            parse_control("attach 40 120\n"),
-            Some(ControlRequest::Attach {
-                rows: 40,
-                cols: 120
-            })
-        );
-        for bad in [
-            "",
-            "shutdown now",
-            "attach 0 80",
-            "attach 40",
-            "attach x y",
-            "rm -rf /",
-        ] {
-            assert_eq!(parse_control(bad), None, "{bad:?}");
+    fn shutdown_is_the_only_control_request() {
+        assert!(is_shutdown("shutdown\n"));
+        assert!(is_shutdown("  shutdown  "));
+        for bad in ["", "shutdown now", "attach 40 120", "rm -rf /"] {
+            assert!(!is_shutdown(bad), "{bad:?}");
         }
-    }
-
-    #[test]
-    fn attach_runs_tmux_attach_in_a_sized_pty() {
-        let command = attach_command(40, 120);
-        assert_eq!(command.first().map(String::as_str), Some("script"));
-        assert!(
-            command.contains(&"stty rows 40 cols 120; exec tmux attach -t agent".to_owned()),
-            "{command:?}"
-        );
     }
 }

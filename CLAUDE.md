@@ -348,7 +348,7 @@ open; the CLI's `list`/`status`/`ssh` therefore require `devbox login` too.
 **Planned / not yet built** (ideas borrowed from [`.kiro/references.md`](.kiro/references.md)
 are tagged inline):
 - **Sub-agent sandboxes (smoketurner/devbox#164)** — built: `devbox-agent sandbox
-  run|ls|logs|diff|attach|pause|resume|stop` (claimant side: per-sub-agent clone on
+  run|ls|logs|diff|stop`, single-shot (claimant side: per-sub-agent clone on
   `agent/<name>`, ext4 workspace image, a collect step that treats the guest repo
   as hostile, review worktree) and the root daemon `devbox-agent sandboxd`
   (`sandbox/daemon.rs`, peer-credential-checked Unix socket) that runs each VMM
@@ -356,11 +356,11 @@ are tagged inline):
   Nitro Sandbox direct mode, no NIC), its vsock relay (`sandbox/relay.rs`: egress
   proxy pipe, model API forwarding to `/egress/*` with the box token, `git push`
   inbox for live `diff`), and runtime control over the Firecracker API socket
-  (`sandbox/api.rs`: pause/resume, clean shutdown via the guest's control port),
-  `attach` (daemon splices the CLI to the guest's tmux session; `sandbox/terminal.rs`),
-  and the guest init `devbox-agent guest` (`sandbox/guest.rs`: mounts the
+  (`sandbox/api.rs`: clean shutdown via the guest's control port), and the
+  guest init `devbox-agent guest` (`sandbox/guest.rs`: mounts the
   workspace, bridges loopback to the host relay over vsock with `tokio-vsock`, pushes
-  the branch, runs the harness in tmux, WIP-commits and powers off). The guest
+  the branch, runs the harness once (`claude -p`, `codex exec`), WIP-commits and
+  powers off). The guest
   rootfs build and `devbox-sandboxd.service` are in devbox-infra
   (`07-nitro-sandboxes`, `08-sandbox-guest`). Still missing: a sandbox-capable
   Firecracker, `jailer` and guest kernel in the AMI (no AWS package located yet).

@@ -2,15 +2,15 @@
 //! guest's control port over vsock.
 //!
 //! The VMM boots from its config file and also serves its HTTP API on
-//! `<sandbox dir>/api.sock`. That is used to read the VM state, pause and
-//! resume, and (on x86_64 only) send Ctrl-Alt-Del.
+//! `<chroot>/api.sock`. Sandboxes are single-shot, so the only call used is
+//! Ctrl-Alt-Del on x86_64, as a second way to ask for a clean power-off.
 //!
 //! A clean shutdown is asked of the guest itself: the host opens a vsock
 //! connection to guest port [`CONTROL_PORT`] through Firecracker's Unix socket
 //! (`CONNECT <port>\n`, answered `OK <port>\n`) and sends `shutdown\n`. The
 //! guest image's init is expected to listen there, sync and unmount the
 //! workspace, and power off, which ends the VMM. A guest that doesn't answer is
-//! stopped by signal instead (see [`super::firecracker::Firecracker::stop`]).
+//! stopped by signal instead (see [`super::firecracker::stop_vmm`]).
 
 use std::path::Path;
 use std::time::Duration;
@@ -35,15 +35,6 @@ pub(crate) const CONTROL_PORT: u32 = 1024;
 
 /// Bound on one API call or control exchange.
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// The VM state Firecracker reports.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum VmState {
-    Running,
-    Paused,
-    /// Any other state Firecracker reports (e.g. `Not started`).
-    Other(String),
-}
 
 /// Call the API at `socket`: `method path` with an optional JSON body. Returns
 /// the status and the response body.
@@ -117,43 +108,6 @@ fn expect_success(what: &str, status: StatusCode, body: &Bytes) -> Result<()> {
         })
         .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned());
     anyhow::bail!("{what} failed ({status}): {fault}")
-}
-
-/// The VM state of the sandbox in `dir`.
-///
-/// # Errors
-///
-/// Returns an error if the API is unreachable or answers unexpectedly.
-pub(crate) async fn vm_state(dir: &Path) -> Result<VmState> {
-    let (status, body) = call(&dir.join(API_SOCKET), Method::GET, "/", None).await?;
-    expect_success("read VM state", status, &body)?;
-    let info: Value = serde_json::from_slice(&body).context("parse instance info")?;
-    let state = info
-        .get("state")
-        .and_then(Value::as_str)
-        .context("instance info has no state")?;
-    Ok(match state {
-        "Running" => VmState::Running,
-        "Paused" => VmState::Paused,
-        other => VmState::Other(other.to_owned()),
-    })
-}
-
-/// Pause (`true`) or resume (`false`) the sandbox in `dir`.
-///
-/// # Errors
-///
-/// Returns an error if Firecracker refuses or can't be reached.
-pub(crate) async fn set_paused(dir: &Path, paused: bool) -> Result<()> {
-    let state = if paused { "Paused" } else { "Resumed" };
-    let (status, body) = call(
-        &dir.join(API_SOCKET),
-        Method::PATCH,
-        "/vm",
-        Some(&json!({ "state": state })),
-    )
-    .await?;
-    expect_success(if paused { "pause" } else { "resume" }, status, &body)
 }
 
 /// Send Ctrl-Alt-Del to the guest (Firecracker supports this on x86_64 only).
@@ -259,57 +213,33 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
 
-    use super::{
-        API_SOCKET, CONTROL_PORT, VmState, request_guest_shutdown, send_ctrl_alt_del, set_paused,
-        vm_state,
-    };
+    use super::{API_SOCKET, CONTROL_PORT, request_guest_shutdown, send_ctrl_alt_del};
     use crate::sandbox::firecracker::VSOCK;
     use crate::sandbox::test_support::temp_root;
 
-    /// A stand-in Firecracker API holding a VM state; returns the requests it saw.
+    /// A stand-in Firecracker API that refuses everything with a fault
+    /// message, as Firecracker does for Ctrl-Alt-Del on aarch64; returns the
+    /// requests it saw.
     fn serve_api(dir: &std::path::Path) -> Arc<Mutex<Vec<String>>> {
         let listener = UnixListener::bind(dir.join(API_SOCKET)).unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let state = Arc::new(Mutex::new("Running".to_owned()));
         let log = Arc::clone(&seen);
         tokio::spawn(async move {
             loop {
                 let (conn, _) = listener.accept().await.unwrap();
-                let (log, state) = (Arc::clone(&log), Arc::clone(&state));
+                let log = Arc::clone(&log);
                 tokio::spawn(async move {
                     let service = service_fn(move |req: Request<Incoming>| {
-                        let (log, state) = (Arc::clone(&log), Arc::clone(&state));
+                        let log = Arc::clone(&log);
                         async move {
                             let line = format!("{} {}", req.method(), req.uri());
                             let body = req.into_body().collect().await.unwrap().to_bytes();
                             let body = String::from_utf8_lossy(&body).into_owned();
                             log.lock().unwrap().push(format!("{line} {body}"));
-                            let response = match line.as_str() {
-                                "GET /" => {
-                                    let s = state.lock().unwrap().clone();
-                                    Response::new(Full::new(Bytes::from(format!(
-                                        r#"{{"id":"x","state":"{s}"}}"#
-                                    ))))
-                                }
-                                "PATCH /vm" => {
-                                    let next = if body.contains("Paused") {
-                                        "Paused"
-                                    } else {
-                                        "Running"
-                                    };
-                                    *state.lock().unwrap() = next.to_owned();
-                                    let mut r = Response::new(Full::new(Bytes::new()));
-                                    *r.status_mut() = StatusCode::NO_CONTENT;
-                                    r
-                                }
-                                _ => {
-                                    let mut r = Response::new(Full::new(Bytes::from(
-                                        r#"{"fault_message":"unsupported on aarch64"}"#,
-                                    )));
-                                    *r.status_mut() = StatusCode::BAD_REQUEST;
-                                    r
-                                }
-                            };
+                            let mut response = Response::new(Full::new(Bytes::from(
+                                r#"{"fault_message":"unsupported on aarch64"}"#,
+                            )));
+                            *response.status_mut() = StatusCode::BAD_REQUEST;
                             Ok::<_, Infallible>(response)
                         }
                     });
@@ -324,16 +254,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn state_pause_and_resume_go_through_the_api_socket() {
+    async fn api_faults_come_back_as_errors() {
         let dir = temp_root("api");
         let seen = serve_api(&dir);
-
-        assert_eq!(vm_state(&dir).await.unwrap(), VmState::Running);
-        set_paused(&dir, true).await.unwrap();
-        assert_eq!(vm_state(&dir).await.unwrap(), VmState::Paused);
-        set_paused(&dir, false).await.unwrap();
-        assert_eq!(vm_state(&dir).await.unwrap(), VmState::Running);
-
         let err = send_ctrl_alt_del(&dir).await.unwrap_err();
         assert!(
             format!("{err:#}").contains("unsupported on aarch64"),
@@ -341,11 +264,7 @@ mod tests {
         );
         let seen = seen.lock().unwrap().clone();
         assert!(
-            seen.contains(&r#"PATCH /vm {"state":"Paused"}"#.to_owned()),
-            "{seen:?}"
-        );
-        assert!(
-            seen.contains(&r#"PATCH /vm {"state":"Resumed"}"#.to_owned()),
+            seen.contains(&r#"PUT /actions {"action_type":"SendCtrlAltDel"}"#.to_owned()),
             "{seen:?}"
         );
     }
@@ -353,7 +272,7 @@ mod tests {
     #[tokio::test]
     async fn api_calls_fail_cleanly_without_a_vmm() {
         let dir = temp_root("api-none");
-        assert!(vm_state(&dir).await.is_err());
+        assert!(send_ctrl_alt_del(&dir).await.is_err());
         assert!(request_guest_shutdown(&dir).await.is_err());
     }
 
