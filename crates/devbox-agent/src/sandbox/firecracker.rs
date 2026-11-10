@@ -62,8 +62,11 @@ pub(crate) fn vm_config(meta: &SandboxMeta) -> Value {
     json!({
         "boot-source": {
             "kernel_image_path": "/vmlinux",
+            // The root drive is read-only and shared by every sandbox;
+            // systemd.volatile=overlay gives each guest a writable tmpfs layer.
             "boot_args": format!(
-                "console=ttyS0 reboot=k panic=1 devbox.sandbox={} devbox.workspace=LABEL={WORKSPACE_LABEL}",
+                "console=ttyS0 reboot=k panic=1 systemd.volatile=overlay \
+                 devbox.sandbox={} devbox.workspace=LABEL={WORKSPACE_LABEL}",
                 meta.name
             ),
         },
@@ -277,7 +280,9 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(
-            boot_args.contains("devbox.sandbox=calm-quilt"),
+            boot_args.contains("devbox.sandbox=calm-quilt")
+                && boot_args.contains("devbox.workspace=LABEL=sbworkspace")
+                && boot_args.contains("systemd.volatile=overlay"),
             "{boot_args}"
         );
     }
