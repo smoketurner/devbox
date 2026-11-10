@@ -348,12 +348,14 @@ open; the CLI's `list`/`status`/`ssh` therefore require `devbox login` too.
 **Planned / not yet built** (ideas borrowed from [`.kiro/references.md`](.kiro/references.md)
 are tagged inline):
 - **Sub-agent sandboxes (smoketurner/devbox#164)** — `devbox-agent sandbox
-  run|ls|logs|diff|stop` is built: per-sub-agent clone on `agent/<name>`, ext4
+  run|ls|logs|diff|pause|resume|stop` is built: per-sub-agent clone on `agent/<name>`, ext4
   workspace image, Firecracker config in Nitro Sandbox direct mode with no NIC
   (vsock only), a collect step that treats the guest repo as hostile, and a
   per-sandbox vsock relay (`sandbox/relay.rs`: egress proxy pipe, model API
   forwarding to the control plane's `/egress/*` with the box token, `git push`
-  inbox for live `diff`). Still missing: the guest image + init, `attach`, and
+  inbox for live `diff`), and runtime control over the Firecracker API socket
+  (`sandbox/api.rs`: `pause`/`resume`, paused state in `ls`, clean shutdown via
+  the guest's vsock control port before any signal). Still missing: the guest image + init, `attach`, and
   the AMI bake (Firecracker + guest image; infra side is
   `nitro_sandboxes_enabled`, devbox-infra#30). Until then `run` stops at its
   preflight.

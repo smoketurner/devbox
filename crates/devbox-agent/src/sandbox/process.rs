@@ -16,6 +16,21 @@ pub(crate) fn cmdline_contains(pid: u32, needle: &str) -> bool {
         .is_ok_and(|cmdline| String::from_utf8_lossy(&cmdline).contains(needle))
 }
 
+/// Wait up to `timeout` for the process `needle` identifies to exit. Returns
+/// whether it did.
+pub(crate) async fn wait_exit(pid: u32, needle: &str, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(tokio::time::Instant::now);
+    while cmdline_contains(pid, needle) {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    true
+}
+
 /// Stop `pid` (if it is still the process `needle` identifies): SIGTERM, wait up
 /// to `grace`, then SIGKILL.
 ///
@@ -33,12 +48,7 @@ pub(crate) async fn terminate(pid: u32, needle: &str, grace: Duration) -> Result
             .arg(pid.to_string())
             .status()
             .await;
-        let deadline = tokio::time::Instant::now()
-            .checked_add(wait)
-            .unwrap_or_else(tokio::time::Instant::now);
-        while cmdline_contains(pid, needle) && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        wait_exit(pid, needle, wait).await;
     }
     anyhow::ensure!(!cmdline_contains(pid, needle), "process {pid} did not stop");
     Ok(())

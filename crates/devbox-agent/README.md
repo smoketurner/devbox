@@ -16,7 +16,7 @@ One binary, a handful of subcommands, each wired to a different host trigger:
 | `warmup` | `devbox-warmup.service` (systemd, at boot) | Freshen `/workspace` repos, then self-tag `devbox:ready=true` |
 | `checkout <urls>` | the snapshot-builder, or a developer/agent on a claimed box | Clone repos into `/workspace`, minting a read-only token per repo |
 | `doctor` | operator on a claimed box, via `devbox ssh -- devbox-agent doctor` | Print a read-only diagnostic of warm-cache delivery |
-| `sandbox run\|ls\|logs\|diff\|stop` | the claimant, logged in to their box | Run sub-agents in Nitro Sandboxes, each on its own clone; collect their work as `agent/<name>` branches |
+| `sandbox run\|ls\|logs\|diff\|pause\|resume\|stop` | the claimant, logged in to their box | Run sub-agents in Nitro Sandboxes, each on its own clone; collect their work as `agent/<name>` branches |
 
 ## `principals` — per-claim SSH authorization
 
@@ -160,6 +160,7 @@ NAME                 STATE     HARNESS  AGE    REPO
 calm-quilt           running   claude   2m     /workspace/devbox
 
 $ devbox-agent sandbox logs calm-quilt -f    # follow the guest console
+$ devbox-agent sandbox pause calm-quilt      # freeze it; `resume` continues
 $ devbox-agent sandbox stop calm-quilt       # stop it, fetch its work
 collected 3 commit(s) from calm-quilt onto agent/calm-quilt
 $ cd /workspace/.sandboxes/calm-quilt/worktree   # open, build, test it
@@ -174,6 +175,12 @@ How it works:
   an ext4 image (`mkfs.ext4 -d`, no root needed), and starts Firecracker with
   `"enclave": {"direct_mode": true}` so the guest boots as a Nitro Sandbox. The
   guest has no network device, only a vsock device.
+- Firecracker boots from its config file and also serves its API on
+  `<sandbox dir>/api.sock`, which `ls` (running or paused), `pause`, `resume`
+  and `stop` use. `stop` asks for a clean power-off first: it resumes a paused
+  guest, then sends `shutdown` to guest vsock port 1024 (and Ctrl-Alt-Del on
+  x86_64). Only a guest that doesn't answer, or doesn't power off within 15
+  s, gets SIGTERM and then SIGKILL, and `stop` says which happened.
 - `stop` (or `diff`, once the guest exits by itself) replays the image's
   journal, copies `/repo` out with `debugfs rdump`, and fetches only
   `agent/<name>` back into your repository. Uncommitted guest changes become a
@@ -207,8 +214,8 @@ write access to it (the `ne` group), and the VMM and guest image
 defaults `firecracker` on `PATH` and `/opt/devbox/sandbox/{vmlinux,rootfs.ext4}`).
 
 Not built yet (smoketurner/devbox#164): the guest image and its init (mount the
-workspace, map the vsock ports to loopback, run the harness, push and commit,
-power off), `attach`, and the AMI bake of
+workspace, map the vsock ports to loopback, listen for `shutdown` on port
+1024, run the harness, push and commit, power off), `attach`, and the AMI bake of
 Firecracker plus the guest image. Until those land, `run` stops at the preflight
 on every host.
 

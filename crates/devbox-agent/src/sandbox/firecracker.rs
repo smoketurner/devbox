@@ -30,7 +30,8 @@ use devbox_common::env_non_empty;
 use serde_json::{Value, json};
 use tokio::process::Command;
 
-use super::process::{cmdline_contains, terminate};
+use super::api::{self, API_SOCKET, VmState};
+use super::process::{cmdline_contains, terminate, wait_exit};
 use super::store::SandboxMeta;
 
 /// The Nitro Enclaves device the VMM drives.
@@ -50,8 +51,22 @@ const WORKSPACE_LABEL: &str = "sbworkspace";
 /// Time budget for building or reading the workspace image.
 const IMAGE_TIMEOUT: Duration = Duration::from_mins(10);
 
-/// How long `stop` waits after SIGTERM before SIGKILL.
+/// How long `stop` waits for a guest asked to power off.
 const STOP_GRACE: Duration = Duration::from_secs(15);
+
+/// How long a VMM gets between SIGTERM and SIGKILL.
+const KILL_GRACE: Duration = Duration::from_secs(5);
+
+/// How [`Firecracker::stop`] ended the VMM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopOutcome {
+    /// It had already exited.
+    NotRunning,
+    /// The guest powered off when asked.
+    Clean,
+    /// It was signalled (the guest didn't answer, or didn't power off in time).
+    Forced,
+}
 
 /// Files inside a sandbox directory.
 pub(crate) const CONSOLE_LOG: &str = "console.log";
@@ -207,7 +222,9 @@ impl Firecracker {
         // Its own process group, so the VMM outlives this command and a Ctrl-C in
         // the claimant's terminal doesn't reach it.
         let child = std::process::Command::new(&self.firecracker)
-            .arg("--no-api")
+            // Boot from the config file, and serve the API for runtime control.
+            .arg("--api-sock")
+            .arg(dir.join(API_SOCKET))
             .arg("--config-file")
             .arg(&config_path)
             .current_dir(dir)
@@ -226,18 +243,38 @@ impl Firecracker {
             .is_some_and(|pid| cmdline_contains(pid, &Self::needle(dir)))
     }
 
-    /// Stop the VMM: SIGTERM, then SIGKILL after [`STOP_GRACE`].
+    /// Stop the VMM, cleanly if the guest cooperates.
+    ///
+    /// A paused guest is resumed first, then asked to power off through its
+    /// control port (and, on x86_64, sent Ctrl-Alt-Del). If it is still running
+    /// after [`STOP_GRACE`], or never accepted the request, it gets SIGTERM and
+    /// then SIGKILL.
     ///
     /// # Errors
     ///
     /// Returns an error if the VMM is still running after SIGKILL.
-    pub(crate) async fn stop(dir: &Path, meta: &SandboxMeta) -> Result<()> {
+    pub(crate) async fn stop(dir: &Path, meta: &SandboxMeta) -> Result<StopOutcome> {
         let Some(pid) = meta.pid else {
-            return Ok(());
+            return Ok(StopOutcome::NotRunning);
         };
-        terminate(pid, &Self::needle(dir), STOP_GRACE)
+        let needle = Self::needle(dir);
+        if !cmdline_contains(pid, &needle) {
+            return Ok(StopOutcome::NotRunning);
+        }
+        if matches!(api::vm_state(dir).await, Ok(VmState::Paused)) {
+            api::set_paused(dir, false).await.ok();
+        }
+        let mut asked = api::request_guest_shutdown(dir).await.is_ok();
+        if cfg!(target_arch = "x86_64") {
+            asked |= api::send_ctrl_alt_del(dir).await.is_ok();
+        }
+        if asked && wait_exit(pid, &needle, STOP_GRACE).await {
+            return Ok(StopOutcome::Clean);
+        }
+        terminate(pid, &needle, KILL_GRACE)
             .await
-            .with_context(|| format!("stop sandbox {}", meta.name))
+            .with_context(|| format!("stop sandbox {}", meta.name))?;
+        Ok(StopOutcome::Forced)
     }
 
     /// The command-line fragment identifying this sandbox's VMM: its config path,
@@ -435,6 +472,38 @@ mod tests {
         assert!(resolve_program(std::path::Path::new("sh")).is_some());
         assert!(resolve_program(std::path::Path::new("/bin/sh")).is_some());
         assert!(resolve_program(std::path::Path::new("no-such-devbox-binary")).is_none());
+    }
+
+    // Needs /proc: Linux only, like the backend.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn stop_signals_a_guest_that_ignores_the_shutdown_request() {
+        use super::StopOutcome;
+
+        let root = temp_root("fc-stop");
+        // No API socket and no control port: nothing answers a clean request.
+        let mut vmm = tokio::process::Command::new("sh")
+            .args(["-c", "trap 'exit 0' TERM; sleep 300 & wait", "sh"])
+            .arg(root.join("vm.json"))
+            .spawn()
+            .unwrap();
+        let mut sandbox = meta();
+        sandbox.pid = vmm.id();
+        for _ in 0..100 {
+            if Firecracker::is_running(&root, &sandbox) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(Firecracker::is_running(&root, &sandbox));
+
+        let outcome = Firecracker::stop(&root, &sandbox).await.unwrap();
+        assert_eq!(outcome, StopOutcome::Forced);
+        vmm.wait().await.unwrap();
+        assert_eq!(
+            Firecracker::stop(&root, &sandbox).await.unwrap(),
+            StopOutcome::NotRunning
+        );
     }
 
     // e2fsprogs (mkfs.ext4 -d, e2fsck, debugfs) ships on the agent's Linux hosts only.

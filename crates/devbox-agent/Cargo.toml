@@ -23,7 +23,7 @@ clap = { workspace = true, features = ["std", "help", "usage", "error-context", 
 devbox-common = { path = "../devbox-common" }
 futures-util = { workspace = true, features = ["std"] }
 http-body-util = { workspace = true }
-hyper = { workspace = true, features = ["server", "http1"] }
+hyper = { workspace = true, features = ["server", "client", "http1"] }
 hyper-util = { workspace = true, features = ["tokio"] }
 reqwest = { workspace = true, features = ["json", "rustls", "stream"] }
 rust-ini = { workspace = true }

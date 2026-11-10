@@ -16,6 +16,7 @@
 //! Records live on the box only (see [`store`]); nothing here talks to the
 //! control plane.
 
+mod api;
 mod firecracker;
 mod process;
 mod relay;
@@ -30,7 +31,8 @@ use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use serde_json::json;
 
-use firecracker::{CONSOLE_LOG, Firecracker};
+use api::VmState;
+use firecracker::{CONSOLE_LOG, Firecracker, StopOutcome};
 use store::{SandboxMeta, Store, now_unix};
 
 /// `devbox-agent sandbox` subcommands.
@@ -60,6 +62,16 @@ pub(crate) enum SandboxCommand {
     },
     /// Stop a sandbox and fetch its work onto branch `agent/<name>`.
     Stop {
+        /// Sandbox name.
+        name: String,
+    },
+    /// Pause a running sandbox (its vCPUs stop; memory and state are kept).
+    Pause {
+        /// Sandbox name.
+        name: String,
+    },
+    /// Resume a paused sandbox.
+    Resume {
         /// Sandbox name.
         name: String,
     },
@@ -121,9 +133,11 @@ pub(crate) async fn run(command: SandboxCommand) -> Result<()> {
     match command {
         SandboxCommand::Run(args) => start(&store, &fc, args, RelayMode::Spawn).await,
         SandboxCommand::Ls => {
-            print!("{}", render_list(&store, now_unix())?);
+            print!("{}", render_list(&store, now_unix()).await?);
             Ok(())
         }
+        SandboxCommand::Pause { name } => set_paused(&store, &name, true).await,
+        SandboxCommand::Resume { name } => set_paused(&store, &name, false).await,
         SandboxCommand::Logs { name, follow } => logs(&store, &name, follow).await,
         SandboxCommand::Diff { name, stat } => diff(&store, &name, stat).await,
         SandboxCommand::Stop { name } => stop(&store, &name).await,
@@ -248,6 +262,8 @@ async fn launch(
             "egress_port": relay::EGRESS_PORT,
             "model_port": relay::MODEL_PORT,
             "git_port": relay::GIT_PORT,
+            // Guest port the host sends `shutdown` to (see `api`).
+            "control_port": api::CONTROL_PORT,
         },
     });
     std::fs::write(
@@ -322,7 +338,13 @@ async fn spawn_relay(store: &Store, dir: &Path, name: &str) -> Result<u32> {
 async fn stop(store: &Store, name: &str) -> Result<()> {
     let meta = store.load(name)?;
     let dir = store.dir(name)?;
-    Firecracker::stop(&dir, &meta).await?;
+    match Firecracker::stop(&dir, &meta).await? {
+        StopOutcome::Clean => println!("{name} powered off cleanly"),
+        StopOutcome::Forced => {
+            println!("{name} didn't power off when asked; stopped it by signal");
+        }
+        StopOutcome::NotRunning => {}
+    }
     if let Some(relay_pid) = meta.relay_pid {
         // The relay also exits by itself once the VMM is gone; this is prompter.
         if let Err(e) =
@@ -451,8 +473,41 @@ async fn logs(store: &Store, name: &str, follow: bool) -> Result<()> {
     Ok(())
 }
 
+/// `sandbox pause` / `sandbox resume`.
+async fn set_paused(store: &Store, name: &str, paused: bool) -> Result<()> {
+    let meta = store.load(name)?;
+    let dir = store.dir(name)?;
+    anyhow::ensure!(
+        Firecracker::is_running(&dir, &meta),
+        "sandbox {name} is not running"
+    );
+    api::set_paused(&dir, paused).await?;
+    println!("{name} {}", if paused { "paused" } else { "resumed" });
+    Ok(())
+}
+
+/// Whether a sandbox's VMM is up, and if so whether its guest is paused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Liveness {
+    Stopped,
+    Running,
+    Paused,
+}
+
+/// The liveness of the sandbox in `dir`.
+async fn liveness(dir: &Path, meta: &SandboxMeta) -> Liveness {
+    if !Firecracker::is_running(dir, meta) {
+        return Liveness::Stopped;
+    }
+    match api::vm_state(dir).await {
+        Ok(VmState::Paused) => Liveness::Paused,
+        // Unreachable API or another state: the VMM is still up.
+        _ => Liveness::Running,
+    }
+}
+
 /// The `sandbox ls` table.
-fn render_list(store: &Store, now: u64) -> Result<String> {
+async fn render_list(store: &Store, now: u64) -> Result<String> {
     let metas = store.list()?;
     if metas.is_empty() {
         return Ok(
@@ -466,7 +521,7 @@ fn render_list(store: &Store, now: u64) -> Result<String> {
     );
     for meta in metas {
         let dir = store.dir(&meta.name)?;
-        let state = state_label(&meta, Firecracker::is_running(&dir, &meta));
+        let state = state_label(&meta, liveness(&dir, &meta).await);
         out.push_str(&format!(
             "{:<20} {:<9} {:<8} {:<6} {}\n",
             meta.name,
@@ -479,15 +534,14 @@ fn render_list(store: &Store, now: u64) -> Result<String> {
     Ok(out)
 }
 
-/// A sandbox's lifecycle state, from its record and whether its VMM is alive.
-fn state_label(meta: &SandboxMeta, running: bool) -> &'static str {
-    if running {
-        "running"
-    } else if meta.collected {
-        "collected"
-    } else {
+/// A sandbox's lifecycle state, from its record and its VMM's liveness.
+fn state_label(meta: &SandboxMeta, live: Liveness) -> &'static str {
+    match live {
+        Liveness::Running => "running",
+        Liveness::Paused => "paused",
+        Liveness::Stopped if meta.collected => "collected",
         // Stopped on its own (or crashed) with work not yet fetched.
-        "exited"
+        Liveness::Stopped => "exited",
     }
 }
 
@@ -609,9 +663,9 @@ mod tests {
     use super::test_support::temp_root;
     #[cfg(target_os = "linux")]
     use super::test_support::{git, init_repo};
+    use super::{Liveness, age, is_valid_harness, render_list, state_label, tail_lines};
     #[cfg(target_os = "linux")]
-    use super::{RelayMode, RunArgs, diff, start, stop};
-    use super::{age, is_valid_harness, render_list, state_label, tail_lines};
+    use super::{RelayMode, RunArgs, diff, set_paused, start, stop};
 
     fn meta(name: &str, created_unix: u64, collected: bool) -> SandboxMeta {
         SandboxMeta {
@@ -631,13 +685,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ls_shows_state_age_and_repo() {
+    #[tokio::test]
+    async fn ls_shows_state_age_and_repo() {
         let store = Store::new(temp_root("ls"));
         store.create(&meta("calm-quilt", 100, false)).unwrap();
         store.create(&meta("bold-acorn", 50, true)).unwrap();
 
-        let out = render_list(&store, 400).unwrap();
+        let out = render_list(&store, 400).await.unwrap();
         assert_eq!(out.lines().count(), 3, "{out}");
         let mut lines = out.lines();
         assert!(lines.next().unwrap().starts_with("NAME"), "{out}");
@@ -656,13 +710,60 @@ mod tests {
     #[cfg(target_os = "linux")]
     /// A stand-in VMM: writes an untracked file into the guest's workspace image
     /// (as a sub-agent would), then waits to be stopped.
-    const FAKE_VMM: &str = r#"#!/bin/sh
-dir=$(dirname "$3")
-printf 'from the guest\n' > "$dir/guest.txt"
-debugfs -w -R "write $dir/guest.txt /repo/guest.txt" "$dir/workspace.img" >/dev/null 2>&1
-trap 'kill $! 2>/dev/null; exit 0' TERM
-sleep 300 &
-wait
+    const FAKE_VMM: &str = r#"#!/usr/bin/env python3
+import json, os, socket, socketserver, subprocess, sys, threading
+from http.server import BaseHTTPRequestHandler
+
+args = sys.argv[1:]
+api = args[args.index("--api-sock") + 1]
+d = os.path.dirname(args[args.index("--config-file") + 1])
+with open(f"{d}/guest.txt", "w") as f:
+    f.write("from the guest\n")
+subprocess.run(["debugfs", "-w", "-R", f"write {d}/guest.txt /repo/guest.txt",
+                f"{d}/workspace.img"], capture_output=True)
+state = {"s": "Running"}
+
+class Api(BaseHTTPRequestHandler):
+    def address_string(self):
+        return "vmm"
+    def log_message(self, *a):
+        pass
+    def reply(self, code, body=b""):
+        self.send_response(code)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def body(self):
+        return self.rfile.read(int(self.headers.get("Content-Length", 0))).decode()
+    def do_GET(self):
+        self.reply(200, json.dumps({"id": "x", "state": state["s"]}).encode())
+    def do_PATCH(self):
+        state["s"] = "Paused" if "Paused" in self.body() else "Running"
+        self.reply(204)
+    def do_PUT(self):
+        self.body()
+        self.reply(400, b'{"fault_message":"not supported"}')
+
+class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+
+threading.Thread(target=Server(api, Api).serve_forever, daemon=True).start()
+control = socket.socket(socket.AF_UNIX)
+control.bind(f"{d}/vsock.sock")
+control.listen()
+while True:
+    conn, _ = control.accept()
+    stream = conn.makefile("rwb")
+    # A paused guest can't answer its control port.
+    if stream.readline().strip() != b"CONNECT 1024" or state["s"] == "Paused":
+        conn.close()
+        continue
+    stream.write(b"OK 1073741824\n")
+    stream.flush()
+    if stream.readline().strip() == b"shutdown":
+        with open(f"{d}/clean-shutdown", "w") as f:
+            f.write("yes\n")
+        os._exit(0)
 "#;
 
     // Needs /proc, e2fsprogs and GNU `timeout`: Linux only, like the backend.
@@ -702,7 +803,19 @@ wait
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         assert!(Firecracker::is_running(&dir, &meta));
-        assert!(render_list(&store, now_unix()).unwrap().contains("running"));
+        assert!(
+            render_list(&store, now_unix())
+                .await
+                .unwrap()
+                .contains("running")
+        );
+        set_paused(&store, "calm-quilt", true).await.unwrap();
+        assert!(
+            render_list(&store, now_unix())
+                .await
+                .unwrap()
+                .contains("paused")
+        );
         assert!(!dir.join("stage").exists(), "staging copy must be removed");
 
         // Nothing pushed yet: a live diff says so.
@@ -744,7 +857,12 @@ wait
             &store.load("calm-quilt").unwrap()
         ));
 
+        // Stopping a paused guest resumes it, then asks it to power off.
         stop(&store, "calm-quilt").await.unwrap();
+        assert!(
+            dir.join("clean-shutdown").exists(),
+            "guest was not asked to shut down"
+        );
 
         let meta = store.load("calm-quilt").unwrap();
         assert!(meta.collected && meta.pid.is_none());
@@ -768,17 +886,32 @@ wait
         stop(&store, "calm-quilt").await.unwrap();
     }
 
-    #[test]
-    fn ls_with_no_sandboxes_says_how_to_start_one() {
+    #[tokio::test]
+    async fn ls_with_no_sandboxes_says_how_to_start_one() {
         let store = Store::new(temp_root("ls-empty"));
-        assert!(render_list(&store, 0).unwrap().contains("sandbox run"));
+        assert!(
+            render_list(&store, 0)
+                .await
+                .unwrap()
+                .contains("sandbox run")
+        );
     }
 
     #[test]
     fn state_prefers_running_then_collected() {
-        assert_eq!(state_label(&meta("a", 0, true), true), "running");
-        assert_eq!(state_label(&meta("a", 0, true), false), "collected");
-        assert_eq!(state_label(&meta("a", 0, false), false), "exited");
+        assert_eq!(
+            state_label(&meta("a", 0, true), Liveness::Running),
+            "running"
+        );
+        assert_eq!(state_label(&meta("a", 0, true), Liveness::Paused), "paused");
+        assert_eq!(
+            state_label(&meta("a", 0, true), Liveness::Stopped),
+            "collected"
+        );
+        assert_eq!(
+            state_label(&meta("a", 0, false), Liveness::Stopped),
+            "exited"
+        );
     }
 
     #[test]
