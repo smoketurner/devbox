@@ -228,6 +228,64 @@ pub(crate) async fn collect(
     })
 }
 
+/// Fetch what a running sandbox has pushed to its inbox onto `live_ref` in
+/// `repo`. Returns `false` when nothing has been pushed to `branch` yet.
+///
+/// The inbox is a bare repository the host created and only `receive-pack`
+/// writes to, so its config and hooks are the host's own; pushed objects were
+/// fsck-checked on the way in, and are checked again here.
+///
+/// # Errors
+///
+/// Returns an error if a git step fails.
+pub(crate) async fn fetch_live(
+    repo: &Path,
+    inbox: &Path,
+    branch: &str,
+    live_ref: &str,
+) -> Result<bool> {
+    let pushed = git_output(
+        inbox,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+        GIT_TIMEOUT,
+    )
+    .await
+    .is_ok();
+    if !pushed {
+        return Ok(false);
+    }
+    let source = inbox
+        .to_str()
+        .with_context(|| format!("inbox path {} is not UTF-8", inbox.display()))?;
+    run_git(
+        repo,
+        None,
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "protocol.file.allow=always",
+            "-c",
+            "fetch.fsckObjects=true",
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-write-fetch-head",
+            source,
+            &format!("+refs/heads/{branch}:{live_ref}"),
+        ],
+        GIT_TIMEOUT,
+    )
+    .await
+    .with_context(|| format!("fetch {branch} from the sandbox inbox"))?;
+    Ok(true)
+}
+
 /// Check `branch` out into a new linked worktree at `path`, so the claimant can
 /// open, build and test the sub-agent's work before merging it.
 ///

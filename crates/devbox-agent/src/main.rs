@@ -127,7 +127,9 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Command::Sandbox { command } => {
-            // Human-facing output on stdout, errors on stderr, like `doctor`.
+            // Human-facing output on stdout; warnings (and the relay's logs) on
+            // stderr via tracing; the final error on stderr, like `doctor`.
+            init_tracing();
             match sandbox::run(command).await {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {

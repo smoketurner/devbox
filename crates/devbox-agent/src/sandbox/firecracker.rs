@@ -30,6 +30,7 @@ use devbox_common::env_non_empty;
 use serde_json::{Value, json};
 use tokio::process::Command;
 
+use super::process::{cmdline_contains, terminate};
 use super::store::SandboxMeta;
 
 /// The Nitro Enclaves device the VMM drives.
@@ -56,7 +57,7 @@ const STOP_GRACE: Duration = Duration::from_secs(15);
 pub(crate) const CONSOLE_LOG: &str = "console.log";
 const IMAGE: &str = "workspace.img";
 const VM_CONFIG: &str = "vm.json";
-const VSOCK: &str = "vsock.sock";
+pub(crate) const VSOCK: &str = "vsock.sock";
 
 /// Where the VMM and guest image live on this host.
 #[derive(Debug, Clone)]
@@ -221,15 +222,8 @@ impl Firecracker {
 
     /// Whether the VMM for `meta` is still running.
     pub(crate) fn is_running(dir: &Path, meta: &SandboxMeta) -> bool {
-        let Some(pid) = meta.pid else {
-            return false;
-        };
-        // Match on the config path too, so a recycled pid isn't mistaken for ours.
-        std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| {
-            let needle = dir.join(VM_CONFIG);
-            let needle = needle.to_string_lossy();
-            String::from_utf8_lossy(&cmdline).contains(needle.as_ref())
-        })
+        meta.pid
+            .is_some_and(|pid| cmdline_contains(pid, &Self::needle(dir)))
     }
 
     /// Stop the VMM: SIGTERM, then SIGKILL after [`STOP_GRACE`].
@@ -241,29 +235,15 @@ impl Firecracker {
         let Some(pid) = meta.pid else {
             return Ok(());
         };
-        for (signal, wait) in [("-TERM", STOP_GRACE), ("-KILL", Duration::from_secs(5))] {
-            if !Self::is_running(dir, meta) {
-                return Ok(());
-            }
-            // Best effort: the process may exit between the check and the signal.
-            let _status = Command::new("kill")
-                .arg(signal)
-                .arg(pid.to_string())
-                .status()
-                .await;
-            let deadline = tokio::time::Instant::now()
-                .checked_add(wait)
-                .unwrap_or_else(tokio::time::Instant::now);
-            while Self::is_running(dir, meta) && tokio::time::Instant::now() < deadline {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        }
-        anyhow::ensure!(
-            !Self::is_running(dir, meta),
-            "sandbox {} (pid {pid}) did not stop",
-            meta.name
-        );
-        Ok(())
+        terminate(pid, &Self::needle(dir), STOP_GRACE)
+            .await
+            .with_context(|| format!("stop sandbox {}", meta.name))
+    }
+
+    /// The command-line fragment identifying this sandbox's VMM: its config path,
+    /// so a recycled pid isn't mistaken for ours.
+    fn needle(dir: &Path) -> String {
+        dir.join(VM_CONFIG).to_string_lossy().into_owned()
     }
 
     /// Copy the guest's repository out of the workspace image into `dest`.
@@ -403,6 +383,7 @@ mod tests {
             memory_mib: 4096,
             pid: None,
             collected: false,
+            relay_pid: None,
             worktree: None,
         }
     }

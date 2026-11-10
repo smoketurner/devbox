@@ -197,7 +197,7 @@ in-memory SQLite.
 | Shared types | `crates/devbox-common/src/lib.rs` |
 | CLI (incl. `ssh` over SSM) | `crates/devbox-cli/src/main.rs` (Clap definitions), `crates/devbox-cli/src/command.rs` (handlers), `crates/devbox-cli/src/ssh.rs`, `crates/devbox-cli/src/ssm.rs` (native data channel) |
 | On-host agent (principals / owner-sync / warmup / checkout) | `crates/devbox-agent/src/` |
-| Sub-agent sandboxes (`devbox-agent sandbox`) | `crates/devbox-agent/src/sandbox/` (`workspace.rs` = clone + hostile-repo collect, `firecracker.rs` = Nitro Sandbox VMM backend) |
+| Sub-agent sandboxes (`devbox-agent sandbox`) | `crates/devbox-agent/src/sandbox/` (`workspace.rs` = clone + hostile-repo collect, `firecracker.rs` = Nitro Sandbox VMM backend, `relay.rs` = host side of the guest's vsock ports) |
 | Server entry / config / shutdown | `crates/devbox-server/src/main.rs` |
 | HTTP routes | `crates/devbox-server/src/routes.rs`, `crates/devbox-server/src/service.rs` (domain logic) |
 | Dashboard UI | `crates/devbox-server/src/ui.rs` |
@@ -350,11 +350,13 @@ are tagged inline):
 - **Sub-agent sandboxes (smoketurner/devbox#164)** — `devbox-agent sandbox
   run|ls|logs|diff|stop` is built: per-sub-agent clone on `agent/<name>`, ext4
   workspace image, Firecracker config in Nitro Sandbox direct mode with no NIC
-  (vsock only), and a collect step that treats the guest repo as hostile. Still
-  missing: the guest image + init, the host vsock relay to the egress proxy and
-  a model-credential proxy, `attach`, and the AMI bake (Firecracker + guest
-  image; infra side is `nitro_sandboxes_enabled`, devbox-infra#30). Until then
-  `run` stops at its preflight.
+  (vsock only), a collect step that treats the guest repo as hostile, and a
+  per-sandbox vsock relay (`sandbox/relay.rs`: egress proxy pipe, model API
+  forwarding to the control plane's `/egress/*` with the box token, `git push`
+  inbox for live `diff`). Still missing: the guest image + init, `attach`, and
+  the AMI bake (Firecracker + guest image; infra side is
+  `nitro_sandboxes_enabled`, devbox-infra#30). Until then `run` stops at its
+  preflight.
 - **Principal ↔ Unix-username alignment (operational)** — Server-side validation
   now rejects a non-Unix-safe `owner` at claim time (see "Owner validation"
   above), but the Vouch config must still be set so `AUTH_PRINCIPAL_CLAIM` emits a

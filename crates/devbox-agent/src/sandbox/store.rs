@@ -55,6 +55,9 @@ pub(crate) struct SandboxMeta {
     pub(crate) pid: Option<u32>,
     /// Whether the guest's commits have been fetched onto `branch`.
     pub(crate) collected: bool,
+    /// Relay process id while launched (see `relay`).
+    #[serde(default)]
+    pub(crate) relay_pid: Option<u32>,
     /// Review checkout of `branch` on the host, once collected.
     #[serde(default)]
     pub(crate) worktree: Option<PathBuf>,
@@ -185,6 +188,11 @@ impl Store {
         });
         Ok(metas)
     }
+
+    /// The store root.
+    pub(crate) fn root(&self) -> &std::path::Path {
+        &self.root
+    }
 }
 
 /// Seconds since the Unix epoch (0 if the clock is before it).
@@ -216,6 +224,7 @@ mod tests {
             memory_mib: 4096,
             pid: None,
             collected: false,
+            relay_pid: None,
             worktree: None,
         }
     }

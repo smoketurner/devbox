@@ -185,8 +185,20 @@ How it works:
   `<sandbox dir>/worktree` so you can open, build and test it. That checkout
   holds the committed contents of the fetched branch only, never the guest's
   files directly.
+- The guest has no network device. A relay process (`sandbox relay`, started
+  by `run` before the guest boots) serves its vsock ports. Port 3128 is an opaque
+  pipe to the box's egress proxy (`HTTPS_PROXY`, or `DEVBOX_SANDBOX_EGRESS_PROXY`),
+  so the proxy's policy applies. Port 8080 forwards model API calls
+  (`/<integration>/<path>`) to the control plane's credential-injecting
+  `/egress/<integration>/<path>`: guest credential headers are dropped, and the
+  box's web-identity token is added. Port 9418 runs `git receive-pack` into the
+  sandbox's own bare `inbox.git`, so `diff` on a running sandbox shows what it
+  has pushed so far (fetched onto `refs/sandbox/<name>/live`). An upstream the box
+  isn't configured for (no proxy, no `DEVBOX_SERVER_URL`) leaves its port unbound,
+  so the guest's connection is refused. No credential enters the guest. The
+  relay exits once the VMM is gone, and `stop` also stops it.
 - State lives in `/workspace/.sandboxes/<name>/` (`DEVBOX_SANDBOX_DIR` to
-  override): `meta.json`, `console.log`, and the image until it is collected.
+  override): `meta.json`, `console.log`, `relay.log`, `inbox.git`, the vsock sockets, and the image until it is collected. Socket paths must fit in 107 bytes, which `run` checks.
 
 Host requirements, checked before anything is created, with a message naming
 the fix: `/dev/nitro_enclaves` (pool `nitro_sandboxes_enabled` in devbox-infra),
@@ -195,8 +207,8 @@ write access to it (the `ne` group), and the VMM and guest image
 defaults `firecracker` on `PATH` and `/opt/devbox/sandbox/{vmlinux,rootfs.ext4}`).
 
 Not built yet (smoketurner/devbox#164): the guest image and its init (mount the
-workspace, run the harness, commit, power off), the host-side vsock relay to
-the egress proxy and model-credential proxy, `attach`, and the AMI bake of
+workspace, map the vsock ports to loopback, run the harness, push and commit,
+power off), `attach`, and the AMI bake of
 Firecracker plus the guest image. Until those land, `run` stops at the preflight
 on every host.
 

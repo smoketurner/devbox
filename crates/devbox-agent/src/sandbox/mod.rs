@@ -17,9 +17,12 @@
 //! control plane.
 
 mod firecracker;
+mod process;
+mod relay;
 mod store;
 mod workspace;
 
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -60,7 +63,27 @@ pub(crate) enum SandboxCommand {
         /// Sandbox name.
         name: String,
     },
+    /// Serve a sandbox's vsock channel (started by `run`; not for direct use).
+    #[command(hide = true)]
+    Relay {
+        /// Sandbox name.
+        name: String,
+        /// The store the sandbox lives in.
+        #[arg(long)]
+        store: PathBuf,
+    },
 }
+
+/// Whether `run` starts the relay process (tests drive the relay in-process).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RelayMode {
+    Spawn,
+    #[cfg(test)]
+    Skip,
+}
+
+/// Log file of a sandbox's relay process.
+const RELAY_LOG: &str = "relay.log";
 
 /// Arguments for `devbox-agent sandbox run`.
 #[derive(Args)]
@@ -96,7 +119,7 @@ pub(crate) async fn run(command: SandboxCommand) -> Result<()> {
     let store = Store::from_env();
     let fc = Firecracker::from_env();
     match command {
-        SandboxCommand::Run(args) => start(&store, &fc, args).await,
+        SandboxCommand::Run(args) => start(&store, &fc, args, RelayMode::Spawn).await,
         SandboxCommand::Ls => {
             print!("{}", render_list(&store, now_unix())?);
             Ok(())
@@ -104,6 +127,7 @@ pub(crate) async fn run(command: SandboxCommand) -> Result<()> {
         SandboxCommand::Logs { name, follow } => logs(&store, &name, follow).await,
         SandboxCommand::Diff { name, stat } => diff(&store, &name, stat).await,
         SandboxCommand::Stop { name } => stop(&store, &name).await,
+        SandboxCommand::Relay { name, store: root } => relay::run(&Store::new(root), &name).await,
     }
 }
 
@@ -118,7 +142,12 @@ fn tail_lines(text: &str, n: usize) -> String {
 }
 
 /// `sandbox run`.
-async fn start(store: &Store, fc: &Firecracker, args: RunArgs) -> Result<()> {
+async fn start(
+    store: &Store,
+    fc: &Firecracker,
+    args: RunArgs,
+    relay_mode: RelayMode,
+) -> Result<()> {
     fc.preflight()?;
     anyhow::ensure!(
         is_valid_harness(&args.harness),
@@ -135,6 +164,7 @@ async fn start(store: &Store, fc: &Firecracker, args: RunArgs) -> Result<()> {
         Some(name) => name,
         None => store.fresh_name()?,
     };
+    relay::check_socket_path(&store.dir(&name)?)?;
     let mut meta = SandboxMeta {
         branch: format!("agent/{name}"),
         name,
@@ -147,13 +177,14 @@ async fn start(store: &Store, fc: &Firecracker, args: RunArgs) -> Result<()> {
         memory_mib: args.memory_mib,
         pid: None,
         collected: false,
+        relay_pid: None,
         worktree: None,
     };
     let dir = store.create(&meta)?;
 
-    let launched = launch(fc, &dir, &meta, args.disk_gib).await;
-    let pid = match launched {
-        Ok(pid) => pid,
+    let launched = launch(store, fc, &dir, &meta, args.disk_gib, relay_mode).await;
+    let (pid, relay_pid) = match launched {
+        Ok(pids) => pids,
         Err(e) => {
             // Free the name; a sandbox that never started has nothing to keep.
             std::fs::remove_dir_all(&dir).ok();
@@ -161,6 +192,7 @@ async fn start(store: &Store, fc: &Firecracker, args: RunArgs) -> Result<()> {
         }
     };
     meta.pid = Some(pid);
+    meta.relay_pid = relay_pid;
     store.save(&meta)?;
 
     // A VMM that rejects its config or the device exits at once; say so here
@@ -187,8 +219,16 @@ async fn start(store: &Store, fc: &Firecracker, args: RunArgs) -> Result<()> {
     Ok(())
 }
 
-/// Stage the clone and task, then boot the guest. Returns the VMM pid.
-async fn launch(fc: &Firecracker, dir: &Path, meta: &SandboxMeta, disk_gib: u32) -> Result<u32> {
+/// Stage the clone and task, start the relay, then boot the guest. Returns the
+/// VMM and relay pids. Nothing is left running if it fails.
+async fn launch(
+    store: &Store,
+    fc: &Firecracker,
+    dir: &Path,
+    meta: &SandboxMeta,
+    disk_gib: u32,
+    relay_mode: RelayMode,
+) -> Result<(u32, Option<u32>)> {
     let stage = dir.join("stage");
     workspace::prepare_clone(
         &meta.repo,
@@ -203,16 +243,79 @@ async fn launch(fc: &Firecracker, dir: &Path, meta: &SandboxMeta, disk_gib: u32)
         "prompt": meta.prompt,
         "branch": meta.branch,
         "base_commit": meta.base_commit,
+        // Host vsock ports the guest image maps to loopback (see `relay`).
+        "vsock": {
+            "egress_port": relay::EGRESS_PORT,
+            "model_port": relay::MODEL_PORT,
+            "git_port": relay::GIT_PORT,
+        },
     });
     std::fs::write(
         stage.join("task.json"),
         serde_json::to_vec_pretty(&task).context("serialize task")?,
     )
     .context("write task.json")?;
+    relay::init_inbox(dir).await?;
 
-    let pid = fc.launch(dir, meta, &stage, disk_gib).await?;
+    // The relay listens before the guest boots, so its first connection lands.
+    let relay_pid = match relay_mode {
+        RelayMode::Spawn => Some(spawn_relay(store, dir, &meta.name).await?),
+        #[cfg(test)]
+        RelayMode::Skip => None,
+    };
+    let pid = match fc.launch(dir, meta, &stage, disk_gib).await {
+        Ok(pid) => pid,
+        Err(e) => {
+            if let Some(relay_pid) = relay_pid {
+                let needle = relay::needle(store.root(), &meta.name);
+                process::terminate(relay_pid, &needle, RELAY_GRACE)
+                    .await
+                    .ok();
+            }
+            return Err(e);
+        }
+    };
     std::fs::remove_dir_all(&stage).ok();
-    Ok(pid)
+    Ok((pid, relay_pid))
+}
+
+/// How long a relay gets to exit on SIGTERM.
+const RELAY_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Start `devbox-agent sandbox relay <name>` detached and wait until it listens.
+async fn spawn_relay(store: &Store, dir: &Path, name: &str) -> Result<u32> {
+    let exe = std::env::current_exe().context("locate the devbox-agent binary")?;
+    let log_path = dir.join(RELAY_LOG);
+    let log = std::fs::File::create(&log_path)
+        .with_context(|| format!("create {}", log_path.display()))?;
+    let log_err = log.try_clone().context("duplicate relay log handle")?;
+    // Its own process group, like the VMM, so it outlives this command.
+    let child = std::process::Command::new(exe)
+        .args(["sandbox", "relay", name, "--store"])
+        .arg(store.root())
+        .stdin(Stdio::null())
+        .stdout(log)
+        .stderr(log_err)
+        .process_group(0)
+        .spawn()
+        .context("start the sandbox relay")?;
+    let pid = child.id();
+
+    let ready = relay::socket_path(dir, relay::GIT_PORT);
+    for _ in 0..50 {
+        if ready.exists() {
+            return Ok(pid);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    process::terminate(pid, &relay::needle(store.root(), name), RELAY_GRACE)
+        .await
+        .ok();
+    let output = std::fs::read_to_string(&log_path).unwrap_or_default();
+    anyhow::bail!(
+        "the sandbox relay did not start; its output:\n{}",
+        tail_lines(&output, 20)
+    )
 }
 
 /// `sandbox stop`.
@@ -220,6 +323,14 @@ async fn stop(store: &Store, name: &str) -> Result<()> {
     let meta = store.load(name)?;
     let dir = store.dir(name)?;
     Firecracker::stop(&dir, &meta).await?;
+    if let Some(relay_pid) = meta.relay_pid {
+        // The relay also exits by itself once the VMM is gone; this is prompter.
+        if let Err(e) =
+            process::terminate(relay_pid, &relay::needle(store.root(), name), RELAY_GRACE).await
+        {
+            eprintln!("warning: {e:#}");
+        }
+    }
     collect_and_report(store, meta).await
 }
 
@@ -250,6 +361,7 @@ async fn collect_and_report(store: &Store, mut meta: SandboxMeta) -> Result<()> 
     Firecracker::discard_image(&dir)?;
     meta.collected = true;
     meta.pid = None;
+    meta.relay_pid = None;
     if collected.commits > 0 {
         // Best effort: the branch is safe in the repo whether or not this works.
         let tree = dir.join("worktree");
@@ -280,17 +392,30 @@ async fn collect_and_report(store: &Store, mut meta: SandboxMeta) -> Result<()> 
 }
 
 /// `sandbox diff`.
+///
+/// While the sandbox runs, shows what it has pushed to its inbox so far; once
+/// it has stopped, collects (if needed) and shows the final branch.
 async fn diff(store: &Store, name: &str, stat: bool) -> Result<()> {
     let meta = store.load(name)?;
-    if !meta.collected {
-        let dir = store.dir(name)?;
+    let dir = store.dir(name)?;
+    let target = if !meta.collected && Firecracker::is_running(&dir, &meta) {
+        let live = format!("refs/sandbox/{name}/live");
+        let pushed =
+            workspace::fetch_live(&meta.repo, &dir.join(relay::INBOX), &meta.branch, &live).await?;
         anyhow::ensure!(
-            !Firecracker::is_running(&dir, &meta),
-            "sandbox {name} is still running; `devbox-agent sandbox stop {name}` collects its work"
+            pushed,
+            "sandbox {name} is running and hasn't pushed anything yet; \
+             `devbox-agent sandbox stop {name}` collects its work"
         );
-        collect_and_report(store, meta.clone()).await?;
-    }
-    let range = format!("{}...{}", meta.base_commit, meta.branch);
+        eprintln!("{name} is still running; showing the commits it has pushed so far");
+        live
+    } else {
+        if !meta.collected {
+            collect_and_report(store, meta.clone()).await?;
+        }
+        meta.branch.clone()
+    };
+    let range = format!("{}...{target}", meta.base_commit);
     let mut cmd = tokio::process::Command::new("git");
     cmd.arg("-C").arg(&meta.repo).arg("diff");
     if stat {
@@ -485,7 +610,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     use super::test_support::{git, init_repo};
     #[cfg(target_os = "linux")]
-    use super::{RunArgs, start, stop};
+    use super::{RelayMode, RunArgs, diff, start, stop};
     use super::{age, is_valid_harness, render_list, state_label, tail_lines};
 
     fn meta(name: &str, created_unix: u64, collected: bool) -> SandboxMeta {
@@ -501,6 +626,7 @@ mod tests {
             memory_mib: 4096,
             pid: None,
             collected,
+            relay_pid: None,
             worktree: None,
         }
     }
@@ -563,7 +689,7 @@ wait
             memory_mib: 4096,
             disk_gib: 1,
         };
-        start(&store, &fc, args).await.unwrap();
+        start(&store, &fc, args, RelayMode::Skip).await.unwrap();
 
         let meta = store.load("calm-quilt").unwrap();
         assert_eq!(meta.prompt, "add a test");
@@ -578,6 +704,45 @@ wait
         assert!(Firecracker::is_running(&dir, &meta));
         assert!(render_list(&store, now_unix()).unwrap().contains("running"));
         assert!(!dir.join("stage").exists(), "staging copy must be removed");
+
+        // Nothing pushed yet: a live diff says so.
+        let err = diff(&store, "calm-quilt", true).await.unwrap_err();
+        assert!(format!("{err:#}").contains("hasn't pushed"), "{err:#}");
+        // The guest pushes a commit to its inbox (as it would over vsock): a
+        // live diff now fetches it, without stopping the sandbox.
+        let pusher = root.join("pusher");
+        git(
+            &root,
+            &[
+                "clone",
+                "--quiet",
+                &repo.to_string_lossy(),
+                &pusher.to_string_lossy(),
+            ],
+        );
+        std::fs::write(pusher.join("progress.txt"), "halfway\n").unwrap();
+        git(&pusher, &["add", "progress.txt"]);
+        git(&pusher, &["commit", "--quiet", "-m", "progress"]);
+        let inbox = dir.join("inbox.git");
+        git(
+            &pusher,
+            &[
+                "push",
+                "--quiet",
+                &inbox.to_string_lossy(),
+                "HEAD:refs/heads/agent/calm-quilt",
+            ],
+        );
+        diff(&store, "calm-quilt", true).await.unwrap();
+        let live = git(
+            &repo,
+            &["ls-tree", "--name-only", "refs/sandbox/calm-quilt/live"],
+        );
+        assert!(live.contains("progress.txt"), "{live}");
+        assert!(Firecracker::is_running(
+            &dir,
+            &store.load("calm-quilt").unwrap()
+        ));
 
         stop(&store, "calm-quilt").await.unwrap();
 
@@ -648,9 +813,14 @@ wait
             memory_mib: 512,
             disk_gib: 1,
         };
-        let err = start(&store, &Firecracker::rooted_at(&root), args)
-            .await
-            .unwrap_err();
+        let err = start(
+            &store,
+            &Firecracker::rooted_at(&root),
+            args,
+            RelayMode::Skip,
+        )
+        .await
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("exited while booting") && msg.contains("rejected the VM"),
