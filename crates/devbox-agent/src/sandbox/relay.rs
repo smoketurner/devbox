@@ -2,8 +2,8 @@
 //!
 //! The guest has no network device. Its only way out is vsock: when the guest
 //! connects to the host (CID 2) on port N, Firecracker hands the connection to
-//! the Unix socket `<sandbox dir>/vsock.sock_N`. This relay, started by
-//! `sandbox run` next to the VMM, listens on those sockets. Each port has one
+//! the Unix socket `<chroot>/vsock.sock_N`. This relay, run by the sandbox
+//! daemon for each sandbox, listens on those sockets. Each port has one
 //! fixed meaning:
 //!
 //! | Port | The guest uses it for | The relay connects it to |
@@ -19,13 +19,15 @@
 //! (no `HTTPS_PROXY`, no `DEVBOX_SERVER_URL`) isn't bound, so the guest's
 //! connection is refused instead of silently going somewhere else.
 //!
-//! The relay exits by itself once the VMM is gone or the sandbox is collected.
+//! The root daemon ([`super::daemon`]) runs one relay per sandbox, as tasks,
+//! from just before the VMM boots until it is gone.
 
 use std::convert::Infallible;
 use std::future::Future;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use devbox_common::env_non_empty;
@@ -42,8 +44,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UnixListener, UnixStream};
 use tokio::process::Command;
 
-use super::firecracker::{Firecracker, VSOCK};
-use super::store::Store;
+use super::firecracker::VSOCK;
 use crate::control_plane::ControlPlaneClient;
 
 /// Guest port for outbound HTTPS through the egress proxy.
@@ -63,9 +64,6 @@ const MAX_REQUEST_BODY: usize = 33_554_432;
 
 /// How often the relay checks whether its sandbox is gone.
 const WATCH_INTERVAL: Duration = Duration::from_millis(500);
-
-/// How long the relay waits for `run` to record the VMM before giving up.
-const STARTUP_GRACE: Duration = Duration::from_mins(1);
 
 /// Time budget for one `git push`.
 const PUSH_TIMEOUT: Duration = Duration::from_mins(10);
@@ -132,12 +130,6 @@ pub(crate) fn check_socket_path(dir: &Path) -> Result<()> {
         longest.display()
     );
     Ok(())
-}
-
-/// The command-line fragment identifying the relay for sandbox `name` in
-/// `store` (used to find and stop it by pid).
-pub(crate) fn needle(store: &Path, name: &str) -> String {
-    format!("relay\0{name}\0--store\0{}", store.display())
 }
 
 /// Create the empty bare repository the guest pushes into.
@@ -224,25 +216,18 @@ impl ModelUpstream {
     }
 }
 
-/// The relay for one sandbox directory.
-pub(crate) struct Relay {
-    dir: PathBuf,
-    egress: Option<String>,
-    model: Option<Arc<ModelUpstream>>,
+/// The relay's upstreams, shared by every sandbox on the box.
+#[derive(Clone, Default)]
+pub(crate) struct Upstreams {
+    /// `host:port` of the egress proxy.
+    pub(crate) egress: Option<String>,
+    /// The control plane's model API proxy.
+    pub(crate) model: Option<Arc<ModelUpstream>>,
 }
 
-impl Relay {
-    /// A relay for `dir` with explicit upstreams (none means that port is unbound).
-    pub(crate) fn new(dir: PathBuf, egress: Option<String>, model: Option<ModelUpstream>) -> Self {
-        Self {
-            dir,
-            egress,
-            model: model.map(Arc::new),
-        }
-    }
-
-    /// A relay for `dir` with the upstreams this box is configured for.
-    pub(crate) async fn from_env(dir: PathBuf) -> Self {
+impl Upstreams {
+    /// The upstreams this box is configured for.
+    pub(crate) async fn from_env() -> Self {
         let egress = [EGRESS_ENV, "HTTPS_PROXY", "https_proxy"]
             .into_iter()
             .find_map(env_non_empty)
@@ -262,6 +247,7 @@ impl Relay {
                 ModelUpstream::new(&base, Auth::ControlPlane(tokio::sync::Mutex::new(client)))
                     .map_err(|e| tracing::warn!(error = %format!("{e:#}"), "model port disabled"))
                     .ok()
+                    .map(Arc::new)
             }
             Ok(None) => None,
             Err(e) => {
@@ -270,82 +256,95 @@ impl Relay {
             }
         };
         if egress.is_none() {
-            tracing::warn!("no egress proxy configured; the guest has no outbound HTTPS");
+            tracing::warn!("no egress proxy configured; guests have no outbound HTTPS");
         }
         if model.is_none() {
-            tracing::warn!("DEVBOX_SERVER_URL not set; the guest has no model API access");
+            tracing::warn!("DEVBOX_SERVER_URL not set; guests have no model API access");
         }
-        Self::new(dir, egress, model)
+        Self { egress, model }
+    }
+}
+
+/// The relay for one sandbox.
+pub(crate) struct Relay {
+    /// Where the vsock sockets live (the VMM's chroot).
+    vm_dir: PathBuf,
+    /// The sandbox's bare repository for pushes.
+    inbox: PathBuf,
+    /// The claimant's uid and gid, which `receive-pack` runs as.
+    owner: (u32, u32),
+    upstreams: Upstreams,
+}
+
+/// A relay whose sockets are bound and whose accept loops are running.
+pub(crate) struct Listening {
+    tasks: tokio::task::JoinSet<()>,
+    bound: Vec<PathBuf>,
+}
+
+impl Relay {
+    /// A relay serving sockets in `vm_dir`, pushing into `inbox` as `owner`.
+    pub(crate) fn new(
+        vm_dir: PathBuf,
+        inbox: PathBuf,
+        owner: (u32, u32),
+        upstreams: Upstreams,
+    ) -> Self {
+        Self {
+            vm_dir,
+            inbox,
+            owner,
+            upstreams,
+        }
     }
 
-    /// Listen on the sandbox's vsock sockets until `should_stop` says so.
+    /// Bind the sandbox's vsock sockets and start accepting. Ports without a
+    /// configured upstream are left unbound.
     ///
     /// # Errors
     ///
     /// Returns an error if a socket can't be bound.
-    pub(crate) async fn serve(self, should_stop: impl Fn() -> bool) -> Result<()> {
+    pub(crate) fn listen(self) -> Result<Listening> {
         let mut tasks = tokio::task::JoinSet::new();
         let mut bound = Vec::new();
 
-        if let Some(proxy) = self.egress {
-            let (listener, path) = bind(&self.dir, EGRESS_PORT)?;
+        if let Some(proxy) = self.upstreams.egress {
+            let (listener, path) = bind(&self.vm_dir, EGRESS_PORT)?;
             bound.push(path);
             tasks.spawn(accept_loop(listener, "egress", move |guest| {
                 pipe_egress(guest, proxy.clone())
             }));
         }
-        if let Some(upstream) = self.model {
-            let (listener, path) = bind(&self.dir, MODEL_PORT)?;
+        if let Some(upstream) = self.upstreams.model {
+            let (listener, path) = bind(&self.vm_dir, MODEL_PORT)?;
             bound.push(path);
             tasks.spawn(accept_loop(listener, "model", move |guest| {
                 serve_model(guest, Arc::clone(&upstream))
             }));
         }
-        let inbox = self.dir.join(INBOX);
-        let (listener, path) = bind(&self.dir, GIT_PORT)?;
+        let (inbox, owner) = (self.inbox, self.owner);
+        let (listener, path) = bind(&self.vm_dir, GIT_PORT)?;
         bound.push(path);
         tasks.spawn(accept_loop(listener, "git", move |guest| {
-            receive_pack(guest, inbox.clone())
+            receive_pack(guest, inbox.clone(), owner)
         }));
+        Ok(Listening { tasks, bound })
+    }
+}
 
-        while !should_stop() {
+impl Listening {
+    /// Serve until `should_stop` says so, then close the sockets.
+    pub(crate) async fn run_until(mut self, should_stop: impl Fn() -> bool) {
+        loop {
             tokio::time::sleep(WATCH_INTERVAL).await;
+            if should_stop() {
+                break;
+            }
         }
-        tasks.abort_all();
-        for path in bound {
+        self.tasks.abort_all();
+        for path in self.bound {
             std::fs::remove_file(&path).ok();
         }
-        Ok(())
-    }
-}
-
-/// `devbox-agent sandbox relay <name>`: serve until the sandbox is gone.
-///
-/// # Errors
-///
-/// Returns an error if the sandbox is unknown or a socket can't be bound.
-pub(crate) async fn run(store: &Store, name: &str) -> Result<()> {
-    let dir = store.dir(name)?;
-    store.load(name)?;
-    let relay = Relay::from_env(dir.clone()).await;
-    let started = Instant::now();
-    relay
-        .serve(|| sandbox_gone(store, name, &dir, started))
-        .await
-}
-
-/// Whether the relay for `name` should exit: the record is gone or collected,
-/// the VMM has exited, or `run` never recorded a VMM.
-fn sandbox_gone(store: &Store, name: &str, dir: &Path, started: Instant) -> bool {
-    let Ok(meta) = store.load(name) else {
-        return true;
-    };
-    if meta.collected {
-        return true;
-    }
-    match meta.pid {
-        Some(_) => !Firecracker::is_running(dir, &meta),
-        None => started.elapsed() > STARTUP_GRACE,
     }
 }
 
@@ -354,6 +353,10 @@ fn bind(dir: &Path, port: u32) -> Result<(UnixListener, PathBuf)> {
     let path = socket_path(dir, port);
     std::fs::remove_file(&path).ok();
     let listener = UnixListener::bind(&path).with_context(|| format!("bind {}", path.display()))?;
+    // The jailed VMM connects as its own uid; the chroot already confines who
+    // can reach the socket at all.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
+        .with_context(|| format!("open up {}", path.display()))?;
     Ok((listener, path))
 }
 
@@ -393,10 +396,17 @@ async fn pipe_egress(mut guest: UnixStream, proxy: String) -> Result<()> {
 }
 
 /// Run `git receive-pack` on the inbox with the guest connection as its stdio.
-async fn receive_pack(guest: UnixStream, inbox: PathBuf) -> Result<()> {
+///
+/// It runs as the claimant (`owner`), who owns the inbox, with no global or
+/// system git config: only the inbox's own, host-written config applies.
+async fn receive_pack(guest: UnixStream, inbox: PathBuf, owner: (u32, u32)) -> Result<()> {
     let mut child = Command::new("git")
         .args(["-c", "core.hooksPath=/dev/null", "receive-pack"])
         .arg(&inbox)
+        .uid(owner.0)
+        .gid(owner.1)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -625,7 +635,6 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
 
     use http_body_util::{BodyExt, Full};
     use hyper::body::{Bytes, Incoming};
@@ -637,23 +646,23 @@ mod tests {
     use tokio::net::{TcpListener, UnixStream};
 
     use super::{
-        Auth, EGRESS_PORT, GIT_PORT, INBOX, MODEL_PORT, ModelUpstream, Relay, init_inbox,
-        socket_path,
+        Auth, EGRESS_PORT, GIT_PORT, INBOX, MODEL_PORT, ModelUpstream, Relay, Upstreams,
+        init_inbox, socket_path,
     };
+    use crate::sandbox::jail::owner_of;
     use crate::sandbox::test_support::{git, init_repo, temp_root};
 
-    /// Start `relay` in the background; the returned flag stops it.
-    async fn start(relay: Relay, dir: &Path, port: u32) -> Arc<AtomicBool> {
+    /// Start a relay for `dir` (sockets and inbox both there) with `upstreams`
+    /// in the background; the returned flag stops it.
+    async fn start(dir: &Path, upstreams: Upstreams, port: u32) -> Arc<AtomicBool> {
+        let owner = owner_of(dir).unwrap();
+        let listening = Relay::new(dir.to_path_buf(), dir.join(INBOX), owner, upstreams)
+            .listen()
+            .unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
-        tokio::spawn(async move { relay.serve(|| flag.load(Ordering::Relaxed)).await });
-        let socket = socket_path(dir, port);
-        for _ in 0..100 {
-            if socket.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        tokio::spawn(async move { listening.run_until(|| flag.load(Ordering::Relaxed)).await });
+        assert!(socket_path(dir, port).exists());
         stop
     }
 
@@ -670,12 +679,11 @@ mod tests {
             conn.write_all(buf.get(..n).unwrap()).await.unwrap();
         });
 
-        let stop = start(
-            Relay::new(dir.clone(), Some(proxy_addr), None),
-            &dir,
-            EGRESS_PORT,
-        )
-        .await;
+        let upstreams = Upstreams {
+            egress: Some(proxy_addr),
+            model: None,
+        };
+        let stop = start(&dir, upstreams, EGRESS_PORT).await;
         let mut guest = UnixStream::connect(socket_path(&dir, EGRESS_PORT))
             .await
             .unwrap();
@@ -729,7 +737,11 @@ mod tests {
         });
 
         let model = ModelUpstream::new(&base, Auth::Fixed("box-token".to_owned())).unwrap();
-        let stop = start(Relay::new(dir.clone(), None, Some(model)), &dir, MODEL_PORT).await;
+        let upstreams = Upstreams {
+            egress: None,
+            model: Some(Arc::new(model)),
+        };
+        let stop = start(&dir, upstreams, MODEL_PORT).await;
 
         let mut guest = UnixStream::connect(socket_path(&dir, MODEL_PORT))
             .await
@@ -792,7 +804,7 @@ while True:
         let dir = root.join("sandbox");
         std::fs::create_dir_all(&dir).unwrap();
         init_inbox(&dir).await.unwrap();
-        let stop = start(Relay::new(dir.clone(), None, None), &dir, GIT_PORT).await;
+        let stop = start(&dir, Upstreams::default(), GIT_PORT).await;
 
         let guest = init_repo(&root.join("guest"));
         let bridge = root.join("bridge.py");

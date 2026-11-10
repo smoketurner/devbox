@@ -1,46 +1,28 @@
-//! Nitro Sandbox backend: Firecracker booting a child VM through the Nitro
-//! Enclaves driver.
+//! The Nitro Sandbox VM itself: its Firecracker configuration, stopping it, and
+//! the workspace image that carries the guest's repository.
 //!
-//! The sandbox's working copy travels as an ext4 image built with
-//! `mkfs.ext4 -d` (no root or loop mount needed) and attached as the guest's
-//! second drive. After the guest stops, the repository is copied back out with
-//! `debugfs rdump`, again without mounting anything on the host.
+//! Firecracker boots a Nitro Sandbox (a child VM created through the Nitro
+//! Enclaves driver) from a config file whose paths are inside the jail's chroot
+//! (see [`super::jail`]). The guest has no network device; its only channel to
+//! the host is vsock (see [`super::relay`]).
 //!
-//! The guest has no network device. Its only channel to the host is a vsock
-//! device whose host side is a Unix socket in the sandbox directory, so every
-//! byte the guest sends out has to pass through something the host runs.
-//!
-//! Host requirements, checked by [`Firecracker::preflight`]:
-//!
-//! - `/dev/nitro_enclaves`, present only when the pool launches hosts with
-//!   enclave options (`nitro_sandboxes_enabled` in the devbox-infra pool module);
-//! - write access to it (the `ne` group);
-//! - a sandbox-capable `firecracker`, the guest kernel and the guest root
-//!   filesystem (`DEVBOX_SANDBOX_FIRECRACKER`, `DEVBOX_SANDBOX_KERNEL`,
-//!   `DEVBOX_SANDBOX_ROOTFS`).
+//! The working copy travels as an ext4 image built with `mkfs.ext4 -d` (no root
+//! or loop mount needed) and attached as the guest's second drive. After the
+//! guest stops, the repository is copied back out with `debugfs rdump`, again
+//! without mounting anything on the host.
 
-use std::fs::OpenOptions;
-use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use devbox_common::env_non_empty;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::process::Command;
 
-use super::api::{self, API_SOCKET, VmState};
+use super::api::{self, VmState};
 use super::process::{cmdline_contains, terminate, wait_exit};
 use super::store::SandboxMeta;
-
-/// The Nitro Enclaves device the VMM drives.
-const ENCLAVE_DEVICE: &str = "/dev/nitro_enclaves";
-
-/// Default locations of the VMM and guest image in the AMI.
-const DEFAULT_FIRECRACKER: &str = "firecracker";
-const DEFAULT_KERNEL: &str = "/opt/devbox/sandbox/vmlinux";
-const DEFAULT_ROOTFS: &str = "/opt/devbox/sandbox/rootfs.ext4";
 
 /// Guest vsock context id (2 is the host; 3 is the first guest id).
 const GUEST_CID: u32 = 3;
@@ -57,8 +39,15 @@ const STOP_GRACE: Duration = Duration::from_secs(15);
 /// How long a VMM gets between SIGTERM and SIGKILL.
 const KILL_GRACE: Duration = Duration::from_secs(5);
 
-/// How [`Firecracker::stop`] ended the VMM.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Files in a sandbox directory (and, for the image and config, the chroot).
+pub(crate) const CONSOLE_LOG: &str = "console.log";
+pub(crate) const IMAGE: &str = "workspace.img";
+pub(crate) const VM_CONFIG: &str = "vm.json";
+pub(crate) const VSOCK: &str = "vsock.sock";
+
+/// How [`stop_vmm`] ended the VMM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum StopOutcome {
     /// It had already exited.
     NotRunning,
@@ -68,263 +57,103 @@ pub(crate) enum StopOutcome {
     Forced,
 }
 
-/// Files inside a sandbox directory.
-pub(crate) const CONSOLE_LOG: &str = "console.log";
-const IMAGE: &str = "workspace.img";
-const VM_CONFIG: &str = "vm.json";
-pub(crate) const VSOCK: &str = "vsock.sock";
-
-/// Where the VMM and guest image live on this host.
-#[derive(Debug, Clone)]
-pub(crate) struct Firecracker {
-    device: PathBuf,
-    firecracker: PathBuf,
-    kernel: PathBuf,
-    rootfs: PathBuf,
-}
-
-impl Firecracker {
-    /// Paths from the `DEVBOX_SANDBOX_*` environment, or the AMI defaults.
-    pub(crate) fn from_env() -> Self {
-        let path = |key: &str, default: &str| {
-            env_non_empty(key).map_or_else(|| PathBuf::from(default), PathBuf::from)
-        };
-        Self {
-            device: PathBuf::from(ENCLAVE_DEVICE),
-            firecracker: path("DEVBOX_SANDBOX_FIRECRACKER", DEFAULT_FIRECRACKER),
-            kernel: path("DEVBOX_SANDBOX_KERNEL", DEFAULT_KERNEL),
-            rootfs: path("DEVBOX_SANDBOX_ROOTFS", DEFAULT_ROOTFS),
-        }
-    }
-
-    /// A backend rooted at `root` (`nitro_enclaves`, `firecracker`, `vmlinux`,
-    /// `rootfs.ext4` inside it), for tests that stand in for the real host.
-    #[cfg(test)]
-    pub(crate) fn rooted_at(root: &Path) -> Self {
-        Self {
-            device: root.join("nitro_enclaves"),
-            firecracker: root.join("firecracker"),
-            kernel: root.join("vmlinux"),
-            rootfs: root.join("rootfs.ext4"),
-        }
-    }
-
-    /// Check this host can run a sandbox, explaining what to fix when it can't.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error naming the first missing requirement.
-    pub(crate) fn preflight(&self) -> Result<()> {
-        anyhow::ensure!(
-            self.device.exists(),
-            "Nitro Sandboxes are not available on this host: {} is missing.\n\
-             The pool must launch hosts with Nitro Enclaves enabled on an enclave-capable \
-             instance type (nitro_sandboxes_enabled in the devbox-infra pool module).",
-            self.device.display()
-        );
-        if let Err(e) = OpenOptions::new().read(true).write(true).open(&self.device) {
-            anyhow::bail!(
-                "cannot open {} ({e}).\n\
-                 Add your account to the `ne` group (sudo usermod -aG ne \"$USER\"), \
-                 then log in again.",
-                self.device.display()
-            );
-        }
-        anyhow::ensure!(
-            resolve_program(&self.firecracker).is_some(),
-            "the sandbox VMM ({}) is not installed; this AMI predates sandbox support \
-             (set DEVBOX_SANDBOX_FIRECRACKER to override)",
-            self.firecracker.display()
-        );
-        for (what, path, var) in [
-            ("guest kernel", &self.kernel, "DEVBOX_SANDBOX_KERNEL"),
-            (
-                "guest root filesystem",
-                &self.rootfs,
-                "DEVBOX_SANDBOX_ROOTFS",
+/// The Firecracker configuration for `meta`. Paths are inside the chroot.
+pub(crate) fn vm_config(meta: &SandboxMeta) -> Value {
+    json!({
+        "boot-source": {
+            "kernel_image_path": "/vmlinux",
+            "boot_args": format!(
+                "console=ttyS0 reboot=k panic=1 devbox.sandbox={} devbox.workspace=LABEL={WORKSPACE_LABEL}",
+                meta.name
             ),
-        ] {
-            anyhow::ensure!(
-                path.is_file(),
-                "the sandbox {what} is missing at {}; this AMI predates sandbox support \
-                 (set {var} to override)",
-                path.display()
-            );
-        }
-        Ok(())
-    }
-
-    /// The Firecracker configuration for the sandbox in `dir`.
-    pub(crate) fn vm_config(&self, dir: &Path, meta: &SandboxMeta) -> Value {
-        json!({
-            "boot-source": {
-                "kernel_image_path": self.kernel,
-                "boot_args": format!(
-                    "console=ttyS0 reboot=k panic=1 devbox.sandbox={} devbox.workspace=LABEL={WORKSPACE_LABEL}",
-                    meta.name
-                ),
+        },
+        "drives": [
+            {
+                "drive_id": "rootfs",
+                "path_on_host": "/rootfs.ext4",
+                "is_root_device": true,
+                "is_read_only": true,
             },
-            "drives": [
-                {
-                    "drive_id": "rootfs",
-                    "path_on_host": self.rootfs,
-                    "is_root_device": true,
-                    "is_read_only": true,
-                },
-                {
-                    "drive_id": "workspace",
-                    "path_on_host": dir.join(IMAGE),
-                    "is_root_device": false,
-                    "is_read_only": false,
-                },
-            ],
-            "machine-config": {
-                "vcpu_count": meta.vcpus,
-                "mem_size_mib": meta.memory_mib,
+            {
+                "drive_id": "workspace",
+                "path_on_host": format!("/{IMAGE}"),
+                "is_root_device": false,
+                "is_read_only": false,
             },
-            "vsock": {
-                "guest_cid": GUEST_CID,
-                "uds_path": dir.join(VSOCK),
-            },
-            // Run as a Nitro Sandbox. Direct mode: the threat is the guest, not the
-            // claimant, so confidential mode's protection from the parent isn't
-            // needed and direct mode's faster I/O is.
-            "enclave": { "direct_mode": true },
-        })
-    }
-
-    /// Build the workspace image from `stage`, write the VM config, and start the
-    /// VMM detached. Returns the VMM's process id.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the image, config or VMM process can't be created.
-    pub(crate) async fn launch(
-        &self,
-        dir: &Path,
-        meta: &SandboxMeta,
-        stage: &Path,
-        disk_gib: u32,
-    ) -> Result<u32> {
-        build_image(stage, &dir.join(IMAGE), disk_gib).await?;
-
-        let config_path = dir.join(VM_CONFIG);
-        let config =
-            serde_json::to_vec_pretty(&self.vm_config(dir, meta)).context("serialize VM config")?;
-        std::fs::write(&config_path, config)
-            .with_context(|| format!("write {}", config_path.display()))?;
-
-        let console = std::fs::File::create(dir.join(CONSOLE_LOG))
-            .with_context(|| format!("create {}", dir.join(CONSOLE_LOG).display()))?;
-        let console_err = console
-            .try_clone()
-            .context("duplicate console log handle")?;
-        // Its own process group, so the VMM outlives this command and a Ctrl-C in
-        // the claimant's terminal doesn't reach it.
-        let child = std::process::Command::new(&self.firecracker)
-            // Boot from the config file, and serve the API for runtime control.
-            .arg("--api-sock")
-            .arg(dir.join(API_SOCKET))
-            .arg("--config-file")
-            .arg(&config_path)
-            .current_dir(dir)
-            .stdin(Stdio::null())
-            .stdout(console)
-            .stderr(console_err)
-            .process_group(0)
-            .spawn()
-            .with_context(|| format!("start {}", self.firecracker.display()))?;
-        Ok(child.id())
-    }
-
-    /// Whether the VMM for `meta` is still running.
-    pub(crate) fn is_running(dir: &Path, meta: &SandboxMeta) -> bool {
-        meta.pid
-            .is_some_and(|pid| cmdline_contains(pid, &Self::needle(dir)))
-    }
-
-    /// Stop the VMM, cleanly if the guest cooperates.
-    ///
-    /// A paused guest is resumed first, then asked to power off through its
-    /// control port (and, on x86_64, sent Ctrl-Alt-Del). If it is still running
-    /// after [`STOP_GRACE`], or never accepted the request, it gets SIGTERM and
-    /// then SIGKILL.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the VMM is still running after SIGKILL.
-    pub(crate) async fn stop(dir: &Path, meta: &SandboxMeta) -> Result<StopOutcome> {
-        let Some(pid) = meta.pid else {
-            return Ok(StopOutcome::NotRunning);
-        };
-        let needle = Self::needle(dir);
-        if !cmdline_contains(pid, &needle) {
-            return Ok(StopOutcome::NotRunning);
-        }
-        if matches!(api::vm_state(dir).await, Ok(VmState::Paused)) {
-            api::set_paused(dir, false).await.ok();
-        }
-        let mut asked = api::request_guest_shutdown(dir).await.is_ok();
-        if cfg!(target_arch = "x86_64") {
-            asked |= api::send_ctrl_alt_del(dir).await.is_ok();
-        }
-        if asked && wait_exit(pid, &needle, STOP_GRACE).await {
-            return Ok(StopOutcome::Clean);
-        }
-        terminate(pid, &needle, KILL_GRACE)
-            .await
-            .with_context(|| format!("stop sandbox {}", meta.name))?;
-        Ok(StopOutcome::Forced)
-    }
-
-    /// The command-line fragment identifying this sandbox's VMM: its config path,
-    /// so a recycled pid isn't mistaken for ours.
-    fn needle(dir: &Path) -> String {
-        dir.join(VM_CONFIG).to_string_lossy().into_owned()
-    }
-
-    /// Copy the guest's repository out of the workspace image into `dest`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the image is missing or can't be read.
-    pub(crate) async fn export_repo(dir: &Path, dest: &Path) -> Result<()> {
-        export_image(&dir.join(IMAGE), dest).await
-    }
-
-    /// Delete the workspace image once its work has been collected.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error on I/O failure other than the image being gone already.
-    pub(crate) fn discard_image(dir: &Path) -> Result<()> {
-        match std::fs::remove_file(dir.join(IMAGE)) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(anyhow::Error::new(e).context("remove workspace image")),
-        }
-    }
+        ],
+        "machine-config": {
+            "vcpu_count": meta.vcpus,
+            "mem_size_mib": meta.memory_mib,
+        },
+        "vsock": {
+            "guest_cid": GUEST_CID,
+            "uds_path": format!("/{VSOCK}"),
+        },
+        // Run as a Nitro Sandbox. Direct mode: the threat is the guest, not the
+        // claimant, so confidential mode's protection from the parent isn't
+        // needed and direct mode's faster I/O is.
+        "enclave": { "direct_mode": true },
+    })
 }
 
-/// Build an ext4 image of `disk_gib` GiB at `image`, populated from `stage`.
-async fn build_image(stage: &Path, image: &Path, disk_gib: u32) -> Result<()> {
+/// Stop the VMM `pid` (identified by `needle`) whose chroot is `vm_dir`,
+/// cleanly if the guest cooperates.
+///
+/// A paused guest is resumed first, then asked to power off through its
+/// control port (and, on x86_64, sent Ctrl-Alt-Del). If it is still running
+/// after [`STOP_GRACE`], or never accepted the request, it gets SIGTERM and
+/// then SIGKILL.
+///
+/// # Errors
+///
+/// Returns an error if the VMM is still running after SIGKILL.
+pub(crate) async fn stop_vmm(vm_dir: &Path, pid: u32, needle: &str) -> Result<StopOutcome> {
+    if !cmdline_contains(pid, needle) {
+        return Ok(StopOutcome::NotRunning);
+    }
+    if matches!(api::vm_state(vm_dir).await, Ok(VmState::Paused)) {
+        api::set_paused(vm_dir, false).await.ok();
+    }
+    let mut asked = api::request_guest_shutdown(vm_dir).await.is_ok();
+    if cfg!(target_arch = "x86_64") {
+        asked |= api::send_ctrl_alt_del(vm_dir).await.is_ok();
+    }
+    if asked && wait_exit(pid, needle, STOP_GRACE).await {
+        return Ok(StopOutcome::Clean);
+    }
+    terminate(pid, needle, KILL_GRACE).await?;
+    Ok(StopOutcome::Forced)
+}
+
+/// Build an ext4 image of `disk_gib` GiB at `<dir>/workspace.img`, populated
+/// from `stage`.
+///
+/// # Errors
+///
+/// Returns an error if `mkfs.ext4` fails.
+pub(crate) async fn build_image(stage: &Path, dir: &Path, disk_gib: u32) -> Result<()> {
     let size = format!("{disk_gib}G");
     run(
         Command::new("mkfs.ext4")
             .args(["-q", "-F", "-L", WORKSPACE_LABEL, "-d"])
             .arg(stage)
-            .arg(image)
+            .arg(dir.join(IMAGE))
             .arg(&size),
         "mkfs.ext4",
     )
     .await
 }
 
-/// Copy `/repo` out of the ext4 image at `image` into `dest` (created).
+/// Copy `/repo` out of `<dir>/workspace.img` into `<dest>/repo`.
 ///
 /// The guest may have been stopped without unmounting, so the journal is
 /// replayed first (`e2fsck -p`; exit 1 means "errors fixed", which is fine).
-async fn export_image(image: &Path, dest: &Path) -> Result<()> {
+///
+/// # Errors
+///
+/// Returns an error if the image is missing, unrepairable, or has no `/repo`.
+pub(crate) async fn export_repo(dir: &Path, dest: &Path) -> Result<()> {
+    let image = dir.join(IMAGE);
     anyhow::ensure!(
         image.is_file(),
         "workspace image {} is missing",
@@ -334,7 +163,7 @@ async fn export_image(image: &Path, dest: &Path) -> Result<()> {
         IMAGE_TIMEOUT,
         Command::new("e2fsck")
             .args(["-p", "-f"])
-            .arg(image)
+            .arg(&image)
             .stdout(Stdio::null())
             .status(),
     )
@@ -350,16 +179,28 @@ async fn export_image(image: &Path, dest: &Path) -> Result<()> {
     std::fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
     let request = format!("rdump /repo {}", dest.display());
     run(
-        Command::new("debugfs").arg("-R").arg(&request).arg(image),
+        Command::new("debugfs").arg("-R").arg(&request).arg(&image),
         "debugfs rdump",
     )
     .await?;
-    let repo = dest.join("repo");
     anyhow::ensure!(
-        repo.is_dir(),
+        dest.join("repo").is_dir(),
         "workspace image has no /repo; the guest removed its checkout"
     );
     Ok(())
+}
+
+/// Delete `<dir>/workspace.img` once its work has been collected.
+///
+/// # Errors
+///
+/// Returns an error on I/O failure other than the image being gone already.
+pub(crate) fn discard_image(dir: &Path) -> Result<()> {
+    match std::fs::remove_file(dir.join(IMAGE)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(anyhow::Error::new(e).context("remove workspace image")),
+    }
 }
 
 /// Run `cmd` under [`IMAGE_TIMEOUT`], failing on a non-zero exit.
@@ -377,18 +218,6 @@ async fn run(cmd: &mut Command, what: &str) -> Result<()> {
     Ok(())
 }
 
-/// `program` itself if it is a path, else its first match on `PATH`.
-fn resolve_program(program: &Path) -> Option<PathBuf> {
-    if program.components().count() > 1 {
-        return program.is_file().then(|| program.to_path_buf());
-    }
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|dir| dir.join(program))
-            .find(|candidate| candidate.is_file())
-    })
-}
-
 #[cfg(test)]
 #[expect(
     clippy::unwrap_used,
@@ -397,17 +226,10 @@ fn resolve_program(program: &Path) -> Option<PathBuf> {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{Firecracker, resolve_program};
-    #[cfg(target_os = "linux")]
-    use super::{build_image, export_image};
+    use super::vm_config;
     use crate::sandbox::store::SandboxMeta;
-    use crate::sandbox::test_support::temp_root;
 
-    fn backend(root: &std::path::Path) -> Firecracker {
-        Firecracker::rooted_at(root)
-    }
-
-    fn meta() -> SandboxMeta {
+    pub(crate) fn meta() -> SandboxMeta {
         SandboxMeta {
             name: "calm-quilt".to_owned(),
             harness: "claude".to_owned(),
@@ -418,34 +240,14 @@ mod tests {
             created_unix: 0,
             vcpus: 2,
             memory_mib: 4096,
-            pid: None,
             collected: false,
-            relay_pid: None,
             worktree: None,
         }
     }
 
     #[test]
-    fn preflight_explains_each_missing_requirement_in_order() {
-        let root = temp_root("fc-preflight");
-        let fc = backend(&root);
-        let msg = |fc: &Firecracker| format!("{:#}", fc.preflight().unwrap_err());
-
-        assert!(msg(&fc).contains("nitro_sandboxes_enabled"), "{}", msg(&fc));
-        std::fs::write(root.join("nitro_enclaves"), "").unwrap();
-        assert!(msg(&fc).contains("VMM"), "{}", msg(&fc));
-        std::fs::write(root.join("firecracker"), "").unwrap();
-        assert!(msg(&fc).contains("guest kernel"), "{}", msg(&fc));
-        std::fs::write(root.join("vmlinux"), "").unwrap();
-        assert!(msg(&fc).contains("guest root filesystem"), "{}", msg(&fc));
-        std::fs::write(root.join("rootfs.ext4"), "").unwrap();
-        fc.preflight().unwrap();
-    }
-
-    #[test]
-    fn vm_config_is_a_direct_mode_sandbox_with_no_network() {
-        let root = temp_root("fc-config");
-        let config = backend(&root).vm_config(&root, &meta());
+    fn vm_config_is_a_direct_mode_sandbox_with_no_network_and_chroot_paths() {
+        let config = vm_config(&meta());
 
         assert_eq!(config.pointer("/enclave/direct_mode").unwrap(), true);
         assert!(config.get("network-interfaces").is_none());
@@ -456,6 +258,19 @@ mod tests {
         );
         assert_eq!(config.pointer("/drives/0/is_read_only").unwrap(), true);
         assert_eq!(config.pointer("/drives/1/is_read_only").unwrap(), false);
+        // Every host path is inside the jail's chroot.
+        for pointer in [
+            "/boot-source/kernel_image_path",
+            "/drives/0/path_on_host",
+            "/drives/1/path_on_host",
+            "/vsock/uds_path",
+        ] {
+            let path = config.pointer(pointer).unwrap().as_str().unwrap();
+            assert!(
+                path.starts_with('/') && path.matches('/').count() == 1,
+                "{pointer}={path}"
+            );
+        }
         let boot_args = config
             .pointer("/boot-source/boot_args")
             .unwrap()
@@ -467,41 +282,30 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_program_handles_paths_and_path_lookup() {
-        assert!(resolve_program(std::path::Path::new("sh")).is_some());
-        assert!(resolve_program(std::path::Path::new("/bin/sh")).is_some());
-        assert!(resolve_program(std::path::Path::new("no-such-devbox-binary")).is_none());
-    }
-
     // Needs /proc: Linux only, like the backend.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn stop_signals_a_guest_that_ignores_the_shutdown_request() {
-        use super::StopOutcome;
+        use super::{StopOutcome, stop_vmm};
+        use crate::sandbox::process::wait_started;
+        use crate::sandbox::test_support::temp_root;
 
         let root = temp_root("fc-stop");
         // No API socket and no control port: nothing answers a clean request.
         let mut vmm = tokio::process::Command::new("sh")
-            .args(["-c", "trap 'exit 0' TERM; sleep 300 & wait", "sh"])
-            .arg(root.join("vm.json"))
+            .args(["-c", "trap 'kill $!; exit 0' TERM; sleep 300 & wait", "sh"])
+            .args(["--id", "calm-quilt", "x"])
             .spawn()
             .unwrap();
-        let mut sandbox = meta();
-        sandbox.pid = vmm.id();
-        for _ in 0..100 {
-            if Firecracker::is_running(&root, &sandbox) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(Firecracker::is_running(&root, &sandbox));
+        let pid = vmm.id().unwrap();
+        let needle = "--id\0calm-quilt\0";
+        assert!(wait_started(pid, needle, std::time::Duration::from_secs(1)).await);
 
-        let outcome = Firecracker::stop(&root, &sandbox).await.unwrap();
+        let outcome = stop_vmm(&root, pid, needle).await.unwrap();
         assert_eq!(outcome, StopOutcome::Forced);
         vmm.wait().await.unwrap();
         assert_eq!(
-            Firecracker::stop(&root, &sandbox).await.unwrap(),
+            stop_vmm(&root, pid, needle).await.unwrap(),
             StopOutcome::NotRunning
         );
     }
@@ -510,16 +314,18 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn workspace_image_round_trips_the_repo() {
+        use super::{build_image, export_repo};
+        use crate::sandbox::test_support::temp_root;
+
         let root = temp_root("fc-image");
         let stage = root.join("stage");
         std::fs::create_dir_all(stage.join("repo/.git")).unwrap();
         std::fs::write(stage.join("repo/file.txt"), "hello\n").unwrap();
         std::fs::write(stage.join("task.json"), "{}").unwrap();
 
-        let image = root.join("workspace.img");
-        build_image(&stage, &image, 1).await.unwrap();
+        build_image(&stage, &root, 1).await.unwrap();
         let out = root.join("out");
-        export_image(&image, &out).await.unwrap();
+        export_repo(&root, &out).await.unwrap();
         assert_eq!(
             std::fs::read_to_string(out.join("repo/file.txt")).unwrap(),
             "hello\n"

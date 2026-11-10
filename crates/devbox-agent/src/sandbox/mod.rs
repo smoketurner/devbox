@@ -7,23 +7,28 @@
 //! ```
 //!
 //! That clones the current repository at `HEAD` onto a new `agent/<name>`
-//! branch, packs the clone into the guest's workspace image, and boots a Nitro
-//! Sandbox (a hardware-isolated child VM) to run the harness against the task.
-//! The sub-agent never sees the claimant's checkout, credentials, SSH agent or
-//! the host's instance metadata. When it stops, its branch is fetched back into
-//! the claimant's repository, where it is reviewed and merged with plain git.
+//! branch, packs the clone into the guest's workspace image, and asks the
+//! sandbox daemon ([`daemon`], `devbox-agent sandboxd`, root under systemd) to
+//! boot a Nitro Sandbox (a hardware-isolated child VM) under Firecracker's
+//! jailer to run the harness against the task. The sub-agent never sees the
+//! claimant's checkout, credentials, SSH agent or the host's instance metadata.
+//! When it stops, its branch is fetched back into the claimant's repository,
+//! where it is reviewed and merged with plain git.
 //!
-//! Records live on the box only (see [`store`]); nothing here talks to the
-//! control plane.
+//! The CLI does everything it can as the claimant; only starting, stopping,
+//! pausing and inspecting the VMM go through the daemon. Records live on the
+//! box only (see [`store`]).
 
 mod api;
+pub(crate) mod daemon;
 mod firecracker;
+mod jail;
 mod process;
 mod relay;
 mod store;
 mod workspace;
 
-use std::os::unix::process::CommandExt;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -31,8 +36,8 @@ use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use serde_json::json;
 
-use api::VmState;
-use firecracker::{CONSOLE_LOG, Firecracker, StopOutcome};
+use daemon::{Client, LiveState, Request, Response};
+use firecracker::{CONSOLE_LOG, StopOutcome};
 use store::{SandboxMeta, Store, now_unix};
 
 /// `devbox-agent sandbox` subcommands.
@@ -52,7 +57,8 @@ pub(crate) enum SandboxCommand {
     },
     /// Show the sub-agent's changes against the commit it started from.
     ///
-    /// Collects the work first if the sandbox has exited on its own.
+    /// While it runs, shows what it has pushed so far; once it has exited,
+    /// collects its work first.
     Diff {
         /// Sandbox name.
         name: String,
@@ -75,28 +81,7 @@ pub(crate) enum SandboxCommand {
         /// Sandbox name.
         name: String,
     },
-    /// Serve a sandbox's vsock channel (started by `run`; not for direct use).
-    #[command(hide = true)]
-    Relay {
-        /// Sandbox name.
-        name: String,
-        /// The store the sandbox lives in.
-        #[arg(long)]
-        store: PathBuf,
-    },
 }
-
-/// Whether `run` starts the relay process (tests drive the relay in-process).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RelayMode {
-    Spawn,
-    // Only the Linux-only end-to-end tests launch sandboxes.
-    #[cfg(all(test, target_os = "linux"))]
-    Skip,
-}
-
-/// Log file of a sandbox's relay process.
-const RELAY_LOG: &str = "relay.log";
 
 /// Arguments for `devbox-agent sandbox run`.
 #[derive(Args)]
@@ -123,47 +108,32 @@ pub(crate) struct RunArgs {
     disk_gib: u32,
 }
 
-/// Run a `sandbox` subcommand against this box's store and VMM.
+/// Run a `sandbox` subcommand against this box's store and sandbox daemon.
 ///
 /// # Errors
 ///
 /// Returns the subcommand's error, phrased for the person at the terminal.
 pub(crate) async fn run(command: SandboxCommand) -> Result<()> {
     let store = Store::from_env();
-    let fc = Firecracker::from_env();
+    let client = Client::new(daemon::socket_path());
     match command {
-        SandboxCommand::Run(args) => start(&store, &fc, args, RelayMode::Spawn).await,
+        SandboxCommand::Run(args) => start(&store, &client, args).await,
         SandboxCommand::Ls => {
-            print!("{}", render_list(&store, now_unix()).await?);
+            print!("{}", render_list(&store, &client, now_unix()).await?);
             Ok(())
         }
-        SandboxCommand::Pause { name } => set_paused(&store, &name, true).await,
-        SandboxCommand::Resume { name } => set_paused(&store, &name, false).await,
         SandboxCommand::Logs { name, follow } => logs(&store, &name, follow).await,
-        SandboxCommand::Diff { name, stat } => diff(&store, &name, stat).await,
-        SandboxCommand::Stop { name } => stop(&store, &name).await,
-        SandboxCommand::Relay { name, store: root } => relay::run(&Store::new(root), &name).await,
+        SandboxCommand::Diff { name, stat } => diff(&store, &client, &name, stat).await,
+        SandboxCommand::Stop { name } => stop(&store, &client, &name).await,
+        SandboxCommand::Pause { name } => set_paused(&client, &name, true).await,
+        SandboxCommand::Resume { name } => set_paused(&client, &name, false).await,
     }
 }
 
-/// How long `run` waits before checking the VMM survived boot.
-const BOOT_CHECK: std::time::Duration = std::time::Duration::from_millis(750);
-
-/// The last `n` lines of `text`.
-fn tail_lines(text: &str, n: usize) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let skip = lines.len().saturating_sub(n);
-    lines.into_iter().skip(skip).collect::<Vec<_>>().join("\n")
-}
-
 /// `sandbox run`.
-async fn start(
-    store: &Store,
-    fc: &Firecracker,
-    args: RunArgs,
-    relay_mode: RelayMode,
-) -> Result<()> {
-    fc.preflight()?;
+async fn start(store: &Store, client: &Client, args: RunArgs) -> Result<()> {
+    // Fail before any cloning if this host can't run a sandbox at all.
+    client.call(&Request::Preflight).await?;
     anyhow::ensure!(
         is_valid_harness(&args.harness),
         "invalid harness {:?} (lowercase letters, digits and '-')",
@@ -179,8 +149,8 @@ async fn start(
         Some(name) => name,
         None => store.fresh_name()?,
     };
-    relay::check_socket_path(&store.dir(&name)?)?;
-    let mut meta = SandboxMeta {
+    relay::check_socket_path(&jail::default_vm_dir(&store.dir(&name)?, &name))?;
+    let meta = SandboxMeta {
         branch: format!("agent/{name}"),
         name,
         harness: args.harness,
@@ -190,43 +160,31 @@ async fn start(
         created_unix: now_unix(),
         vcpus: args.vcpus,
         memory_mib: args.memory_mib,
-        pid: None,
         collected: false,
-        relay_pid: None,
         worktree: None,
     };
     let dir = store.create(&meta)?;
 
-    let launched = launch(store, fc, &dir, &meta, args.disk_gib, relay_mode).await;
-    let (pid, relay_pid) = match launched {
-        Ok(pids) => pids,
-        Err(e) => {
-            // Free the name; a sandbox that never started has nothing to keep.
-            std::fs::remove_dir_all(&dir).ok();
-            return Err(e);
-        }
+    let started = match prepare(&dir, &meta, args.disk_gib).await {
+        Ok(()) => client
+            .call(&Request::Start {
+                name: meta.name.clone(),
+            })
+            .await
+            .map(drop),
+        Err(e) => Err(e),
     };
-    meta.pid = Some(pid);
-    meta.relay_pid = relay_pid;
-    store.save(&meta)?;
-
-    // A VMM that rejects its config or the device exits at once; say so here
-    // rather than printing "started" for a sandbox that never booted.
-    tokio::time::sleep(BOOT_CHECK).await;
-    if !Firecracker::is_running(&dir, &meta) {
-        let console = std::fs::read_to_string(dir.join(CONSOLE_LOG)).unwrap_or_default();
-        anyhow::bail!(
-            "sandbox {} exited while booting; console output:\n{}",
-            meta.name,
-            tail_lines(&console, 20)
-        );
+    if let Err(e) = started {
+        // Free the name; a sandbox that never started has nothing to keep.
+        std::fs::remove_dir_all(&dir).ok();
+        return Err(e);
     }
 
     println!(
         "started sandbox {name} ({harness}) on branch {branch}\n\
          \n  devbox-agent sandbox logs {name} -f   follow its console\
-         \n  devbox-agent sandbox stop {name}      stop it and collect its work\
-         \n  devbox-agent sandbox diff {name}      review the changes",
+         \n  devbox-agent sandbox diff {name}      review its changes so far\
+         \n  devbox-agent sandbox stop {name}      stop it and collect its work",
         name = meta.name,
         harness = meta.harness,
         branch = meta.branch,
@@ -234,16 +192,9 @@ async fn start(
     Ok(())
 }
 
-/// Stage the clone and task, start the relay, then boot the guest. Returns the
-/// VMM and relay pids. Nothing is left running if it fails.
-async fn launch(
-    store: &Store,
-    fc: &Firecracker,
-    dir: &Path,
-    meta: &SandboxMeta,
-    disk_gib: u32,
-    relay_mode: RelayMode,
-) -> Result<(u32, Option<u32>)> {
+/// Everything `run` does as the claimant before asking the daemon to boot the
+/// guest: the clone, the task, the workspace image, and the push inbox.
+async fn prepare(dir: &Path, meta: &SandboxMeta, disk_gib: u32) -> Result<()> {
     let stage = dir.join("stage");
     workspace::prepare_clone(
         &meta.repo,
@@ -272,93 +223,20 @@ async fn launch(
         serde_json::to_vec_pretty(&task).context("serialize task")?,
     )
     .context("write task.json")?;
-    relay::init_inbox(dir).await?;
-
-    // The relay listens before the guest boots, so its first connection lands.
-    let relay_pid = match relay_mode {
-        RelayMode::Spawn => Some(spawn_relay(store, dir, &meta.name).await?),
-        #[cfg(all(test, target_os = "linux"))]
-        RelayMode::Skip => None,
-    };
-    let pid = match fc.launch(dir, meta, &stage, disk_gib).await {
-        Ok(pid) => pid,
-        Err(e) => {
-            if let Some(relay_pid) = relay_pid {
-                let needle = relay::needle(store.root(), &meta.name);
-                process::terminate(relay_pid, &needle, RELAY_GRACE)
-                    .await
-                    .ok();
-            }
-            return Err(e);
-        }
-    };
+    firecracker::build_image(&stage, dir, disk_gib).await?;
     std::fs::remove_dir_all(&stage).ok();
-    Ok((pid, relay_pid))
-}
-
-/// How long a relay gets to exit on SIGTERM.
-const RELAY_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Start `devbox-agent sandbox relay <name>` detached and wait until it listens.
-async fn spawn_relay(store: &Store, dir: &Path, name: &str) -> Result<u32> {
-    let exe = std::env::current_exe().context("locate the devbox-agent binary")?;
-    let log_path = dir.join(RELAY_LOG);
-    let log = std::fs::File::create(&log_path)
-        .with_context(|| format!("create {}", log_path.display()))?;
-    let log_err = log.try_clone().context("duplicate relay log handle")?;
-    // Its own process group, like the VMM, so it outlives this command.
-    let child = std::process::Command::new(exe)
-        .args(["sandbox", "relay", name, "--store"])
-        .arg(store.root())
-        .stdin(Stdio::null())
-        .stdout(log)
-        .stderr(log_err)
-        .process_group(0)
-        .spawn()
-        .context("start the sandbox relay")?;
-    let pid = child.id();
-
-    let ready = relay::socket_path(dir, relay::GIT_PORT);
-    for _ in 0..50 {
-        if ready.exists() {
-            return Ok(pid);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    process::terminate(pid, &relay::needle(store.root(), name), RELAY_GRACE)
-        .await
-        .ok();
-    let output = std::fs::read_to_string(&log_path).unwrap_or_default();
-    anyhow::bail!(
-        "the sandbox relay did not start; its output:\n{}",
-        tail_lines(&output, 20)
-    )
+    relay::init_inbox(dir).await
 }
 
 /// `sandbox stop`.
-async fn stop(store: &Store, name: &str) -> Result<()> {
+async fn stop(store: &Store, client: &Client, name: &str) -> Result<()> {
     let meta = store.load(name)?;
-    let dir = store.dir(name)?;
-    match Firecracker::stop(&dir, &meta).await? {
-        StopOutcome::Clean => println!("{name} powered off cleanly"),
-        StopOutcome::Forced => {
-            println!("{name} didn't power off when asked; stopped it by signal");
-        }
-        StopOutcome::NotRunning => {}
-    }
-    if let Some(relay_pid) = meta.relay_pid {
-        // The relay also exits by itself once the VMM is gone; this is prompter.
-        if let Err(e) =
-            process::terminate(relay_pid, &relay::needle(store.root(), name), RELAY_GRACE).await
-        {
-            eprintln!("warning: {e:#}");
-        }
-    }
-    collect_and_report(store, meta).await
+    collect_and_report(client, store, meta).await
 }
 
-/// Fetch a stopped sandbox's branch home (once) and say how to use it.
-async fn collect_and_report(store: &Store, mut meta: SandboxMeta) -> Result<()> {
+/// Stop a sandbox through the daemon (which also hands its image back), then
+/// fetch its branch home (once) and say how to use it.
+async fn collect_and_report(client: &Client, store: &Store, mut meta: SandboxMeta) -> Result<()> {
     if meta.collected {
         println!(
             "sandbox {} was already collected onto {}",
@@ -366,10 +244,28 @@ async fn collect_and_report(store: &Store, mut meta: SandboxMeta) -> Result<()> 
         );
         return Ok(());
     }
+    let response = client
+        .call(&Request::Stop {
+            name: meta.name.clone(),
+        })
+        .await?;
+    match response {
+        Response::Stopped {
+            outcome: StopOutcome::Clean,
+        } => println!("{} powered off cleanly", meta.name),
+        Response::Stopped {
+            outcome: StopOutcome::Forced,
+        } => println!(
+            "{} didn't power off when asked; stopped it by signal",
+            meta.name
+        ),
+        _ => {}
+    }
+
     let dir = store.dir(&meta.name)?;
     let export = dir.join("export");
     std::fs::remove_dir_all(&export).ok();
-    Firecracker::export_repo(&dir, &export).await?;
+    firecracker::export_repo(&dir, &export).await?;
     let collected = workspace::collect(
         &meta.repo,
         &export.join("repo"),
@@ -381,10 +277,8 @@ async fn collect_and_report(store: &Store, mut meta: SandboxMeta) -> Result<()> 
     std::fs::remove_dir_all(&export).ok();
     let collected = collected?;
 
-    Firecracker::discard_image(&dir)?;
+    firecracker::discard_image(&dir)?;
     meta.collected = true;
-    meta.pid = None;
-    meta.relay_pid = None;
     if collected.commits > 0 {
         // Best effort: the branch is safe in the repo whether or not this works.
         let tree = dir.join("worktree");
@@ -414,14 +308,23 @@ async fn collect_and_report(store: &Store, mut meta: SandboxMeta) -> Result<()> 
     Ok(())
 }
 
+/// Which sandboxes the daemon reports running or paused.
+async fn live_states(client: &Client) -> Result<BTreeMap<String, LiveState>> {
+    match client.call(&Request::Status).await? {
+        Response::Status { sandboxes } => Ok(sandboxes),
+        other => anyhow::bail!("unexpected answer from the sandbox daemon: {other:?}"),
+    }
+}
+
 /// `sandbox diff`.
 ///
 /// While the sandbox runs, shows what it has pushed to its inbox so far; once
 /// it has stopped, collects (if needed) and shows the final branch.
-async fn diff(store: &Store, name: &str, stat: bool) -> Result<()> {
+async fn diff(store: &Store, client: &Client, name: &str, stat: bool) -> Result<()> {
     let meta = store.load(name)?;
     let dir = store.dir(name)?;
-    let target = if !meta.collected && Firecracker::is_running(&dir, &meta) {
+    let running = !meta.collected && live_states(client).await?.contains_key(name);
+    let target = if running {
         let live = format!("refs/sandbox/{name}/live");
         let pushed =
             workspace::fetch_live(&meta.repo, &dir.join(relay::INBOX), &meta.branch, &live).await?;
@@ -434,7 +337,7 @@ async fn diff(store: &Store, name: &str, stat: bool) -> Result<()> {
         live
     } else {
         if !meta.collected {
-            collect_and_report(store, meta.clone()).await?;
+            collect_and_report(client, store, meta.clone()).await?;
         }
         meta.branch.clone()
     };
@@ -475,40 +378,24 @@ async fn logs(store: &Store, name: &str, follow: bool) -> Result<()> {
 }
 
 /// `sandbox pause` / `sandbox resume`.
-async fn set_paused(store: &Store, name: &str, paused: bool) -> Result<()> {
-    let meta = store.load(name)?;
-    let dir = store.dir(name)?;
-    anyhow::ensure!(
-        Firecracker::is_running(&dir, &meta),
-        "sandbox {name} is not running"
-    );
-    api::set_paused(&dir, paused).await?;
+async fn set_paused(client: &Client, name: &str, paused: bool) -> Result<()> {
+    let request = if paused {
+        Request::Pause {
+            name: name.to_owned(),
+        }
+    } else {
+        Request::Resume {
+            name: name.to_owned(),
+        }
+    };
+    client.call(&request).await?;
     println!("{name} {}", if paused { "paused" } else { "resumed" });
     Ok(())
 }
 
-/// Whether a sandbox's VMM is up, and if so whether its guest is paused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Liveness {
-    Stopped,
-    Running,
-    Paused,
-}
-
-/// The liveness of the sandbox in `dir`.
-async fn liveness(dir: &Path, meta: &SandboxMeta) -> Liveness {
-    if !Firecracker::is_running(dir, meta) {
-        return Liveness::Stopped;
-    }
-    match api::vm_state(dir).await {
-        Ok(VmState::Paused) => Liveness::Paused,
-        // Unreachable API or another state: the VMM is still up.
-        _ => Liveness::Running,
-    }
-}
-
-/// The `sandbox ls` table.
-async fn render_list(store: &Store, now: u64) -> Result<String> {
+/// The `sandbox ls` table. If the daemon can't be reached, the records are
+/// still listed, with their state shown as unknown.
+async fn render_list(store: &Store, client: &Client, now: u64) -> Result<String> {
     let metas = store.list()?;
     if metas.is_empty() {
         return Ok(
@@ -516,13 +403,22 @@ async fn render_list(store: &Store, now: u64) -> Result<String> {
                 .to_owned(),
         );
     }
+    let live = match live_states(client).await {
+        Ok(live) => Some(live),
+        Err(e) => {
+            eprintln!("warning: {e:#}");
+            None
+        }
+    };
     let mut out = format!(
         "{:<20} {:<9} {:<8} {:<6} {}\n",
         "NAME", "STATE", "HARNESS", "AGE", "REPO"
     );
     for meta in metas {
-        let dir = store.dir(&meta.name)?;
-        let state = state_label(&meta, liveness(&dir, &meta).await);
+        let state = match &live {
+            Some(live) => state_label(&meta, live.get(&meta.name).copied()),
+            None => "unknown",
+        };
         out.push_str(&format!(
             "{:<20} {:<9} {:<8} {:<6} {}\n",
             meta.name,
@@ -535,14 +431,14 @@ async fn render_list(store: &Store, now: u64) -> Result<String> {
     Ok(out)
 }
 
-/// A sandbox's lifecycle state, from its record and its VMM's liveness.
-fn state_label(meta: &SandboxMeta, live: Liveness) -> &'static str {
+/// A sandbox's lifecycle state, from its record and what the daemon reports.
+fn state_label(meta: &SandboxMeta, live: Option<LiveState>) -> &'static str {
     match live {
-        Liveness::Running => "running",
-        Liveness::Paused => "paused",
-        Liveness::Stopped if meta.collected => "collected",
+        Some(LiveState::Running) => "running",
+        Some(LiveState::Paused) => "paused",
+        None if meta.collected => "collected",
         // Stopped on its own (or crashed) with work not yet fetched.
-        Liveness::Stopped => "exited",
+        None => "exited",
     }
 }
 
@@ -653,20 +549,10 @@ pub(crate) mod test_support {
     reason = "test code: panic on assertion failure is acceptable"
 )]
 mod tests {
-    #[cfg(target_os = "linux")]
-    use std::os::unix::fs::PermissionsExt;
-
-    #[cfg(target_os = "linux")]
-    use super::firecracker::Firecracker;
-    #[cfg(target_os = "linux")]
-    use super::store::now_unix;
+    use super::daemon::{Client, LiveState};
     use super::store::{SandboxMeta, Store};
     use super::test_support::temp_root;
-    #[cfg(target_os = "linux")]
-    use super::test_support::{git, init_repo};
-    use super::{Liveness, age, is_valid_harness, render_list, state_label, tail_lines};
-    #[cfg(target_os = "linux")]
-    use super::{RelayMode, RunArgs, diff, set_paused, start, stop};
+    use super::{age, is_valid_harness, render_list, state_label};
 
     fn meta(name: &str, created_unix: u64, collected: bool) -> SandboxMeta {
         SandboxMeta {
@@ -679,49 +565,120 @@ mod tests {
             created_unix,
             vcpus: 2,
             memory_mib: 4096,
-            pid: None,
             collected,
-            relay_pid: None,
             worktree: None,
         }
     }
 
     #[tokio::test]
-    async fn ls_shows_state_age_and_repo() {
-        let store = Store::new(temp_root("ls"));
+    async fn ls_without_a_daemon_still_lists_records() {
+        let root = temp_root("ls");
+        let store = Store::new(root.join("store"));
         store.create(&meta("calm-quilt", 100, false)).unwrap();
         store.create(&meta("bold-acorn", 50, true)).unwrap();
+        let nowhere = Client::new(root.join("no-daemon.sock"));
 
-        let out = render_list(&store, 400).await.unwrap();
+        let out = render_list(&store, &nowhere, 400).await.unwrap();
         assert_eq!(out.lines().count(), 3, "{out}");
         let mut lines = out.lines();
         assert!(lines.next().unwrap().starts_with("NAME"), "{out}");
         let first = lines.next().unwrap();
         assert!(
-            first.starts_with("bold-acorn") && first.contains("collected") && first.contains("5m"),
+            first.starts_with("bold-acorn") && first.contains("unknown") && first.contains("5m"),
             "{out}"
         );
-        let second = lines.next().unwrap();
-        assert!(
-            second.contains("exited") && second.contains("/workspace/devbox"),
-            "{out}"
-        );
+        assert!(lines.next().unwrap().contains("/workspace/devbox"), "{out}");
     }
 
-    #[cfg(target_os = "linux")]
-    /// A stand-in VMM: writes an untracked file into the guest's workspace image
-    /// (as a sub-agent would), then waits to be stopped.
+    #[tokio::test]
+    async fn ls_with_no_sandboxes_says_how_to_start_one() {
+        let root = temp_root("ls-empty");
+        let store = Store::new(root.join("store"));
+        let out = render_list(&store, &Client::new(root.join("x.sock")), 0)
+            .await
+            .unwrap();
+        assert!(out.contains("sandbox run"), "{out}");
+    }
+
+    #[test]
+    fn state_prefers_live_state_then_collected() {
+        let collected = meta("a", 0, true);
+        assert_eq!(state_label(&collected, Some(LiveState::Running)), "running");
+        assert_eq!(state_label(&collected, Some(LiveState::Paused)), "paused");
+        assert_eq!(state_label(&collected, None), "collected");
+        assert_eq!(state_label(&meta("a", 0, false), None), "exited");
+    }
+
+    #[test]
+    fn age_is_compact() {
+        assert_eq!(age(42), "42s");
+        assert_eq!(age(300), "5m");
+        assert_eq!(age(7_200), "2h");
+        assert_eq!(age(172_800), "2d");
+    }
+
+    #[test]
+    fn harness_must_be_a_plain_token() {
+        assert!(is_valid_harness("claude"));
+        assert!(is_valid_harness("claude-code"));
+        for bad in ["", "Claude", "a b", "../x", "x;rm"] {
+            assert!(!is_valid_harness(bad), "{bad:?}");
+        }
+    }
+}
+
+/// End to end, on Linux: the CLI against an in-process daemon, with a stand-in
+/// `jailer` and VMM (Python) in place of the real ones.
+#[cfg(all(test, target_os = "linux"))]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test code: panic on assertion failure is acceptable"
+)]
+mod e2e {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    use super::daemon::{self, Client, Config};
+    use super::jail::{Jail, owner_of};
+    use super::relay::Upstreams;
+    use super::store::{Store, now_unix};
+    use super::test_support::{git, init_repo, temp_root};
+    use super::{RunArgs, diff, render_list, set_paused, start, stop};
+
+    /// Stands in for jailer: finds the chroot jailer would have built and execs
+    /// the VMM there (as the same user: tests can't chroot or change uid), with
+    /// `--id <name>` first, as jailer does.
+    const FAKE_JAILER: &str = r#"#!/usr/bin/env python3
+import os, sys
+args = sys.argv[1:]
+split = args.index("--")
+opts, rest = args[:split], args[split + 1:]
+def opt(key):
+    return opts[opts.index(key) + 1]
+name, exe, base = opt("--id"), opt("--exec-file"), opt("--chroot-base-dir")
+root = os.path.join(base, os.path.basename(exe), name, "root")
+os.environ["FAKE_CHROOT"] = root
+os.chdir(root)
+os.execv(sys.executable, [sys.executable, exe, "--id", name] + rest)
+"#;
+
+    /// Stands in for the VMM: writes an untracked file into the guest's
+    /// workspace image (as a sub-agent would), serves a minimal API and the
+    /// guest control port, and powers off when asked.
     const FAKE_VMM: &str = r#"#!/usr/bin/env python3
 import json, os, socket, socketserver, subprocess, sys, threading
 from http.server import BaseHTTPRequestHandler
 
+root = os.environ["FAKE_CHROOT"]
+sandbox = os.path.normpath(os.path.join(root, "..", "..", "..", ".."))
 args = sys.argv[1:]
-api = args[args.index("--api-sock") + 1]
-d = os.path.dirname(args[args.index("--config-file") + 1])
-with open(f"{d}/guest.txt", "w") as f:
+api = root + args[args.index("--api-sock") + 1]
+with open(f"{sandbox}/guest.txt", "w") as f:
     f.write("from the guest\n")
-subprocess.run(["debugfs", "-w", "-R", f"write {d}/guest.txt /repo/guest.txt",
-                f"{d}/workspace.img"], capture_output=True)
+subprocess.run(["debugfs", "-w", "-R", f"write {sandbox}/guest.txt /repo/guest.txt",
+                f"{root}/workspace.img"], capture_output=True)
+with open(f"{sandbox}/booted", "w") as f:
+    f.write("yes\n")
 state = {"s": "Running"}
 
 class Api(BaseHTTPRequestHandler):
@@ -750,7 +707,7 @@ class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
 
 threading.Thread(target=Server(api, Api).serve_forever, daemon=True).start()
 control = socket.socket(socket.AF_UNIX)
-control.bind(f"{d}/vsock.sock")
+control.bind(f"{root}/vsock.sock")
 control.listen()
 while True:
     conn, _ = control.accept()
@@ -762,65 +719,103 @@ while True:
     stream.write(b"OK 1073741824\n")
     stream.flush()
     if stream.readline().strip() == b"shutdown":
-        with open(f"{d}/clean-shutdown", "w") as f:
+        with open(f"{sandbox}/clean-shutdown", "w") as f:
             f.write("yes\n")
         os._exit(0)
 "#;
 
-    // Needs /proc, e2fsprogs and GNU `timeout`: Linux only, like the backend.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn run_then_stop_collects_guest_work_onto_the_agent_branch() {
-        let root = temp_root("e2e");
+    /// Kills every process whose command line mentions the test's root when the
+    /// test ends, so a failing test doesn't leave a stand-in VMM running.
+    struct Reap(PathBuf);
+
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _status = std::process::Command::new("pkill")
+                .arg("-f")
+                .arg(&self.0)
+                .status();
+        }
+    }
+
+    fn write_executable(path: &Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A host stand-in under `root` with `vmm` as the VMM, and a daemon serving
+    /// it in the background. Returns the store and a client for the daemon.
+    async fn host(root: &Path, vmm: &str) -> (Store, Client) {
         for file in ["nitro_enclaves", "vmlinux", "rootfs.ext4"] {
             std::fs::write(root.join(file), "").unwrap();
         }
-        let vmm = root.join("firecracker");
-        std::fs::write(&vmm, FAKE_VMM).unwrap();
-        std::fs::set_permissions(&vmm, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let fc = Firecracker::rooted_at(&root);
+        write_executable(&root.join("jailer"), FAKE_JAILER);
+        write_executable(&root.join("firecracker"), vmm);
+        let (uid, gid) = owner_of(root).unwrap();
         let store = Store::new(root.join("store"));
-        let repo = init_repo(&root.join("repo"));
+        let socket = root.join("sandboxd.sock");
+        let config = Config {
+            socket: socket.clone(),
+            store: store.clone(),
+            owner_path: root.to_path_buf(),
+            jail: Jail::rooted_at(root, uid, gid),
+            upstreams: Upstreams::default(),
+        };
+        tokio::spawn(daemon::serve(config));
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        (store, Client::new(socket))
+    }
 
-        let args = RunArgs {
+    fn run_args(repo: PathBuf) -> RunArgs {
+        RunArgs {
             harness: "claude".to_owned(),
             prompt: vec!["add".to_owned(), "a".to_owned(), "test".to_owned()],
-            repo: Some(repo.clone()),
+            repo: Some(repo),
             name: Some("calm-quilt".to_owned()),
             vcpus: 2,
             memory_mib: 4096,
             disk_gib: 1,
-        };
-        start(&store, &fc, args, RelayMode::Skip).await.unwrap();
+        }
+    }
 
+    async fn ls(store: &Store, client: &Client) -> String {
+        render_list(store, client, now_unix()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_pause_live_diff_stop_and_collect_through_the_daemon() {
+        let root = temp_root("e2e");
+        let _reap = Reap(root.clone());
+        let (store, client) = host(&root, FAKE_VMM).await;
+        let repo = init_repo(&root.join("repo"));
+
+        start(&store, &client, run_args(repo.clone()))
+            .await
+            .unwrap();
+        let dir = store.dir("calm-quilt").unwrap();
         let meta = store.load("calm-quilt").unwrap();
         assert_eq!(meta.prompt, "add a test");
-        let dir = store.dir("calm-quilt").unwrap();
-        // The VMM is up once it has written into the image.
         for _ in 0..50 {
-            if dir.join("guest.txt").exists() {
+            if dir.join("booted").exists() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        assert!(Firecracker::is_running(&dir, &meta));
-        assert!(
-            render_list(&store, now_unix())
-                .await
-                .unwrap()
-                .contains("running")
-        );
-        set_paused(&store, "calm-quilt", true).await.unwrap();
-        assert!(
-            render_list(&store, now_unix())
-                .await
-                .unwrap()
-                .contains("paused")
-        );
+        // The VMM runs in the chroot jailer built, next to the relay's sockets.
+        let chroot = dir.join("j/firecracker/calm-quilt/root");
+        assert!(chroot.join("vm.json").is_file() && chroot.join("vsock.sock_9418").exists());
         assert!(!dir.join("stage").exists(), "staging copy must be removed");
+        assert!(ls(&store, &client).await.contains("running"));
+
+        set_paused(&client, "calm-quilt", true).await.unwrap();
+        assert!(ls(&store, &client).await.contains("paused"));
 
         // Nothing pushed yet: a live diff says so.
-        let err = diff(&store, "calm-quilt", true).await.unwrap_err();
+        let err = diff(&store, &client, "calm-quilt", true).await.unwrap_err();
         assert!(format!("{err:#}").contains("hasn't pushed"), "{err:#}");
         // The guest pushes a commit to its inbox (as it would over vsock): a
         // live diff now fetches it, without stopping the sandbox.
@@ -847,26 +842,25 @@ while True:
                 "HEAD:refs/heads/agent/calm-quilt",
             ],
         );
-        diff(&store, "calm-quilt", true).await.unwrap();
+        diff(&store, &client, "calm-quilt", true).await.unwrap();
         let live = git(
             &repo,
             &["ls-tree", "--name-only", "refs/sandbox/calm-quilt/live"],
         );
         assert!(live.contains("progress.txt"), "{live}");
-        assert!(Firecracker::is_running(
-            &dir,
-            &store.load("calm-quilt").unwrap()
-        ));
+        assert!(ls(&store, &client).await.contains("paused"));
 
         // Stopping a paused guest resumes it, then asks it to power off.
-        stop(&store, "calm-quilt").await.unwrap();
+        stop(&store, &client, "calm-quilt").await.unwrap();
         assert!(
             dir.join("clean-shutdown").exists(),
             "guest was not asked to shut down"
         );
+        assert!(!dir.join("j").exists(), "the jail is removed");
+        assert!(!dir.join("runtime.json").exists());
 
         let meta = store.load("calm-quilt").unwrap();
-        assert!(meta.collected && meta.pid.is_none());
+        assert!(meta.collected);
         assert!(
             !dir.join("workspace.img").exists(),
             "image is discarded once collected"
@@ -874,7 +868,6 @@ while True:
         let files = git(&repo, &["ls-tree", "--name-only", "agent/calm-quilt"]);
         assert!(files.contains("guest.txt"), "{files}");
         let tree = meta.worktree.clone().unwrap();
-        assert_eq!(tree, dir.join("worktree"));
         assert_eq!(
             std::fs::read_to_string(tree.join("guest.txt")).unwrap(),
             "from the guest\n"
@@ -883,99 +876,52 @@ while True:
             !repo.join("guest.txt").exists(),
             "claimant checkout untouched"
         );
+        assert!(ls(&store, &client).await.contains("collected"));
         // Stopping again is harmless.
-        stop(&store, "calm-quilt").await.unwrap();
+        stop(&store, &client, "calm-quilt").await.unwrap();
     }
 
     #[tokio::test]
-    async fn ls_with_no_sandboxes_says_how_to_start_one() {
-        let store = Store::new(temp_root("ls-empty"));
-        assert!(
-            render_list(&store, 0)
-                .await
-                .unwrap()
-                .contains("sandbox run")
-        );
-    }
-
-    #[test]
-    fn state_prefers_running_then_collected() {
-        assert_eq!(
-            state_label(&meta("a", 0, true), Liveness::Running),
-            "running"
-        );
-        assert_eq!(state_label(&meta("a", 0, true), Liveness::Paused), "paused");
-        assert_eq!(
-            state_label(&meta("a", 0, true), Liveness::Stopped),
-            "collected"
-        );
-        assert_eq!(
-            state_label(&meta("a", 0, false), Liveness::Stopped),
-            "exited"
-        );
-    }
-
-    #[test]
-    fn tail_lines_keeps_the_end() {
-        assert_eq!(tail_lines("a\nb\nc\n", 2), "b\nc");
-        assert_eq!(tail_lines("a", 5), "a");
-        assert_eq!(tail_lines("", 5), "");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn run_reports_a_vmm_that_dies_during_boot() {
+    async fn run_reports_a_vmm_that_dies_during_boot_and_leaves_nothing() {
         let root = temp_root("boot-fail");
-        for file in ["nitro_enclaves", "vmlinux", "rootfs.ext4"] {
-            std::fs::write(root.join(file), "").unwrap();
-        }
-        let vmm = root.join("firecracker");
-        std::fs::write(
-            &vmm,
+        let _reap = Reap(root.clone());
+        let (store, client) = host(
+            &root,
             "#!/bin/sh\necho 'enclave device rejected the VM' >&2\nexit 1\n",
         )
-        .unwrap();
-        std::fs::set_permissions(&vmm, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let store = Store::new(root.join("store"));
+        .await;
         let repo = init_repo(&root.join("repo"));
-        let args = RunArgs {
-            harness: "claude".to_owned(),
-            prompt: vec!["x".to_owned()],
-            repo: Some(repo),
-            name: Some("calm-quilt".to_owned()),
-            vcpus: 1,
-            memory_mib: 512,
-            disk_gib: 1,
-        };
-        let err = start(
-            &store,
-            &Firecracker::rooted_at(&root),
-            args,
-            RelayMode::Skip,
-        )
-        .await
-        .unwrap_err();
+        let err = start(&store, &client, run_args(repo)).await.unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("exited while booting") && msg.contains("rejected the VM"),
             "{msg}"
         );
+        assert!(!store.dir("calm-quilt").unwrap().exists(), "{msg}");
     }
 
-    #[test]
-    fn age_is_compact() {
-        assert_eq!(age(42), "42s");
-        assert_eq!(age(300), "5m");
-        assert_eq!(age(7_200), "2h");
-        assert_eq!(age(172_800), "2d");
+    #[tokio::test]
+    async fn run_stops_at_the_daemons_preflight() {
+        let root = temp_root("e2e-preflight");
+        let _reap = Reap(root.clone());
+        let (store, client) = host(&root, FAKE_VMM).await;
+        std::fs::remove_file(root.join("jailer")).unwrap();
+        let repo = init_repo(&root.join("repo"));
+        let err = start(&store, &client, run_args(repo)).await.unwrap_err();
+        assert!(format!("{err:#}").contains("jailer"), "{err:#}");
+        assert!(store.list().unwrap().is_empty());
     }
 
-    #[test]
-    fn harness_must_be_a_plain_token() {
-        assert!(is_valid_harness("claude"));
-        assert!(is_valid_harness("claude-code"));
-        for bad in ["", "Claude", "a b", "../x", "x;rm"] {
-            assert!(!is_valid_harness(bad), "{bad:?}");
-        }
+    #[tokio::test]
+    async fn without_a_daemon_run_says_how_to_check_it() {
+        let root = temp_root("e2e-nodaemon");
+        let store = Store::new(root.join("store"));
+        let repo = init_repo(&root.join("repo"));
+        let client = Client::new(root.join("absent.sock"));
+        let err = start(&store, &client, run_args(repo)).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("systemctl status devbox-sandboxd"),
+            "{err:#}"
+        );
     }
 }

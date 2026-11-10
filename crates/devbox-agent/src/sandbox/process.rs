@@ -16,6 +16,23 @@ pub(crate) fn cmdline_contains(pid: u32, needle: &str) -> bool {
         .is_ok_and(|cmdline| String::from_utf8_lossy(&cmdline).contains(needle))
 }
 
+/// Wait up to `timeout` for a just-spawned `pid` to show `needle` in its
+/// command line. Until the child has exec'd, `/proc` shows the parent's command
+/// line, so a check made in that window would wrongly read as "not running".
+/// Returns whether it appeared.
+pub(crate) async fn wait_started(pid: u32, needle: &str, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(tokio::time::Instant::now);
+    while !cmdline_contains(pid, needle) {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    true
+}
+
 /// Wait up to `timeout` for the process `needle` identifies to exit. Returns
 /// whether it did.
 pub(crate) async fn wait_exit(pid: u32, needle: &str, timeout: Duration) -> bool {
@@ -62,7 +79,7 @@ pub(crate) async fn terminate(pid: u32, needle: &str, grace: Duration) -> Result
 mod tests {
     use std::time::Duration;
 
-    use super::{cmdline_contains, terminate};
+    use super::{cmdline_contains, terminate, wait_started};
 
     #[tokio::test]
     async fn terminate_stops_only_the_matching_process() {
@@ -71,14 +88,7 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id().unwrap();
-        // Until the child has exec'd, /proc shows the test binary's command line.
-        for _ in 0..100 {
-            if cmdline_contains(pid, "sleep\u{0}37.5") {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(cmdline_contains(pid, "sleep\u{0}37.5"));
+        assert!(wait_started(pid, "sleep\u{0}37.5", Duration::from_secs(1)).await);
         assert!(!cmdline_contains(pid, "something-else"));
 
         // A non-matching needle leaves the process alone.

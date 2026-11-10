@@ -17,6 +17,7 @@ One binary, a handful of subcommands, each wired to a different host trigger:
 | `checkout <urls>` | the snapshot-builder, or a developer/agent on a claimed box | Clone repos into `/workspace`, minting a read-only token per repo |
 | `doctor` | operator on a claimed box, via `devbox ssh -- devbox-agent doctor` | Print a read-only diagnostic of warm-cache delivery |
 | `sandbox run\|ls\|logs\|diff\|pause\|resume\|stop` | the claimant, logged in to their box | Run sub-agents in Nitro Sandboxes, each on its own clone; collect their work as `agent/<name>` branches |
+| `sandboxd` | `devbox-sandboxd.service` (systemd, root) | Jail and run sandbox VMMs and their vsock relays for `sandbox` |
 
 ## `principals` — per-claim SSH authorization
 
@@ -170,54 +171,90 @@ $ git merge agent/calm-quilt                 # take it
 
 How it works:
 
-- `run` clones the repo at `HEAD` onto a new `agent/<name>` branch (refusing a
-  branch that already exists), writes the task to `task.json`, packs both into
-  an ext4 image (`mkfs.ext4 -d`, no root needed), and starts Firecracker with
-  `"enclave": {"direct_mode": true}` so the guest boots as a Nitro Sandbox. The
-  guest has no network device, only a vsock device.
-- Firecracker boots from its config file and also serves its API on
-  `<sandbox dir>/api.sock`, which `ls` (running or paused), `pause`, `resume`
-  and `stop` use. `stop` asks for a clean power-off first: it resumes a paused
-  guest, then sends `shutdown` to guest vsock port 1024 (and Ctrl-Alt-Del on
-  x86_64). Only a guest that doesn't answer, or doesn't power off within 15
-  s, gets SIGTERM and then SIGKILL, and `stop` says which happened.
-- `stop` (or `diff`, once the guest exits by itself) replays the image's
-  journal, copies `/repo` out with `debugfs rdump`, and fetches only
-  `agent/<name>` back into your repository. Uncommitted guest changes become a
-  WIP commit first. The guest's repository is treated as hostile: any symlink
-  under `.git` aborts the collect, `.git/config` is replaced with a minimal one,
-  and hooks are removed and disabled, so nothing the guest wrote runs on the
-  host. Your checkout and working tree are never touched. When the branch has
-  commits, it is then checked out as a linked worktree at
-  `<sandbox dir>/worktree` so you can open, build and test it. That checkout
-  holds the committed contents of the fetched branch only, never the guest's
-  files directly.
-- The guest has no network device. A relay process (`sandbox relay`, started
-  by `run` before the guest boots) serves its vsock ports. Port 3128 is an opaque
-  pipe to the box's egress proxy (`HTTPS_PROXY`, or `DEVBOX_SANDBOX_EGRESS_PROXY`),
-  so the proxy's policy applies. Port 8080 forwards model API calls
-  (`/<integration>/<path>`) to the control plane's credential-injecting
-  `/egress/<integration>/<path>`: guest credential headers are dropped, and the
-  box's web-identity token is added. Port 9418 runs `git receive-pack` into the
-  sandbox's own bare `inbox.git`, so `diff` on a running sandbox shows what it
-  has pushed so far (fetched onto `refs/sandbox/<name>/live`). An upstream the box
-  isn't configured for (no proxy, no `DEVBOX_SERVER_URL`) leaves its port unbound,
-  so the guest's connection is refused. No credential enters the guest. The
-  relay exits once the VMM is gone, and `stop` also stops it.
-- State lives in `/workspace/.sandboxes/<name>/` (`DEVBOX_SANDBOX_DIR` to
-  override): `meta.json`, `console.log`, `relay.log`, `inbox.git`, the vsock sockets, and the image until it is collected. Socket paths must fit in 107 bytes, which `run` checks.
+- **Two halves.** The `sandbox` CLI runs as you and does everything that needs
+  no privilege. A root daemon, `devbox-agent sandboxd`
+  (`devbox-sandboxd.service`), owns the VMMs. The CLI asks it to `preflight`,
+  `start`, `stop`, `pause`, `resume` and report `status` over
+  `/run/devbox/sandboxd.sock` (`DEVBOX_SANDBOXD_SOCKET`), one JSON line each
+  way. The daemon checks the caller's peer credentials: only the owner of
+  `/workspace` (the claimant, `DEVBOX_SANDBOX_OWNER_PATH`) and root may call. It
+  takes sandbox names, never paths. VMMs run in their own process groups and the
+  unit uses `KillMode=process`, so restarting the daemon leaves sandboxes
+  running; on start it finds them again and resumes their relays.
+- **`run`**, as you: asks the daemon to preflight; clones the repo at `HEAD`
+  onto a new `agent/<name>` branch (refusing a branch that already exists);
+  writes the task to `task.json`; packs both into an ext4 image (`mkfs.ext4
+  -d`); creates the push inbox. Then the daemon:
+  - builds a chroot for Firecracker's `jailer` at `<sandbox dir>/j/firecracker/<name>/root`
+    containing only the guest kernel and read-only rootfs (hard-linked from the
+    AMI, or copied when on another filesystem), a hard link to the workspace
+    image, the Nitro Enclaves device node, and `vm.json`;
+  - gives the chroot to a uid of its own from a reserved range (300000+,
+    `DEVBOX_SANDBOX_JAIL_UID_BASE`), so a guest that escapes into the VMM lands
+    in a jail with nothing to take, apart from other sandboxes;
+  - starts the relay, then `jailer`, which chroots, drops to that uid, and execs
+    Firecracker with `"enclave": {"direct_mode": true}` so the guest boots as a
+    Nitro Sandbox. The guest has no network device, only vsock.
+  - If the VMM exits during boot, `run` fails with its console output and
+    removes everything it created.
+- **Runtime control.** Firecracker also serves its API on the chroot's
+  `api.sock`. The daemon uses it for `ls` (running or paused), `pause`,
+  `resume` and `stop`. `stop` asks for a clean power-off first: it resumes a
+  paused guest, then sends `shutdown` to guest vsock port 1024 (and Ctrl-Alt-Del
+  on x86_64). Only a guest that doesn't answer, or doesn't power off within
+  15 s, gets SIGTERM and then SIGKILL, and `stop` says which happened. The
+  daemon then gives the image back to you and deletes the chroot.
+- **Collect**, as you, on `stop` (or `diff`, once the guest exits by itself):
+  replays the image's journal, copies `/repo` out with `debugfs rdump`, and
+  fetches only `agent/<name>` back into your repository. Uncommitted guest
+  changes become a WIP commit first. The guest's repository is treated as
+  hostile: any symlink under `.git` aborts the collect, `.git/config` is
+  replaced with a minimal one, and hooks are removed and disabled, so nothing
+  the guest wrote runs on the host. Your checkout and working tree are never
+  touched. When the branch has commits, it is then checked out as a linked
+  worktree at `<sandbox dir>/worktree` so you can open, build and test it. That
+  checkout holds the committed contents of the fetched branch only, never the
+  guest's files directly.
+- **The relay**, a set of tasks in the daemon for each running sandbox, serves
+  the guest's vsock ports from the chroot.
+  - Port 3128 is an opaque pipe to the box's egress proxy (`HTTPS_PROXY`, or
+    `DEVBOX_SANDBOX_EGRESS_PROXY`), so the proxy's policy applies.
+  - Port 8080 forwards model API calls (`/<integration>/<path>`) to the control
+    plane's credential-injecting `/egress/<integration>/<path>`. Guest
+    credential headers are dropped and the box's web-identity token is added.
+  - Port 9418 runs `git receive-pack` (as you, with no global or system git
+    config) into the sandbox's own bare `inbox.git`, so `diff` on a running
+    sandbox shows what it has pushed so far (fetched onto
+    `refs/sandbox/<name>/live`).
+  - A port whose upstream isn't configured on the box (no proxy, no
+    `DEVBOX_SERVER_URL`) is left unbound, so the guest's connection is refused.
+    No credential enters the guest.
+- **State** lives in `/workspace/.sandboxes/<name>/` (`DEVBOX_SANDBOX_DIR`):
+  `meta.json` (yours), `runtime.json` (the daemon's: VMM pid and jail uid),
+  `console.log`, `inbox.git`, the image until it is collected, and the chroot
+  while running. Socket paths in the chroot must fit in 107 bytes, which `run`
+  checks.
 
-Host requirements, checked before anything is created, with a message naming
-the fix: `/dev/nitro_enclaves` (pool `nitro_sandboxes_enabled` in devbox-infra),
-write access to it (the `ne` group), and the VMM and guest image
-(`DEVBOX_SANDBOX_FIRECRACKER`, `DEVBOX_SANDBOX_KERNEL`, `DEVBOX_SANDBOX_ROOTFS`;
-defaults `firecracker` on `PATH` and `/opt/devbox/sandbox/{vmlinux,rootfs.ext4}`).
+Host requirements, checked by the daemon before anything is created, each with
+a message naming the fix:
+- `/dev/nitro_enclaves`, from the pool's `nitro_sandboxes_enabled` in devbox-infra;
+- the VMM and `jailer` (`DEVBOX_SANDBOX_FIRECRACKER`, `DEVBOX_SANDBOX_JAILER`;
+  default: on `PATH`);
+- the guest image (`DEVBOX_SANDBOX_KERNEL`, `DEVBOX_SANDBOX_ROOTFS`; default
+  `/opt/devbox/sandbox/{vmlinux,rootfs.ext4}`).
 
-Not built yet (smoketurner/devbox#164): the guest image and its init (mount the
-workspace, map the vsock ports to loopback, listen for `shutdown` on port
-1024, run the harness, push and commit, power off), `attach`, and the AMI bake of
-Firecracker plus the guest image. Until those land, `run` stops at the preflight
-on every host.
+Not built yet (smoketurner/devbox#164):
+- the guest image and its init: mount the workspace, map the vsock ports to
+  loopback, listen for `shutdown` on port 1024, run the harness, push and
+  commit, power off;
+- `attach`;
+- the AMI bake of Firecracker, `jailer` and the guest image.
+
+Until the AMI bake lands, `run` stops at the daemon's preflight on every host.
+Unverified until it runs on a real enclave host: whether `jailer` accepts the
+Nitro Enclaves device node the daemon puts in its chroot. jailer itself only
+creates `/dev/kvm` and friends, and AWS doesn't document how it handles this
+device.
 
 ## Design
 

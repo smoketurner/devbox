@@ -10,6 +10,7 @@
 //! - `doctor` — print a read-only diagnostic of warm-cache delivery.
 //! - `sandbox` — run sub-agents in Nitro Sandboxes (hardware-isolated child VMs)
 //!   on a claimed box, each on its own clone, with work returned as a git branch.
+//! - `sandboxd` — the root daemon (systemd) that jails and runs sandbox VMMs.
 
 mod checkout;
 mod control_plane;
@@ -74,6 +75,9 @@ enum Command {
         #[command(subcommand)]
         command: sandbox::SandboxCommand,
     },
+    /// Run the sandbox daemon (root, under systemd): jails and runs sandbox
+    /// VMMs and their vsock relays for `sandbox` commands.
+    Sandboxd,
 }
 
 // Current-thread runtime: the agent reads IMDS / calls the AWS SDK (both async)
@@ -125,6 +129,17 @@ async fn main() -> ExitCode {
             // git parses stdout: emit only the credential protocol, no tracing.
             git_credential::run(&operation).await;
             ExitCode::SUCCESS
+        }
+        Command::Sandboxd => {
+            init_tracing();
+            let config = sandbox::daemon::Config::from_env().await;
+            match sandbox::daemon::serve(config).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    tracing::error!(error = %format!("{e:#}"), "sandbox daemon failed");
+                    ExitCode::FAILURE
+                }
+            }
         }
         Command::Sandbox { command } => {
             // Human-facing output on stdout; warnings (and the relay's logs) on

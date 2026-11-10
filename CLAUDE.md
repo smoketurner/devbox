@@ -105,7 +105,7 @@ Rust workspace, four crates:
 | `devbox-common` | Shared types: `DevboxState`, API request/response |
 | `devbox-server` | Axum API (`/api/v1/devboxes/*`) + HTML dashboard, document store (SQLite dev / Aurora DSQL prod), ASG-adopting pool reconciler, AWS compute layer |
 | `devbox-cli`    | `claim` / `release` / `rename` / `list` / `status` / `ssh` |
-| `devbox-agent`  | On-host binary baked into the AMI: `principals` (sshd resolver), `owner-sync` (provision the claimant's account), `warmup` (self-tags `devbox:ready=true` once warmed), `checkout` (clone repos into `/workspace`), `doctor` (diagnose warm-cache delivery), `sandbox` (run sub-agents in Nitro Sandboxes, work collected as `agent/<name>` branches). musl static; built/released by CI, downloaded into the golden AMI |
+| `devbox-agent`  | On-host binary baked into the AMI: `principals` (sshd resolver), `owner-sync` (provision the claimant's account), `warmup` (self-tags `devbox:ready=true` once warmed), `checkout` (clone repos into `/workspace`), `doctor` (diagnose warm-cache delivery), `sandbox` (run sub-agents in Nitro Sandboxes, work collected as `agent/<name>` branches), `sandboxd` (root daemon that jails and runs the sandbox VMMs). musl static; built/released by CI, downloaded into the golden AMI |
 
 **Pool management is ASG-based and the reconciler is adopt-only.** The Launch
 Template and ASG are **provisioned by Terraform** in `devbox-infra`; there is no
@@ -197,7 +197,7 @@ in-memory SQLite.
 | Shared types | `crates/devbox-common/src/lib.rs` |
 | CLI (incl. `ssh` over SSM) | `crates/devbox-cli/src/main.rs` (Clap definitions), `crates/devbox-cli/src/command.rs` (handlers), `crates/devbox-cli/src/ssh.rs`, `crates/devbox-cli/src/ssm.rs` (native data channel) |
 | On-host agent (principals / owner-sync / warmup / checkout) | `crates/devbox-agent/src/` |
-| Sub-agent sandboxes (`devbox-agent sandbox`) | `crates/devbox-agent/src/sandbox/` (`workspace.rs` = clone + hostile-repo collect, `firecracker.rs` = Nitro Sandbox VMM backend, `relay.rs` = host side of the guest's vsock ports) |
+| Sub-agent sandboxes (`devbox-agent sandbox`) | `crates/devbox-agent/src/sandbox/` (`workspace.rs` = clone + hostile-repo collect, `firecracker.rs` = Nitro Sandbox VMM backend, `relay.rs` = host side of the guest's vsock ports, `daemon.rs` = root `sandboxd`, `jail.rs` = jailer chroot) |
 | Server entry / config / shutdown | `crates/devbox-server/src/main.rs` |
 | HTTP routes | `crates/devbox-server/src/routes.rs`, `crates/devbox-server/src/service.rs` (domain logic) |
 | Dashboard UI | `crates/devbox-server/src/ui.rs` |
@@ -347,18 +347,20 @@ open; the CLI's `list`/`status`/`ssh` therefore require `devbox login` too.
 
 **Planned / not yet built** (ideas borrowed from [`.kiro/references.md`](.kiro/references.md)
 are tagged inline):
-- **Sub-agent sandboxes (smoketurner/devbox#164)** — `devbox-agent sandbox
-  run|ls|logs|diff|pause|resume|stop` is built: per-sub-agent clone on `agent/<name>`, ext4
-  workspace image, Firecracker config in Nitro Sandbox direct mode with no NIC
-  (vsock only), a collect step that treats the guest repo as hostile, and a
-  per-sandbox vsock relay (`sandbox/relay.rs`: egress proxy pipe, model API
-  forwarding to the control plane's `/egress/*` with the box token, `git push`
+- **Sub-agent sandboxes (smoketurner/devbox#164)** — built: `devbox-agent sandbox
+  run|ls|logs|diff|pause|resume|stop` (claimant side: per-sub-agent clone on
+  `agent/<name>`, ext4 workspace image, a collect step that treats the guest repo
+  as hostile, review worktree) and the root daemon `devbox-agent sandboxd`
+  (`sandbox/daemon.rs`, peer-credential-checked Unix socket) that runs each VMM
+  under Firecracker's `jailer` (`sandbox/jail.rs`: chroot, per-sandbox uid,
+  Nitro Sandbox direct mode, no NIC), its vsock relay (`sandbox/relay.rs`: egress
+  proxy pipe, model API forwarding to `/egress/*` with the box token, `git push`
   inbox for live `diff`), and runtime control over the Firecracker API socket
-  (`sandbox/api.rs`: `pause`/`resume`, paused state in `ls`, clean shutdown via
-  the guest's vsock control port before any signal). Still missing: the guest image + init, `attach`, and
-  the AMI bake (Firecracker + guest image; infra side is
-  `nitro_sandboxes_enabled`, devbox-infra#30). Until then `run` stops at its
-  preflight.
+  (`sandbox/api.rs`: pause/resume, clean shutdown via the guest's control port).
+  Still missing: the guest image + init, `attach`, and the AMI bake (Firecracker,
+  jailer, guest image, `devbox-sandboxd.service`; infra side is
+  `nitro_sandboxes_enabled`, devbox-infra#30). Until then `run` stops at the
+  daemon's preflight.
 - **Principal ↔ Unix-username alignment (operational)** — Server-side validation
   now rejects a non-Unix-safe `owner` at claim time (see "Owner validation"
   above), but the Vouch config must still be set so `AUTH_PRINCIPAL_CLAIM` emits a
