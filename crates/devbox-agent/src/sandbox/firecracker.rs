@@ -403,6 +403,7 @@ mod tests {
             memory_mib: 4096,
             pid: None,
             collected: false,
+            worktree: None,
         }
     }
 

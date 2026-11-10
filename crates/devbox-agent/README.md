@@ -162,6 +162,7 @@ calm-quilt           running   claude   2m     /workspace/devbox
 $ devbox-agent sandbox logs calm-quilt -f    # follow the guest console
 $ devbox-agent sandbox stop calm-quilt       # stop it, fetch its work
 collected 3 commit(s) from calm-quilt onto agent/calm-quilt
+$ cd /workspace/.sandboxes/calm-quilt/worktree   # open, build, test it
 $ devbox-agent sandbox diff calm-quilt       # review
 $ git merge agent/calm-quilt                 # take it
 ```
@@ -179,7 +180,11 @@ How it works:
   WIP commit first. The guest's repository is treated as hostile: any symlink
   under `.git` aborts the collect, `.git/config` is replaced with a minimal one,
   and hooks are removed and disabled, so nothing the guest wrote runs on the
-  host. Your checkout and working tree are never touched.
+  host. Your checkout and working tree are never touched. When the branch has
+  commits, it is then checked out as a linked worktree at
+  `<sandbox dir>/worktree` so you can open, build and test it. That checkout
+  holds the committed contents of the fetched branch only, never the guest's
+  files directly.
 - State lives in `/workspace/.sandboxes/<name>/` (`DEVBOX_SANDBOX_DIR` to
   override): `meta.json`, `console.log`, and the image until it is collected.
 

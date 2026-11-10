@@ -228,6 +228,30 @@ pub(crate) async fn collect(
     })
 }
 
+/// Check `branch` out into a new linked worktree at `path`, so the claimant can
+/// open, build and test the sub-agent's work before merging it.
+///
+/// This runs only after [`collect`], so the files written here are exactly the
+/// committed contents of the fetched branch, never the guest's working tree.
+///
+/// # Errors
+///
+/// Returns an error if `path` exists or git refuses (e.g. `branch` is already
+/// checked out elsewhere).
+pub(crate) async fn add_review_worktree(repo: &Path, path: &Path, branch: &str) -> Result<()> {
+    let target = path
+        .to_str()
+        .with_context(|| format!("worktree path {} is not UTF-8", path.display()))?;
+    run_git(
+        repo,
+        None,
+        &["worktree", "add", "--quiet", target, branch],
+        GIT_TIMEOUT,
+    )
+    .await
+    .with_context(|| format!("check out {branch} at {target}"))
+}
+
 /// Reject symlinks under `.git` and replace its config and hooks (module docs).
 async fn sanitize_export(export: &Path) -> Result<()> {
     let git_dir = export.join(".git");
@@ -370,7 +394,7 @@ async fn commit_leftovers(export: &Path, name: &str, branch: &str) -> Result<boo
 mod tests {
     use std::path::Path;
 
-    use super::{collect, head_commit, prepare_clone, repo_root};
+    use super::{add_review_worktree, collect, head_commit, prepare_clone, repo_root};
     use crate::sandbox::test_support::{commit_file, git, init_repo, temp_root};
 
     #[tokio::test]
@@ -448,6 +472,40 @@ mod tests {
         // The claimant's checkout is untouched.
         assert_eq!(git(&repo, &["rev-parse", "HEAD"]), base);
         assert!(!repo.join("fix.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn review_worktree_checks_out_the_collected_branch() {
+        let root = temp_root("ws-worktree");
+        let repo = init_repo(&root.join("repo"));
+        let base = head_commit(&repo).await.unwrap();
+        let export = root.join("export");
+        prepare_clone(&repo, &base, "agent/calm-quilt", &export)
+            .await
+            .unwrap();
+        commit_file(&export, "fix.txt", "fixed\n");
+        collect(&repo, &export, "calm-quilt", "agent/calm-quilt", &base)
+            .await
+            .unwrap();
+
+        let tree = root.join("review");
+        add_review_worktree(&repo, &tree, "agent/calm-quilt")
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tree.join("fix.txt")).unwrap(),
+            "fixed\n"
+        );
+        assert_eq!(
+            git(&tree, &["branch", "--show-current"]),
+            "agent/calm-quilt"
+        );
+        // A second checkout of the same branch is refused, not clobbered.
+        assert!(
+            add_review_worktree(&repo, &root.join("again"), "agent/calm-quilt")
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

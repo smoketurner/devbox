@@ -147,6 +147,7 @@ async fn start(store: &Store, fc: &Firecracker, args: RunArgs) -> Result<()> {
         memory_mib: args.memory_mib,
         pid: None,
         collected: false,
+        worktree: None,
     };
     let dir = store.create(&meta)?;
 
@@ -249,6 +250,14 @@ async fn collect_and_report(store: &Store, mut meta: SandboxMeta) -> Result<()> 
     Firecracker::discard_image(&dir)?;
     meta.collected = true;
     meta.pid = None;
+    if collected.commits > 0 {
+        // Best effort: the branch is safe in the repo whether or not this works.
+        let tree = dir.join("worktree");
+        match workspace::add_review_worktree(&meta.repo, &tree, &meta.branch).await {
+            Ok(()) => meta.worktree = Some(tree),
+            Err(e) => eprintln!("warning: no review checkout: {e:#}"),
+        }
+    }
     store.save(&meta)?;
 
     let wip = if collected.wip_committed {
@@ -257,12 +266,15 @@ async fn collect_and_report(store: &Store, mut meta: SandboxMeta) -> Result<()> 
         ""
     };
     println!(
-        "collected {commits} commit(s) from {name} onto {branch}{wip}\
-         \n\n  devbox-agent sandbox diff {name}   review\
-         \n  git merge {branch}   take it",
-        commits = collected.commits,
-        name = meta.name,
-        branch = meta.branch,
+        "collected {} commit(s) from {} onto {}{wip}\n",
+        collected.commits, meta.name, meta.branch
+    );
+    if let Some(tree) = &meta.worktree {
+        println!("  cd {}   open, build, test", tree.display());
+    }
+    println!(
+        "  devbox-agent sandbox diff {}   review the diff\n  git merge {}   take it",
+        meta.name, meta.branch
     );
     Ok(())
 }
@@ -489,6 +501,7 @@ mod tests {
             memory_mib: 4096,
             pid: None,
             collected,
+            worktree: None,
         }
     }
 
@@ -576,6 +589,12 @@ wait
         );
         let files = git(&repo, &["ls-tree", "--name-only", "agent/calm-quilt"]);
         assert!(files.contains("guest.txt"), "{files}");
+        let tree = meta.worktree.clone().unwrap();
+        assert_eq!(tree, dir.join("worktree"));
+        assert_eq!(
+            std::fs::read_to_string(tree.join("guest.txt")).unwrap(),
+            "from the guest\n"
+        );
         assert!(
             !repo.join("guest.txt").exists(),
             "claimant checkout untouched"

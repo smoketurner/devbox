@@ -55,6 +55,9 @@ pub(crate) struct SandboxMeta {
     pub(crate) pid: Option<u32>,
     /// Whether the guest's commits have been fetched onto `branch`.
     pub(crate) collected: bool,
+    /// Review checkout of `branch` on the host, once collected.
+    #[serde(default)]
+    pub(crate) worktree: Option<PathBuf>,
 }
 
 /// The directory holding every sandbox on this box.
@@ -213,6 +216,7 @@ mod tests {
             memory_mib: 4096,
             pid: None,
             collected: false,
+            worktree: None,
         }
     }
 
