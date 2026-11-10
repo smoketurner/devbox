@@ -180,8 +180,8 @@ pub(crate) async fn init_inbox(dir: &Path) -> Result<()> {
 pub(crate) enum Auth {
     /// This box's web-identity token, minted and refreshed via STS.
     ControlPlane(tokio::sync::Mutex<ControlPlaneClient>),
-    /// A fixed token, for tests standing in for the control plane.
-    #[cfg(test)]
+    /// A fixed token, for the (Linux-only) tests standing in for the control plane.
+    #[cfg(all(test, target_os = "linux"))]
     Fixed(String),
 }
 
@@ -189,7 +189,7 @@ impl Auth {
     async fn token(&self) -> Result<String> {
         match self {
             Self::ControlPlane(client) => client.lock().await.bearer().await,
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "linux"))]
             Self::Fixed(token) => Ok(token.clone()),
         }
     }

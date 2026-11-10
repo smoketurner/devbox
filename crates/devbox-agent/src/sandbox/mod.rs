@@ -90,7 +90,8 @@ pub(crate) enum SandboxCommand {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RelayMode {
     Spawn,
-    #[cfg(test)]
+    // Only the Linux-only end-to-end tests launch sandboxes.
+    #[cfg(all(test, target_os = "linux"))]
     Skip,
 }
 
@@ -276,7 +277,7 @@ async fn launch(
     // The relay listens before the guest boots, so its first connection lands.
     let relay_pid = match relay_mode {
         RelayMode::Spawn => Some(spawn_relay(store, dir, &meta.name).await?),
-        #[cfg(test)]
+        #[cfg(all(test, target_os = "linux"))]
         RelayMode::Skip => None,
     };
     let pid = match fc.launch(dir, meta, &stage, disk_gib).await {
