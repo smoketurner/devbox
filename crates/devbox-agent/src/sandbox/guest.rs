@@ -898,6 +898,21 @@ exec sleep 60
         check()
     }
 
+    /// Files on the agent branch in the host inbox, once anything was pushed.
+    #[cfg(target_os = "linux")]
+    fn inbox_files(root: &std::path::Path) -> Option<String> {
+        inbox_head(root)?;
+        let out = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(root.join("host/inbox.git"))
+            .args(["ls-tree", "--name-only", "refs/heads/agent/calm-quilt"])
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
     #[cfg(target_os = "linux")]
     fn inbox_head(root: &std::path::Path) -> Option<String> {
         let out = std::process::Command::new("git")
@@ -927,13 +942,14 @@ exec sleep 60
 
         let g = guest("guest-shutdown", HARNESS).await;
         // The harness's commit reaches the host inbox through the git port.
+        // The first push can carry only the base commit (the harness hasn't
+        // committed yet); wait for the push that carries the harness's work.
         assert!(
-            eventually(|| inbox_head(&g.root).is_some()).await,
-            "nothing pushed"
+            eventually(|| inbox_files(&g.root).is_some_and(|f| f.contains("task.txt"))).await,
+            "the harness's commit was never pushed: {:?}",
+            inbox_files(&g.root)
         );
         let inbox = g.root.join("host/inbox.git");
-        let files = git(&inbox, &["ls-tree", "--name-only", "agent/calm-quilt"]);
-        assert!(files.contains("task.txt"), "{files}");
 
         // The harness saw loopback proxy and model URLs and placeholder keys.
         let env = std::fs::read_to_string(g.root.join("ws/harness.env")).unwrap();
