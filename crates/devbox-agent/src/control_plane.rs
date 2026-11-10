@@ -101,6 +101,21 @@ impl ControlPlaneClient {
         }))
     }
 
+    /// The control-plane base URL (no trailing slash).
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// A valid web-identity JWT for presenting to the control plane as a bearer
+    /// token, minted or refreshed as needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the STS mint fails.
+    pub(crate) async fn bearer(&mut self) -> Result<String> {
+        self.web_identity_token().await
+    }
+
     /// A read-only, repo-scoped token for `remote`, cached per remote, or
     /// `Ok(None)` when the server reports `remote` is not a repo on the App's
     /// GitHub host (the caller then fetches unauthenticated).

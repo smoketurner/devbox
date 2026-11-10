@@ -8,6 +8,9 @@
 //! - `warmup` — warm the host and self-tag `devbox:ready=true` so the reconciler
 //!   marks the `DevboxDoc` Ready; boxes that never tag ready are reaped.
 //! - `doctor` — print a read-only diagnostic of warm-cache delivery.
+//! - `sandbox` — run sub-agents in Nitro Sandboxes (hardware-isolated child VMs)
+//!   on a claimed box, each on its own clone, with work returned as a git branch.
+//! - `sandboxd` — the root daemon (systemd) that jails and runs sandbox VMMs.
 
 mod checkout;
 mod control_plane;
@@ -18,6 +21,7 @@ mod git_credential;
 mod imds;
 mod owner_sync;
 mod principals;
+mod sandbox;
 mod warmup;
 
 use std::path::PathBuf;
@@ -64,6 +68,34 @@ enum Command {
     GitCredential {
         /// The git credential operation (`get`, `store`, or `erase`).
         operation: String,
+    },
+    /// Run sub-agents in Nitro Sandboxes: each gets its own clone of the repo on
+    /// branch `agent/<name>`, and its work comes back as that branch.
+    Sandbox {
+        #[command(subcommand)]
+        command: sandbox::SandboxCommand,
+    },
+    /// Run the sandbox daemon (root, under systemd): jails and runs sandbox
+    /// VMMs and their vsock relays for `sandbox` commands.
+    Sandboxd,
+    /// The init inside a sandbox guest (run by the guest image's
+    /// `devbox-guest.service`, not on the host). Linux only, like vsock.
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
+    Guest {
+        #[command(subcommand)]
+        command: Option<GuestCommand>,
+    },
+}
+
+/// `devbox-agent guest` subcommands (none: run the init).
+#[cfg(target_os = "linux")]
+#[derive(Subcommand)]
+enum GuestCommand {
+    /// Connect stdin/stdout to host vsock port PORT (git's `ext::` transport).
+    VsockPipe {
+        /// Host vsock port.
+        port: u32,
     },
 }
 
@@ -116,6 +148,56 @@ async fn main() -> ExitCode {
             // git parses stdout: emit only the credential protocol, no tracing.
             git_credential::run(&operation).await;
             ExitCode::SUCCESS
+        }
+        Command::Sandboxd => {
+            init_tracing();
+            let config = sandbox::daemon::Config::from_env().await;
+            match sandbox::daemon::serve(config).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    tracing::error!(error = %format!("{e:#}"), "sandbox daemon failed");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        #[cfg(target_os = "linux")]
+        Command::Guest {
+            command: Some(GuestCommand::VsockPipe { port }),
+        } => {
+            // git speaks its protocol on stdout: errors only, on stderr.
+            match sandbox::guest::vsock_pipe(port).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("vsock-pipe: {e:#}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        #[cfg(target_os = "linux")]
+        Command::Guest { command: None } => {
+            init_tracing();
+            match sandbox::guest::run(sandbox::guest::Config::guest()).await {
+                Ok(ending) => {
+                    tracing::info!(?ending, "sandbox guest finished");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    tracing::error!(error = %format!("{e:#}"), "sandbox guest failed");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Command::Sandbox { command } => {
+            // Human-facing output on stdout; warnings (and the relay's logs) on
+            // stderr via tracing; the final error on stderr, like `doctor`.
+            init_tracing();
+            match sandbox::run(command).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e:#}");
+                    ExitCode::FAILURE
+                }
+            }
         }
     }
 }

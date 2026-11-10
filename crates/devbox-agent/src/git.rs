@@ -46,6 +46,35 @@ pub(crate) async fn run_git(
     await_git(cmd, &format!("git {}", args.join(" "))).await
 }
 
+/// Run `git -C <repo> <args>` under GNU `timeout <cap>` and return its trimmed
+/// stdout. No credentials are injected; use it for local queries (`rev-parse`,
+/// `rev-list`, `config --get`).
+///
+/// # Errors
+///
+/// Returns an error if git cannot be run, exits non-zero, or prints non-UTF-8.
+pub(crate) async fn git_output(repo: &Path, args: &[&str], cap: Duration) -> Result<String> {
+    let mut cmd = base_git_cmd(None, cap);
+    cmd.arg("-C").arg(repo).args(args);
+    let description = format!("git {}", args.join(" "));
+    let output = cmd
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+        .with_context(|| format!("run {description}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "{description} exited with {:?}: {}",
+            output.status.code(),
+            stderr.trim()
+        );
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .with_context(|| format!("{description} printed non-UTF-8 output"))?;
+    Ok(stdout.trim().to_owned())
+}
+
 /// Run `git clone <clone_args> <url> <dest>` under GNU `timeout <cap>`.
 ///
 /// Applies the same credential-helper and timeout machinery as [`run_git`], so the

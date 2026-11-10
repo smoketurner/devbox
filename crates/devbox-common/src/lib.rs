@@ -1,5 +1,7 @@
 //! Shared types for the devbox orchestration service.
 
+pub mod naming;
+
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
