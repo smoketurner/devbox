@@ -16,7 +16,7 @@ One binary, a handful of subcommands, each wired to a different host trigger:
 | `warmup` | `devbox-warmup.service` (systemd, at boot) | Freshen `/workspace` repos, then self-tag `devbox:ready=true` |
 | `checkout <urls>` | the snapshot-builder, or a developer/agent on a claimed box | Clone repos into `/workspace`, minting a read-only token per repo |
 | `doctor` | operator on a claimed box, via `devbox ssh -- devbox-agent doctor` | Print a read-only diagnostic of warm-cache delivery |
-| `sandbox run\|ls\|logs\|diff\|pause\|resume\|stop` | the claimant, logged in to their box | Run sub-agents in Nitro Sandboxes, each on its own clone; collect their work as `agent/<name>` branches |
+| `sandbox run\|ls\|logs\|diff\|attach\|pause\|resume\|stop` | the claimant, logged in to their box | Run sub-agents in Nitro Sandboxes, each on its own clone; collect their work as `agent/<name>` branches |
 | `sandboxd` | `devbox-sandboxd.service` (systemd, root) | Jail and run sandbox VMMs and their vsock relays for `sandbox` |
 
 ## `principals` — per-claim SSH authorization
@@ -161,6 +161,7 @@ NAME                 STATE     HARNESS  AGE    REPO
 calm-quilt           running   claude   2m     /workspace/devbox
 
 $ devbox-agent sandbox logs calm-quilt -f    # follow the guest console
+$ devbox-agent sandbox attach calm-quilt     # join the harness's terminal (detach: Ctrl-b d)
 $ devbox-agent sandbox pause calm-quilt      # freeze it; `resume` continues
 $ devbox-agent sandbox stop calm-quilt       # stop it, fetch its work
 collected 3 commit(s) from calm-quilt onto agent/calm-quilt
@@ -243,14 +244,33 @@ a message naming the fix:
 - the guest image (`DEVBOX_SANDBOX_KERNEL`, `DEVBOX_SANDBOX_ROOTFS`; default
   `/opt/devbox/sandbox/{vmlinux,rootfs.ext4}`).
 
-Not built yet (smoketurner/devbox#164):
-- the guest image and its init: mount the workspace, map the vsock ports to
-  loopback, listen for `shutdown` on port 1024, run the harness, push and
-  commit, power off;
-- `attach`;
-- the AMI bake of Firecracker, `jailer` and the guest image.
+- **Inside the guest**, `devbox-agent guest` (hidden; run by the guest image's
+  `devbox-guest.service`) is the other half of the contract:
+  - It mounts the workspace drive named on the kernel command line at
+    `/workspace` and reads `task.json`.
+  - It serves loopback listeners for the egress (`HTTPS_PROXY=http://127.0.0.1:3128`)
+    and model ports (`ANTHROPIC_BASE_URL=http://127.0.0.1:8080/anthropic`,
+    `OPENAI_BASE_URL=…/openai/v1`), each carried to the host relay over vsock
+    with `socat`.
+  - It adds a `devbox` git remote (`ext::socat STDIO VSOCK-CONNECT:2:9418`,
+    `push.negotiate` off) and pushes the agent branch every 30 s when it moves.
+  - It runs the harness against the task in tmux. Built in: `claude`
+    (`--dangerously-skip-permissions`), `codex`
+    (`--dangerously-bypass-approvals-and-sandbox`) and `shell`. A script at
+    `/etc/devbox/harnesses/<name>` overrides or adds one. The harness sees only
+    placeholder API keys.
+  - On the control port (1024) it accepts `shutdown` and `attach <rows> <cols>`.
+    `attach` runs `tmux attach` in a pty sized to your terminal.
+  - When the harness exits, or on `shutdown`, it commits what is left as a WIP
+    commit, pushes, and powers off.
+- **`attach`**: the CLI asks the daemon, which opens the guest's control port and
+  splices your connection to it. Your terminal goes into raw mode (through
+  `stty`) and is restored afterwards. Detaching (Ctrl-b d) leaves the harness
+  running.
 
-Until the AMI bake lands, `run` stops at the daemon's preflight on every host.
+Not built yet (smoketurner/devbox#164): the AMI bake of Firecracker, `jailer`
+and a guest kernel. The guest rootfs build is devbox-infra's `08-sandbox-guest`
+component. Until the AMI bake lands, `run` stops at the daemon's preflight on every host.
 Unverified until it runs on a real enclave host: whether `jailer` accepts the
 Nitro Enclaves device node the daemon puts in its chroot. jailer itself only
 creates `/dev/kvm` and friends, and AWS doesn't document how it handles this

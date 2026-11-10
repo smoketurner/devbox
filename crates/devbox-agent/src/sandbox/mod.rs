@@ -22,10 +22,12 @@
 mod api;
 pub(crate) mod daemon;
 mod firecracker;
+pub(crate) mod guest;
 mod jail;
 mod process;
 mod relay;
 mod store;
+mod terminal;
 mod workspace;
 
 use std::collections::BTreeMap;
@@ -81,6 +83,11 @@ pub(crate) enum SandboxCommand {
         /// Sandbox name.
         name: String,
     },
+    /// Attach your terminal to a running sandbox's harness (detach: Ctrl-b d).
+    Attach {
+        /// Sandbox name.
+        name: String,
+    },
 }
 
 /// Arguments for `devbox-agent sandbox run`.
@@ -127,6 +134,7 @@ pub(crate) async fn run(command: SandboxCommand) -> Result<()> {
         SandboxCommand::Stop { name } => stop(&store, &client, &name).await,
         SandboxCommand::Pause { name } => set_paused(&client, &name, true).await,
         SandboxCommand::Resume { name } => set_paused(&client, &name, false).await,
+        SandboxCommand::Attach { name } => attach(&client, &name).await,
     }
 }
 
@@ -391,6 +399,23 @@ async fn set_paused(client: &Client, name: &str, paused: bool) -> Result<()> {
     client.call(&request).await?;
     println!("{name} {}", if paused { "paused" } else { "resumed" });
     Ok(())
+}
+
+/// `sandbox attach`: join the harness's terminal until it detaches or exits.
+async fn attach(client: &Client, name: &str) -> Result<()> {
+    let tty = terminal::Tty::open();
+    let (rows, cols) = tty
+        .as_ref()
+        .and_then(terminal::Tty::size)
+        .unwrap_or((24, 80));
+    let conn = client.attach(name, rows, cols).await?;
+    eprintln!("attached to {name}; detach with Ctrl-b d");
+    // Raw mode for the session; the guard puts the terminal back afterwards.
+    let _raw = match &tty {
+        Some(tty) => Some(tty.raw()?),
+        None => None,
+    };
+    terminal::pipe(conn).await
 }
 
 /// The `sandbox ls` table. If the daemon can't be reached, the records are
@@ -718,7 +743,19 @@ while True:
         continue
     stream.write(b"OK 1073741824\n")
     stream.flush()
-    if stream.readline().strip() == b"shutdown":
+    line = stream.readline().strip()
+    if line.startswith(b"attach "):
+        # Stand-in terminal: greet with the size, then echo lines back.
+        def session(conn, stream, size):
+            stream.write(b"hello " + size + b"\n")
+            stream.flush()
+            for echoed in stream:
+                stream.write(echoed)
+                stream.flush()
+            conn.close()
+        threading.Thread(target=session, args=(conn, stream, line[7:]), daemon=True).start()
+        continue
+    if line == b"shutdown":
         with open(f"{sandbox}/clean-shutdown", "w") as f:
             f.write("yes\n")
         os._exit(0)
@@ -810,6 +847,23 @@ while True:
         assert!(chroot.join("vm.json").is_file() && chroot.join("vsock.sock_9418").exists());
         assert!(!dir.join("stage").exists(), "staging copy must be removed");
         assert!(ls(&store, &client).await.contains("running"));
+
+        // `attach` reaches the guest's control port through the daemon, with
+        // the terminal size, and then carries the session both ways.
+        {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            let conn = client.attach("calm-quilt", 40, 120).await.unwrap();
+            let mut session = tokio::io::BufReader::new(conn);
+            let mut line = String::new();
+            session.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "hello 40 120\n");
+            session.get_mut().write_all(b"ls\n").await.unwrap();
+            line.clear();
+            session.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "ls\n");
+        }
+        let err = client.attach("no-such-box", 24, 80).await.unwrap_err();
+        assert!(format!("{err:#}").contains("not running"), "{err:#}");
 
         set_paused(&client, "calm-quilt", true).await.unwrap();
         assert!(ls(&store, &client).await.contains("paused"));

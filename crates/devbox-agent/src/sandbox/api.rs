@@ -22,7 +22,7 @@ use hyper::header;
 use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
 use super::firecracker::VSOCK;
@@ -172,42 +172,72 @@ pub(crate) async fn send_ctrl_alt_del(dir: &Path) -> Result<()> {
     expect_success("send Ctrl-Alt-Del", status, &body)
 }
 
-/// Ask the guest to power off cleanly through its control port.
+/// Read one `\n`-terminated line from `stream`, a byte at a time, so nothing
+/// after it is consumed (the peer's next bytes may be a terminal session).
 ///
 /// # Errors
 ///
-/// Returns an error if the guest doesn't accept the connection (no listener on
-/// [`CONTROL_PORT`], or the VMM is gone).
-pub(crate) async fn request_guest_shutdown(dir: &Path) -> Result<()> {
+/// Returns an error on EOF before a newline, a line over `max` bytes, or
+/// non-UTF-8 input.
+pub(crate) async fn read_line_unbuffered(stream: &mut UnixStream, max: usize) -> Result<String> {
+    use tokio::io::AsyncReadExt;
+    let mut line = Vec::new();
+    loop {
+        let byte = stream
+            .read_u8()
+            .await
+            .context("connection closed mid-line")?;
+        if byte == b'\n' {
+            break;
+        }
+        anyhow::ensure!(line.len() < max, "line longer than {max} bytes");
+        line.push(byte);
+    }
+    String::from_utf8(line).context("line is not UTF-8")
+}
+
+/// Open a connection to the guest's control port through Firecracker's vsock
+/// socket in `vm_dir`, past the `CONNECT`/`OK` handshake.
+///
+/// # Errors
+///
+/// Returns an error if the VMM is gone or the guest isn't listening.
+pub(crate) async fn open_control(vm_dir: &Path) -> Result<UnixStream> {
     tokio::time::timeout(CALL_TIMEOUT, async {
-        let stream = UnixStream::connect(dir.join(VSOCK))
+        let mut stream = UnixStream::connect(vm_dir.join(VSOCK))
             .await
             .context("connect to the sandbox vsock")?;
-        let mut stream = BufReader::new(stream);
         stream
-            .get_mut()
             .write_all(format!("CONNECT {CONTROL_PORT}\n").as_bytes())
             .await
             .context("open the guest control port")?;
-        let mut reply = String::new();
-        stream
-            .read_line(&mut reply)
+        let reply = read_line_unbuffered(&mut stream, 64)
             .await
             .context("read the vsock handshake")?;
         anyhow::ensure!(
             reply.starts_with("OK "),
             "the guest is not listening on its control port"
         );
-        stream
-            .get_mut()
-            .write_all(b"shutdown\n")
-            .await
-            .context("send shutdown")?;
-        stream.get_mut().shutdown().await.ok();
-        Ok(())
+        Ok(stream)
     })
     .await
-    .context("guest shutdown request timed out")?
+    .context("connecting to the guest control port timed out")?
+}
+
+/// Ask the guest to power off cleanly through its control port.
+///
+/// # Errors
+///
+/// Returns an error if the guest doesn't accept the connection (no listener on
+/// [`CONTROL_PORT`], or the VMM is gone).
+pub(crate) async fn request_guest_shutdown(vm_dir: &Path) -> Result<()> {
+    let mut stream = open_control(vm_dir).await?;
+    stream
+        .write_all(b"shutdown\n")
+        .await
+        .context("send shutdown")?;
+    stream.shutdown().await.ok();
+    Ok(())
 }
 
 // Unix-socket paths of a scratch dir: Linux only, like the backend.

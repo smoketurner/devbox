@@ -35,7 +35,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use devbox_common::env_non_empty;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use super::api::{self, VmState};
@@ -52,7 +52,7 @@ const DEFAULT_SOCKET: &str = "/run/devbox/sandboxd.sock";
 const DEFAULT_OWNER_PATH: &str = "/workspace";
 
 /// Largest request accepted.
-const MAX_REQUEST: u64 = 65_536;
+const MAX_REQUEST: usize = 65_536;
 
 /// How long `start` waits before checking the VMM survived boot.
 const BOOT_CHECK: Duration = Duration::from_millis(750);
@@ -68,11 +68,26 @@ const CLIENT_TIMEOUT: Duration = Duration::from_mins(5);
 #[serde(tag = "op", rename_all = "snake_case")]
 pub(crate) enum Request {
     Preflight,
-    Start { name: String },
-    Stop { name: String },
-    Pause { name: String },
-    Resume { name: String },
+    Start {
+        name: String,
+    },
+    Stop {
+        name: String,
+    },
+    Pause {
+        name: String,
+    },
+    Resume {
+        name: String,
+    },
     Status,
+    /// Attach a terminal to the harness. After an `ok` answer the connection
+    /// carries the terminal session in both directions.
+    Attach {
+        name: String,
+        rows: u16,
+        cols: u16,
+    },
 }
 
 /// A running sandbox's state.
@@ -186,25 +201,50 @@ fn bind(path: &Path) -> Result<UnixListener> {
 
 impl Daemon {
     /// Answer one request on `conn`.
-    async fn connection(&self, conn: UnixStream) -> Result<()> {
+    async fn connection(&self, mut conn: UnixStream) -> Result<()> {
         let peer = conn.peer_cred().context("read peer credentials")?.uid();
-        let (read, mut write) = conn.into_split();
-        let mut line = String::new();
-        BufReader::new(read.take(MAX_REQUEST))
-            .read_line(&mut line)
+        let line = api::read_line_unbuffered(&mut conn, MAX_REQUEST)
             .await
             .context("read request")?;
 
-        let response = match self.authorize(peer) {
-            Err(e) => error(&e),
-            Ok(()) => match serde_json::from_str::<Request>(line.trim()) {
-                Ok(request) => self.handle(request).await.unwrap_or_else(|e| error(&e)),
-                Err(e) => error(&anyhow::anyhow!("malformed request: {e}")),
-            },
+        let request = match self.authorize(peer) {
+            Err(e) => Err(e),
+            Ok(()) => serde_json::from_str::<Request>(line.trim())
+                .map_err(|e| anyhow::anyhow!("malformed request: {e}")),
         };
-        let mut reply = serde_json::to_vec(&response).context("serialize response")?;
-        reply.push(b'\n');
-        write.write_all(&reply).await.context("write response")?;
+        if let Ok(Request::Attach { name, rows, cols }) = &request {
+            return self.attach(conn, name, *rows, *cols).await;
+        }
+        let response = match request {
+            Ok(request) => self.handle(request).await.unwrap_or_else(|e| error(&e)),
+            Err(e) => error(&e),
+        };
+        reply(&mut conn, &response).await
+    }
+
+    /// `attach`: connect to the guest's control port and splice the caller's
+    /// connection to it until either side closes.
+    async fn attach(&self, mut conn: UnixStream, name: &str, rows: u16, cols: u16) -> Result<()> {
+        let guest = async {
+            let (dir, _) = self
+                .live(name)
+                .with_context(|| format!("sandbox {name} is not running"))?;
+            let mut guest = api::open_control(&self.config.jail.vm_dir(&dir, name)).await?;
+            guest
+                .write_all(format!("attach {rows} {cols}\n").as_bytes())
+                .await
+                .context("ask the guest to attach")?;
+            anyhow::Ok(guest)
+        }
+        .await;
+        let mut guest = match guest {
+            Ok(guest) => guest,
+            Err(e) => return reply(&mut conn, &error(&e)).await,
+        };
+        reply(&mut conn, &Response::Ok).await?;
+        tokio::io::copy_bidirectional(&mut conn, &mut guest)
+            .await
+            .ok();
         Ok(())
     }
 
@@ -242,6 +282,7 @@ impl Daemon {
             Request::Status => Ok(Response::Status {
                 sandboxes: self.status().await,
             }),
+            Request::Attach { .. } => anyhow::bail!("attach is served on its own connection"),
         }
     }
 
@@ -432,6 +473,13 @@ impl Daemon {
     }
 }
 
+/// Write `response` as one JSON line.
+async fn reply(conn: &mut UnixStream, response: &Response) -> Result<()> {
+    let mut line = serde_json::to_vec(response).context("serialize response")?;
+    line.push(b'\n');
+    conn.write_all(&line).await.context("write response")
+}
+
 fn error(e: &anyhow::Error) -> Response {
     Response::Error {
         message: format!("{e:#}"),
@@ -472,14 +520,44 @@ impl Client {
         }
     }
 
-    async fn exchange(&self, request: &Request) -> Result<Response> {
-        let conn = UnixStream::connect(&self.socket).await.with_context(|| {
+    /// Send an `attach` request; on success, return the connection, which now
+    /// carries the terminal session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the daemon is unreachable or refuses.
+    pub(crate) async fn attach(&self, name: &str, rows: u16, cols: u16) -> Result<UnixStream> {
+        let mut conn = self.connect().await?;
+        let request = Request::Attach {
+            name: name.to_owned(),
+            rows,
+            cols,
+        };
+        let mut line = serde_json::to_vec(&request).context("serialize request")?;
+        line.push(b'\n');
+        conn.write_all(&line).await.context("send request")?;
+        let answer = api::read_line_unbuffered(&mut conn, MAX_REQUEST)
+            .await
+            .context("read the daemon's answer")?;
+        match serde_json::from_str(answer.trim()).context("parse the daemon's answer")? {
+            Response::Ok => Ok(conn),
+            Response::Error { message } => Err(anyhow::anyhow!(message)),
+            other => anyhow::bail!("unexpected answer from the sandbox daemon: {other:?}"),
+        }
+    }
+
+    async fn connect(&self) -> Result<UnixStream> {
+        UnixStream::connect(&self.socket).await.with_context(|| {
             format!(
                 "the sandbox daemon isn't reachable at {} (check `systemctl status \
                  devbox-sandboxd`; this AMI may predate it)",
                 self.socket.display()
             )
-        })?;
+        })
+    }
+
+    async fn exchange(&self, request: &Request) -> Result<Response> {
+        let conn = self.connect().await?;
         let (read, mut write) = conn.into_split();
         let mut line = serde_json::to_vec(request).context("serialize request")?;
         line.push(b'\n');

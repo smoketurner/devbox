@@ -78,6 +78,10 @@ enum Command {
     /// Run the sandbox daemon (root, under systemd): jails and runs sandbox
     /// VMMs and their vsock relays for `sandbox` commands.
     Sandboxd,
+    /// The init inside a sandbox guest (run by the guest image's
+    /// `devbox-guest.service`, not on the host).
+    #[command(hide = true)]
+    Guest,
 }
 
 // Current-thread runtime: the agent reads IMDS / calls the AWS SDK (both async)
@@ -137,6 +141,19 @@ async fn main() -> ExitCode {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     tracing::error!(error = %format!("{e:#}"), "sandbox daemon failed");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Command::Guest => {
+            init_tracing();
+            match sandbox::guest::run(sandbox::guest::Config::guest()).await {
+                Ok(ending) => {
+                    tracing::info!(?ending, "sandbox guest finished");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    tracing::error!(error = %format!("{e:#}"), "sandbox guest failed");
                     ExitCode::FAILURE
                 }
             }
