@@ -362,9 +362,10 @@ are tagged inline):
   the branch, runs the harness once (`claude -p`, `codex exec`), WIP-commits and
   powers off). The guest
   rootfs build and `devbox-sandboxd.service` are in devbox-infra
-  (`07-nitro-sandboxes`, `08-sandbox-guest`). Still missing: a sandbox-capable
-  Firecracker, `jailer` and guest kernel in the AMI (no AWS package located yet).
-  Until then `run` stops at the daemon's preflight.
+  (`07-nitro-sandboxes`, `08-sandbox-guest`). The AMI bakes upstream
+  Firecracker 1.18 and its `jailer`, and the guest boots the host's own AL2023
+  6.18 kernel with a dracut initramfs (`initrd_path`). Not yet run on a real
+  enclave-enabled host; the dev pool's `t4g.small` can't enable enclaves.
 - **Principal ↔ Unix-username alignment (operational)** — Server-side validation
   now rejects a non-Unix-safe `owner` at claim time (see "Owner validation"
   above), but the Vouch config must still be set so `AUTH_PRINCIPAL_CLAIM` emits a
