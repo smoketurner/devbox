@@ -1268,7 +1268,7 @@ dependencies = [
 
 [[package]]
 name = "devbox-agent"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -1294,7 +1294,7 @@ dependencies = [
 
 [[package]]
 name = "devbox-cli"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -1323,7 +1323,7 @@ dependencies = [
 
 [[package]]
 name = "devbox-common"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "jiff",
@@ -1333,7 +1333,7 @@ dependencies = [
 
 [[package]]
 name = "devbox-server"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "askama",

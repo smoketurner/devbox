@@ -2,7 +2,7 @@
 //!
 //! The VMM is the code that parses device I/O from a hostile guest, so it runs
 //! as a dedicated unprivileged uid inside a chroot that holds nothing but what
-//! it needs: the guest kernel, the read-only root filesystem, the workspace
+//! it needs: the guest kernel and initramfs, the read-only root filesystem, the workspace
 //! image, the Nitro Enclaves device node, and its sockets. A guest that escapes
 //! into the VMM lands there, not in the claimant's session or the daemon.
 //!
@@ -10,7 +10,8 @@
 //!
 //! ```text
 //! <dir>/j/<vmm>/<name>/root/        the chroot (jailer's --chroot-base-dir is <dir>/j)
-//!     vmlinux  rootfs.ext4          linked from the AMI if on the same filesystem, else copied
+//!     vmlinuz  initrd.img           linked from the AMI if on the same filesystem, else copied
+//!     rootfs.ext4                   likewise
 //!     workspace.img                 hard link to <dir>/workspace.img
 //!     dev/nitro_enclaves            device node, for the VMM's uid
 //!     vm.json  api.sock  vsock.sock  vsock.sock_<port> (the relay's)
@@ -30,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 use super::api::API_SOCKET;
-use super::firecracker::{CONSOLE_LOG, IMAGE, VM_CONFIG, vm_config};
+use super::firecracker::{CONSOLE_LOG, IMAGE, INITRD, KERNEL, VM_CONFIG, vm_config};
 use super::process::cmdline_contains;
 use super::store::SandboxMeta;
 
@@ -40,7 +41,11 @@ const ENCLAVE_DEVICE: &str = "/dev/nitro_enclaves";
 /// Default locations in the AMI.
 const DEFAULT_JAILER: &str = "jailer";
 const DEFAULT_FIRECRACKER: &str = "firecracker";
-const DEFAULT_KERNEL: &str = "/opt/devbox/sandbox/vmlinux";
+/// The host's own AL2023 kernel (an EFI-stub image), copied in by the AMI.
+const DEFAULT_KERNEL: &str = "/opt/devbox/sandbox/vmlinuz";
+/// Loads the virtio-PCI, block, vsock and NSM modules the root drive needs;
+/// the AL2023 kernel builds them as modules.
+const DEFAULT_INITRD: &str = "/opt/devbox/sandbox/initrd.img";
 const DEFAULT_ROOTFS: &str = "/opt/devbox/sandbox/rootfs.ext4";
 
 /// Reserved uid range for jailed VMMs (one uid per running sandbox).
@@ -69,6 +74,7 @@ pub(crate) struct Jail {
     jailer: PathBuf,
     firecracker: PathBuf,
     kernel: PathBuf,
+    initrd: PathBuf,
     rootfs: PathBuf,
     device: PathBuf,
     uid_base: u32,
@@ -92,6 +98,7 @@ impl Jail {
             jailer: path("DEVBOX_SANDBOX_JAILER", DEFAULT_JAILER),
             firecracker: path("DEVBOX_SANDBOX_FIRECRACKER", DEFAULT_FIRECRACKER),
             kernel: path("DEVBOX_SANDBOX_KERNEL", DEFAULT_KERNEL),
+            initrd: path("DEVBOX_SANDBOX_INITRD", DEFAULT_INITRD),
             rootfs: path("DEVBOX_SANDBOX_ROOTFS", DEFAULT_ROOTFS),
             device: PathBuf::from(ENCLAVE_DEVICE),
             uid_base: number("DEVBOX_SANDBOX_JAIL_UID_BASE", DEFAULT_UID_BASE),
@@ -101,14 +108,15 @@ impl Jail {
     }
 
     /// A jail whose binaries and images sit in `root` (`jailer`, `firecracker`,
-    /// `vmlinux`, `rootfs.ext4`, `nitro_enclaves`), using only `uid` and `gid`:
+    /// `vmlinuz`, `initrd.img`, `rootfs.ext4`, `nitro_enclaves`), using only `uid` and `gid`:
     /// for tests standing in for the host.
     #[cfg(test)]
     pub(crate) fn rooted_at(root: &Path, uid: u32, gid: u32) -> Self {
         Self {
             jailer: root.join("jailer"),
             firecracker: root.join("firecracker"),
-            kernel: root.join("vmlinux"),
+            kernel: root.join("vmlinuz"),
+            initrd: root.join("initrd.img"),
             rootfs: root.join("rootfs.ext4"),
             device: root.join("nitro_enclaves"),
             uid_base: uid,
@@ -143,6 +151,7 @@ impl Jail {
         }
         for (what, path, var) in [
             ("guest kernel", &self.kernel, "DEVBOX_SANDBOX_KERNEL"),
+            ("guest initramfs", &self.initrd, "DEVBOX_SANDBOX_INITRD"),
             (
                 "guest root filesystem",
                 &self.rootfs,
@@ -212,7 +221,8 @@ impl Jail {
         let root = self.vm_dir(dir, &meta.name);
         std::fs::create_dir_all(&root).with_context(|| format!("create {}", root.display()))?;
 
-        link_or_copy(&self.kernel, &root.join("vmlinux")).await?;
+        link_or_copy(&self.kernel, &root.join(KERNEL)).await?;
+        link_or_copy(&self.initrd, &root.join(INITRD)).await?;
         link_or_copy(&self.rootfs, &root.join("rootfs.ext4")).await?;
         std::fs::hard_link(dir.join(IMAGE), root.join(IMAGE))
             .context("link the workspace image into the jail")?;
@@ -455,7 +465,9 @@ mod tests {
         assert!(msg(&jail).contains("jailer"), "{}", msg(&jail));
         std::fs::write(root.join("jailer"), "").unwrap();
         assert!(msg(&jail).contains("guest kernel"), "{}", msg(&jail));
-        std::fs::write(root.join("vmlinux"), "").unwrap();
+        std::fs::write(root.join("vmlinuz"), "").unwrap();
+        assert!(msg(&jail).contains("guest initramfs"), "{}", msg(&jail));
+        std::fs::write(root.join("initrd.img"), "").unwrap();
         assert!(
             msg(&jail).contains("guest root filesystem"),
             "{}",

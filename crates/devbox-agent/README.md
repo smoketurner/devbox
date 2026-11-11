@@ -242,8 +242,12 @@ a message naming the fix:
 - `/dev/nitro_enclaves`, from the pool's `nitro_sandboxes_enabled` in devbox-infra;
 - the VMM and `jailer` (`DEVBOX_SANDBOX_FIRECRACKER`, `DEVBOX_SANDBOX_JAILER`;
   default: on `PATH`);
-- the guest image (`DEVBOX_SANDBOX_KERNEL`, `DEVBOX_SANDBOX_ROOTFS`; default
-  `/opt/devbox/sandbox/{vmlinux,rootfs.ext4}`).
+- the guest image (`DEVBOX_SANDBOX_KERNEL`, `DEVBOX_SANDBOX_INITRD`,
+  `DEVBOX_SANDBOX_ROOTFS`; default `/opt/devbox/sandbox/{vmlinuz,initrd.img,rootfs.ext4}`).
+  The kernel is the host's own AL2023 6.18 kernel, and the initramfs loads the
+  virtio-PCI, block, ext4, overlay, vsock and NSM modules it builds as modules.
+  Firecracker runs without `debug_mode`, so `console.log` holds only the VMM's
+  own output, not the guest console.
 
 - **Inside the guest**, `devbox-agent guest` (hidden; run by the guest image's
   `devbox-guest.service`) is the other half of the contract:
@@ -255,8 +259,9 @@ a message naming the fix:
     over vsock (`tokio-vsock`).
   - It adds a `devbox` git remote (`ext::devbox-agent guest vsock-pipe 9418`,
     `push.negotiate` off) and pushes the agent branch every 30 s when it moves.
-  - It runs the harness once, single-shot, with its output on the console
-    (`logs`). Built in: `claude -p --dangerously-skip-permissions`, `codex exec
+  - It runs the harness once, single-shot, with its output on the guest
+    console. That console stays inside the guest (no `debug_mode`), so `logs`
+    shows only the VMM's output; the work comes back as commits (`diff`). Built in: `claude -p --dangerously-skip-permissions`, `codex exec
     --dangerously-bypass-approvals-and-sandbox`, and `shell` (`bash -lc
     <task>`). A script at `/etc/devbox/harnesses/<name>` overrides or adds one.
     The harness sees only placeholder API keys.

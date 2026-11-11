@@ -729,7 +729,7 @@ time.sleep(1.5)
     /// A host stand-in under `root` with `vmm` as the VMM, and a daemon serving
     /// it in the background. Returns the store and a client for the daemon.
     async fn host(root: &Path, vmm: &str) -> (Store, Client) {
-        for file in ["nitro_enclaves", "vmlinux", "rootfs.ext4"] {
+        for file in ["nitro_enclaves", "vmlinuz", "initrd.img", "rootfs.ext4"] {
             std::fs::write(root.join(file), "").unwrap();
         }
         write_executable(&root.join("jailer"), FAKE_JAILER);

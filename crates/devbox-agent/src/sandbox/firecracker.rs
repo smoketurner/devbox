@@ -42,6 +42,8 @@ const KILL_GRACE: Duration = Duration::from_secs(5);
 /// Files in a sandbox directory (and, for the image and config, the chroot).
 pub(crate) const CONSOLE_LOG: &str = "console.log";
 pub(crate) const IMAGE: &str = "workspace.img";
+pub(crate) const KERNEL: &str = "vmlinuz";
+pub(crate) const INITRD: &str = "initrd.img";
 pub(crate) const VM_CONFIG: &str = "vm.json";
 pub(crate) const VSOCK: &str = "vsock.sock";
 
@@ -61,7 +63,10 @@ pub(crate) enum StopOutcome {
 pub(crate) fn vm_config(meta: &SandboxMeta) -> Value {
     json!({
         "boot-source": {
-            "kernel_image_path": "/vmlinux",
+            "kernel_image_path": format!("/{KERNEL}"),
+            // The AL2023 kernel builds virtio-PCI, virtio-blk, ext4 and overlay
+            // as modules, so the initramfs loads them before the root drive mounts.
+            "initrd_path": format!("/{INITRD}"),
             // The root drive is read-only and shared by every sandbox;
             // systemd.volatile=overlay gives each guest a writable tmpfs layer.
             "boot_args": format!(
@@ -94,7 +99,9 @@ pub(crate) fn vm_config(meta: &SandboxMeta) -> Value {
         },
         // Run as a Nitro Sandbox. Direct mode: the threat is the guest, not the
         // claimant, so confidential mode's protection from the parent isn't
-        // needed and direct mode's faster I/O is.
+        // needed and direct mode's faster I/O is. No debug_mode: it would
+        // forward the guest console to console.log but zero the boot
+        // measurements, so the console stays inside the guest.
         "enclave": { "direct_mode": true },
     })
 }
@@ -250,6 +257,7 @@ mod tests {
         let config = vm_config(&meta());
 
         assert_eq!(config.pointer("/enclave/direct_mode").unwrap(), true);
+        assert!(config.pointer("/enclave/debug_mode").is_none());
         assert!(config.get("network-interfaces").is_none());
         assert_eq!(config.pointer("/machine-config/vcpu_count").unwrap(), 2);
         assert_eq!(
@@ -261,6 +269,7 @@ mod tests {
         // Every host path is inside the jail's chroot.
         for pointer in [
             "/boot-source/kernel_image_path",
+            "/boot-source/initrd_path",
             "/drives/0/path_on_host",
             "/drives/1/path_on_host",
             "/vsock/uds_path",
