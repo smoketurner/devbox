@@ -1325,7 +1325,6 @@ dependencies = [
 name = "devbox-common"
 version = "0.1.14"
 dependencies = [
- "anyhow",
  "jiff",
  "serde",
  "serde_json",

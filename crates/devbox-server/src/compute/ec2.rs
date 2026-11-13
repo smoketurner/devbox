@@ -18,10 +18,7 @@ impl Ec2 {
         Self {
             ec2_client: aws_sdk_ec2::Client::new(config),
             asg_client: aws_sdk_autoscaling::Client::new(config),
-            region: config
-                .region()
-                .map(|r| r.as_ref().to_string())
-                .unwrap_or_default(),
+            region: config.region().map_or_default(|r| r.as_ref().to_string()),
         }
     }
 }
@@ -72,8 +69,7 @@ impl Compute for Ec2 {
                 instance_id: inst.instance_id().unwrap_or_default().to_string(),
                 lifecycle_state: inst
                     .lifecycle_state()
-                    .map(|s| s.as_str().to_string())
-                    .unwrap_or_default(),
+                    .map_or_default(|s| s.as_str().to_string()),
                 health_status: inst.health_status().unwrap_or_default().to_string(),
                 protected_from_scale_in: inst.protected_from_scale_in().unwrap_or(false),
             })
@@ -135,8 +131,7 @@ impl Compute for Ec2 {
                     instance_id: instance_id.to_string(),
                     instance_type: instance
                         .instance_type()
-                        .map(|t| t.as_str().to_string())
-                        .unwrap_or_default(),
+                        .map_or_default(|t| t.as_str().to_string()),
                     ami_id: instance.image_id().unwrap_or_default().to_string(),
                     subnet_id: instance.subnet_id().unwrap_or_default().to_string(),
                     region: self.region.clone(),

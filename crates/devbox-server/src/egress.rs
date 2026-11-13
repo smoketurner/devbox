@@ -589,8 +589,7 @@ async fn read_connect_head(client: &mut TcpStream) -> Result<Option<(String, u16
             };
             let leftover = buf
                 .get(end.saturating_add(4)..)
-                .map(<[u8]>::to_vec)
-                .unwrap_or_default();
+                .map_or_default(<[u8]>::to_vec);
             return Ok(Some((host, port, leftover)));
         }
     }

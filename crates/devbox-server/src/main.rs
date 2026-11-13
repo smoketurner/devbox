@@ -142,8 +142,7 @@ async fn main() -> Result<()> {
         .context("initialize egress integrations layer")?;
     let integration_rules = egress_integrations
         .as_mut()
-        .map(devbox_server::egress_proxy::EgressConfig::policy_rules)
-        .unwrap_or_default();
+        .map_or_default(devbox_server::egress_proxy::EgressConfig::policy_rules);
     let egress_proxy = egress_integrations.map(|cfg| cfg.proxy);
 
     // Build the shared egress policy + decision sink ONCE, independently of the
@@ -330,9 +329,8 @@ async fn build_agent_auth_config(http: &reqwest::Client) -> Result<Option<AgentA
     if pool_role_arns.is_empty() {
         anyhow::bail!("DEVBOX_POOL_ROLE_ARNS must list at least one role ARN");
     }
-    let builder_role_arns = env_non_empty("DEVBOX_BUILDER_ROLE_ARNS")
-        .map(|raw| csv_list(&raw))
-        .unwrap_or_default();
+    let builder_role_arns =
+        env_non_empty("DEVBOX_BUILDER_ROLE_ARNS").map_or_default(|raw| csv_list(&raw));
 
     let endpoints = discover_with_retry(http, &issuer).await?;
     tracing::info!(issuer = %issuer, "agent OIDC auth enabled (AWS web-identity tokens)");

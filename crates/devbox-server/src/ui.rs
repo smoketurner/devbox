@@ -109,11 +109,7 @@ impl From<Document<DevboxDoc>> for DevboxDetail {
             instance_id: doc.data.instance_id,
             ebs_volume_id: doc.data.ebs_volume_id.unwrap_or_default(),
             owner: doc.data.owner.unwrap_or_default(),
-            claimed_at: doc
-                .data
-                .claimed_at
-                .map(format_timestamp)
-                .unwrap_or_default(),
+            claimed_at: doc.data.claimed_at.map_or_default(format_timestamp),
             created_at: format_timestamp(doc.created_at),
         }
     }
@@ -241,10 +237,10 @@ async fn current_session(state: &AppState, headers: &HeaderMap) -> Option<Sessio
 
 /// Gate a dashboard page: every UI route requires a valid login session.
 /// Returns the signed-in user, or a redirect to `/login` when unauthenticated.
-async fn require_login(state: &AppState, headers: &HeaderMap) -> Result<SessionUser, Response> {
+async fn require_login(state: &AppState, headers: &HeaderMap) -> Result<SessionUser, Redirect> {
     current_session(state, headers)
         .await
-        .ok_or_else(|| Redirect::to("/login").into_response())
+        .ok_or_else(|| Redirect::to("/login"))
 }
 
 /// Start the OIDC Authorization Code flow: set a CSRF `state` cookie and
@@ -411,7 +407,7 @@ pub fn build_ui_router() -> Router<SharedState> {
 async fn dashboard(State(state): State<SharedState>, headers: HeaderMap) -> Response {
     let display_name = match require_login(&state, &headers).await {
         Ok(user) => user.display,
-        Err(redirect) => return redirect,
+        Err(redirect) => return redirect.into_response(),
     };
     match state.store.list_all::<DevboxDoc>().await {
         Ok(docs) => {
@@ -453,7 +449,7 @@ async fn devbox_detail(
     Path(id): Path<String>,
 ) -> Response {
     if let Err(redirect) = require_login(&state, &headers).await {
-        return redirect;
+        return redirect.into_response();
     }
     match state.store.get::<DevboxDoc>(&id).await {
         Ok(Some(doc)) => DevboxDetailTemplate {
@@ -479,7 +475,7 @@ async fn devbox_detail(
 /// GET /devboxes/claim
 async fn claim_form(State(state): State<SharedState>, headers: HeaderMap) -> Response {
     if let Err(redirect) = require_login(&state, &headers).await {
-        return redirect;
+        return redirect.into_response();
     }
     ClaimFormTemplate {
         name: None,
@@ -499,7 +495,7 @@ async fn submit_claim(
     // The owner is always the signed-in user.
     let user = match require_login(&state, &headers).await {
         Ok(user) => user,
-        Err(redirect) => return redirect,
+        Err(redirect) => return redirect.into_response(),
     };
     let claimant = Principal {
         owner: user.principal,
@@ -531,7 +527,7 @@ async fn submit_release(
     // existence/metadata (consistent with the GET routes and submit_claim).
     let user = match require_login(&state, &headers).await {
         Ok(user) => user,
-        Err(redirect) => return redirect,
+        Err(redirect) => return redirect.into_response(),
     };
 
     match crate::service::release_devbox(&state, &user.principal, &id).await {
@@ -568,7 +564,7 @@ async fn submit_rename(
     // existence/metadata (consistent with submit_release).
     let user = match require_login(&state, &headers).await {
         Ok(user) => user,
-        Err(redirect) => return redirect,
+        Err(redirect) => return redirect.into_response(),
     };
 
     match crate::service::rename_devbox(&state, &user.principal, &id, &form.name).await {
