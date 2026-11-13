@@ -2,6 +2,7 @@
 name = "devbox-agent"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 description = "On-host devbox agent: SSH principal resolution, account provisioning, and warm-up"
