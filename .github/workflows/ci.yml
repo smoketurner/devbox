@@ -25,13 +25,13 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@v6.0.3
         with:
           persist-credentials: false
       - name: Setup Rust toolchain
         run: rustup show
       - name: Setup Rust cache
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@v2.9.1
         with:
           prefix-key: "v1"
           shared-key: "fmt"
@@ -45,7 +45,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@v6.0.3
         with:
           persist-credentials: false
       - name: Install system dependencies
@@ -53,7 +53,7 @@ jobs:
       - name: Setup Rust toolchain
         run: rustup show
       - name: Setup Rust cache
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@v2.9.1
         with:
           prefix-key: "v1"
           shared-key: "clippy-${{ runner.os }}"
@@ -77,7 +77,7 @@ jobs:
             runner: macos-latest
             install-deps: brew install go cmake
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@v6.0.3
         with:
           persist-credentials: false
       - name: Install system dependencies
@@ -85,7 +85,7 @@ jobs:
       - name: Setup Rust toolchain
         run: rustup show
       - name: Setup Rust cache
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@v2.9.1
         with:
           prefix-key: "v1"
           shared-key: "debug-${{ runner.os }}"
@@ -110,13 +110,13 @@ jobs:
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@v6.0.3
         with:
           persist-credentials: false
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        uses: docker/setup-buildx-action@v4.1.0
       - name: Build (musl static, all crates)
-        uses: docker/bake-action@6614cfa25eff9a0b2b2697efb0b6159e7680d584 # v7.2.0
+        uses: docker/bake-action@v7.2.0
         with:
           targets: ci
         env:
@@ -129,10 +129,10 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@v6.0.3
         with:
           persist-credentials: false
-      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+      - uses: actions/dependency-review-action@v5.0.0
         with:
           vulnerability-check: true
           license-check: true
@@ -147,10 +147,10 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@v6.0.3
         with:
           persist-credentials: false
-      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+      - uses: EmbarkStudios/cargo-deny-action@v2.0.20
         with:
           command: check licenses advisories sources
 
@@ -164,13 +164,13 @@ jobs:
       security-events: write
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@v6.0.3
         with:
           persist-credentials: false
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        uses: docker/setup-buildx-action@v4.1.0
       - name: Build image for scanning
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        uses: docker/build-push-action@v7.2.0
         with:
           context: .
           load: true
@@ -178,7 +178,7 @@ jobs:
           cache-from: type=gha,scope=ci-scan
           cache-to: type=gha,mode=max,scope=ci-scan
       - name: Run Grype vulnerability scanner
-        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        uses: anchore/scan-action@v7.4.0
         id: grype
         with:
           image: 'devbox-server:scan'
@@ -187,7 +187,7 @@ jobs:
           output-format: sarif
           cache-db: true
       - name: Upload scan results to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
+        uses: github/codeql-action/upload-sarif@v4.36.2
         continue-on-error: true
         with:
           sarif_file: ${{ steps.grype.outputs.sarif }}
